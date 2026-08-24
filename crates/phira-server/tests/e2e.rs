@@ -862,3 +862,67 @@ async fn host_leave_transfers_ownership() {
     drop(c1);
     drop(c2);
 }
+
+/// §11 优雅停机：维护广播送达所有在线会话（不依赖房间状态机）。
+#[tokio::test]
+async fn maintenance_broadcast_reaches_all() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx(mock_addr);
+    let ctx_bg = Arc::clone(&ctx);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx_bg);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    // 两个已鉴权会话
+    let mut c1 = client_connect(server_addr).await;
+    let mut c2 = client_connect(server_addr).await;
+    for (c, tok) in [(&mut c1, "tok1"), (&mut c2, "tok2")] {
+        send_cmd(
+            c,
+            &ClientCommand::Authenticate {
+                token: Varchar::new(tok.into()).unwrap(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_cmd(c).await,
+            ServerCommand::Authenticate(Ok(_))
+        ));
+    }
+
+    // 维护广播（§11：系统 Chat，user=0）
+    ctx.sink
+        .broadcast(ServerCommand::Message(phira_api::Message::Chat {
+            user: 0,
+            content: "服务器维护中".to_owned(),
+        }))
+        .await;
+
+    for (name, c) in [("c1", &mut c1), ("c2", &mut c2)] {
+        let f = recv_cmd(c).await;
+        assert!(
+            matches!(
+                &f,
+                ServerCommand::Message(phira_api::Message::Chat {
+                    user: 0,
+                    content,
+                }) if content.contains("维护中")
+            ),
+            "{name} 应收到维护广播: {f:?}"
+        );
+    }
+    drop(c1);
+    drop(c2);
+}

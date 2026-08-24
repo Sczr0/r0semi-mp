@@ -2,7 +2,7 @@
 //!
 //! 阶段 2 接线完成：`handle_connection` 驱动协议全流程（§6.6 表 1/表 2 + §4.9-3 生命周期）。
 //!
-//! TODO(阶段 5): 向所有房间广播"服务器维护中" + 宽限窗口（§11）。
+//! 优雅停机（§11）：SIGTERM/SIGINT → 广播"服务器维护中" → 宽限窗口 → 强制退出。
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -32,6 +32,12 @@ pub struct Server {
     ctx: Arc<ConnContext>,
 }
 
+/// 停机维护通知（§11）：系统 Chat 消息（user=0），协议兼容（客户端显示为聊天）。
+const MAINTENANCE_NOTICE: &str = "服务器维护中，房间即将关闭，请稍后再来";
+
+/// 停机宽限窗口（§11：供玩家看到维护消息，之后强制退出）。
+const MAINTENANCE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Server {
     /// 绑定端口（默认 12346，§3.5）。
     ///
@@ -57,11 +63,21 @@ impl Server {
 
         // 优雅停机（§11）：SIGTERM/SIGINT → 停止 accept
         let shutdown = shutdown_signal();
+        let ctx = Arc::clone(&self.ctx);
 
         tokio::select! {
             () = shutdown => {
-                info!("shutdown signal received");
-                // TODO(阶段 5): 向所有房间广播"服务器维护中" + 宽限窗口（§11）
+                info!("shutdown signal received, broadcasting maintenance notice");
+                // §11：广播"服务器维护中"（系统 Chat，user=0）+ 宽限窗口供玩家看到。
+                // 无持久化下不存在"排空"语义——停机即丢房，降低损失靠消息 + 快速重启。
+                ctx.sink
+                    .broadcast(ServerCommand::Message(phira_api::Message::Chat {
+                        user: 0,
+                        content: MAINTENANCE_NOTICE.to_owned(),
+                    }))
+                    .await;
+                info!("maintenance grace window {MAINTENANCE_GRACE:?}");
+                tokio::time::sleep(MAINTENANCE_GRACE).await;
             }
             () = self.accept_loop() => {}
         }
@@ -137,6 +153,14 @@ impl SessionSink {
             .is_some_and(|cur| Arc::ptr_eq(cur, tx))
         {
             sessions.remove(&user_id);
+        }
+    }
+
+    /// 向所有在线会话广播一帧（§11 停机维护通知；队列满/已断连则丢弃）。
+    pub async fn broadcast(&self, cmd: ServerCommand) {
+        let sessions = self.sessions.read().await;
+        for tx in sessions.values() {
+            let _ = tx.send(cmd.clone()).await;
         }
     }
 }
