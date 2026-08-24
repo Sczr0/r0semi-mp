@@ -8,6 +8,7 @@
 
 pub mod bus;
 pub mod config;
+pub mod convert;
 pub mod session;
 
 pub use bus::{Bus, CommandStats, EventSink, Metrics};

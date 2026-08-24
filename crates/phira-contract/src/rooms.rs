@@ -313,6 +313,7 @@ async fn permissions_and_state<F: RoomFactory>(factory: &F) {
         vec![RoomEvent::CancelGame {
             room_id: rid(),
             user: 1,
+            chart: Some(1),
         }]
     );
 
@@ -371,7 +372,9 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
     // —— 全员完成 → GameEnd（§6.5-11）——
     let (_, events) = room.handle(ctx(3), RoomCommand::Played { id: 3 }).await;
     assert!(
-        events.contains(&RoomEvent::GameEnd { room_id: rid() }),
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::GameEnd { room_id, .. } if room_id == &rid())),
         "全员完成应 GameEnd: {events:?}"
     );
     // 回到 SelectChart：可再次选图
@@ -398,7 +401,9 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
     room.handle(ctx(2), RoomCommand::Abort).await;
     let (_, events) = room.handle(ctx(3), RoomCommand::Abort).await;
     assert!(
-        events.contains(&RoomEvent::GameEnd { room_id: rid() }),
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::GameEnd { room_id, .. } if room_id == &rid())),
         "全员 abort 应 GameEnd: {events:?}"
     );
 
@@ -437,7 +442,9 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
     room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
     let (_, events) = room.handle(ctx(3), RoomCommand::Played { id: 3 }).await;
     assert!(
-        events.contains(&RoomEvent::GameEnd { room_id: rid() }),
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::GameEnd { room_id, .. } if room_id == &rid())),
         "cycle 结算应 GameEnd: {events:?}"
     );
     // 房主顺延：old=1 → new=2（原版 position+1 语义）
@@ -514,10 +521,9 @@ async fn disconnect_reconnect<F: RoomFactory>(factory: &F) {
         .handle(sys_ctx(), RoomCommand::UserDangleExpired { user_id: 2 })
         .await;
     assert!(
-        events.contains(&RoomEvent::UserLeft {
-            room_id: rid(),
-            user: 2
-        }),
+        events.iter().any(
+            |e| matches!(e, RoomEvent::UserLeft { room_id, user: 2, .. } if room_id == &rid())
+        ),
         "窗口到期应驱逐: {events:?}"
     );
     assert!(
@@ -575,10 +581,9 @@ async fn disconnect_reconnect<F: RoomFactory>(factory: &F) {
         )
         .await;
     assert!(
-        events.contains(&RoomEvent::UserLeft {
-            room_id: rid(),
-            user: 2
-        }),
+        events.iter().any(
+            |e| matches!(e, RoomEvent::UserLeft { room_id, user: 2, .. } if room_id == &rid())
+        ),
         "Playing 中断线应立即驱逐: {events:?}"
     );
     // 无重连窗口：DangleExpired 不应再驱逐（已不在）
@@ -1011,15 +1016,17 @@ async fn playing_leave_triggers_settle<F: RoomFactory>(factory: &F) {
     setup_playing(&mut room).await; // 1,2,3 全员 Playing
     // 用户 3 离开 → 剩余 1,2
     let (_, events) = room.handle(ctx(3), RoomCommand::LeaveRoom).await;
-    assert!(events.contains(&RoomEvent::UserLeft {
-        room_id: rid(),
-        user: 3
-    }));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        RoomEvent::UserLeft { room_id, user: 3, .. } if room_id == &rid()
+    )));
     // 1,2 上报成绩 → 全员完成（users 只剩 1,2）→ GameEnd
     room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
     let (_, events) = room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
     assert!(
-        events.contains(&RoomEvent::GameEnd { room_id: rid() }),
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::GameEnd { room_id, .. } if room_id == &rid())),
         "剩余玩家完成应结算: {events:?}"
     );
 }

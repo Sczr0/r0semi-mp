@@ -396,6 +396,8 @@ pub enum RoomEvent {
         room_id: RoomId,
         /// 离开者用户 id。
         user: i32,
+        /// 离开者昵称（转换层生成 `Message::LeaveRoom` 需要，§6.6 表 2；impl 持有）。
+        name: String,
     },
     /// 房主变更（Message::NewHost + ChangeHost 双向，表 2）。
     NewHost {
@@ -444,6 +446,8 @@ pub enum RoomEvent {
         room_id: RoomId,
         /// 房主 id。
         user: i32,
+        /// 已选谱面（保留，转换层生成 `ChangeState(SelectChart)`，§6.6 表 2）。
+        chart: Option<i32>,
     },
     /// 开局（Message::StartPlaying，全员 ready）。
     StartPlaying {
@@ -467,6 +471,8 @@ pub enum RoomEvent {
     GameEnd {
         /// 房间 id。
         room_id: RoomId,
+        /// 已选谱面（保留，转换层生成 `ChangeState(SelectChart)`，§6.6 表 2）。
+        chart: Option<i32>,
     },
     /// 中止（Message::Abort）。
     Abort {

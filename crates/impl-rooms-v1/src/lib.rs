@@ -172,9 +172,17 @@ impl RoomV1 {
     /// 驱逐/离开的统一收尾（规则 5/6/21）：广播 UserLeft + 移除 + host 迁移 + 空房判定。
     /// 返回 true = 房间应自毁（RoomClosed 已产出）。
     fn evict(&mut self, user_id: i32) -> Vec<RoomEvent> {
+        // 名字在 remove 前取（玩家或 monitor；广播 LeaveRoom 需要，§6.6 表 2）
+        let name = self
+            .users
+            .get(&user_id)
+            .or_else(|| self.monitors.get(&user_id))
+            .map(|u| u.name.clone())
+            .unwrap_or_default();
         let mut events = vec![RoomEvent::UserLeft {
             room_id: self.id.clone(),
             user: user_id,
+            name,
         }];
         self.users.remove(&user_id);
         self.monitors.remove(&user_id);
@@ -227,6 +235,7 @@ impl RoomV1 {
                     // 全员完成/abort → GameEnd（规则 11）
                     let mut events = vec![RoomEvent::GameEnd {
                         room_id: self.id.clone(),
+                        chart: self.chart.as_ref().map(|c| c.id),
                     }];
                     let old_host = self.host;
                     self.state = InternalState::SelectChart;
@@ -527,6 +536,7 @@ impl RoomV1 {
                         vec![RoomEvent::CancelGame {
                             room_id: self.id.clone(),
                             user: user_id,
+                            chart: self.chart.as_ref().map(|c| c.id),
                         }],
                     )
                 } else {

@@ -250,6 +250,7 @@ async fn leaver_receives_own_leave_room() {
                 vec![RoomEvent::UserLeft {
                     room_id: rid(),
                     user: 2,
+                    name: "u2".to_owned(),
                 }],
             ),
         ],
@@ -281,6 +282,7 @@ async fn leaver_receives_own_leave_room() {
     let expected = RoomEvent::UserLeft {
         room_id: rid(),
         user: 2,
+        name: "u2".to_owned(),
     };
     assert!(
         deliveries.contains(&(2, expected.clone())),
