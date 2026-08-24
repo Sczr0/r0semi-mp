@@ -22,7 +22,7 @@ pub type TimeMs = u64;
 /// 长度以**字节**计：token ≤32、聊天 ≤200、RoomId ≤20。
 /// 构造时校验超限即拒绝。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Varchar<const N: usize>(String);
+pub struct Varchar<const N: usize>(pub(crate) String);
 
 impl<const N: usize> Varchar<N> {
     /// 构造并校验长度（字节数 ≤ N）。
@@ -52,7 +52,7 @@ impl<const N: usize> std::fmt::Display for Varchar<N> {
 
 /// 房间 id（协议 §6.2）：`Varchar<20>` + 合法字符约束 `[A-Za-z0-9_-]` 且非空。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RoomId(Varchar<20>);
+pub struct RoomId(pub(crate) Varchar<20>);
 
 impl RoomId {
     /// 构造并校验：非空 + 全部字符属于 `[A-Za-z0-9_-]`。
@@ -84,8 +84,8 @@ impl std::fmt::Display for RoomId {
 /// 半精度坐标（协议 §6.2 / §4.8-1）：f16 × 2，不是 f32，写错即不兼容。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompactPos {
-    x: f16,
-    y: f16,
+    pub(crate) x: f16,
+    pub(crate) y: f16,
 }
 
 impl CompactPos {

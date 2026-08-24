@@ -4,14 +4,12 @@
 //! 决定谁上架（RoomsV1）+ 注入外部依赖（HTTP/随机）+ 柜台开业（Bus → Server）。
 //! 换实现 = 组合根换工厂（§3.2：灰度已降级为运维选项，项目内零灰度代码）。
 
-mod http;
-mod server;
-
 use std::sync::Arc;
 
 use anyhow::Result;
 use phira_api::{ApiClient, RandomSource, RoomConfig, RoomDeps, RoomFactory};
 use phira_core::{Bus, Config};
+use phira_server::server::Server;
 
 /// 老板接线（§4.5）。
 #[tokio::main(flavor = "current_thread")]
@@ -20,11 +18,13 @@ async fn main() -> Result<()> {
 
     // 老板接线：决定谁上架 + 注入外部依赖（§4.9-6）
     // 单一 HTTP 实例，auth 与 chart/record 共享（评审 §8 五-1）
-    let http = Arc::new(http::HttpApiClient::new(config.api_base.clone()));
+    let http = Arc::new(phira_server::http::HttpApiClient::new(
+        config.api_base.clone(),
+    ));
 
     let deps = RoomDeps {
         api: Arc::clone(&http) as Arc<dyn ApiClient>,
-        rng: Arc::new(http::ThreadRngSource) as Arc<dyn RandomSource>,
+        rng: Arc::new(phira_server::http::ThreadRngSource) as Arc<dyn RandomSource>,
     };
 
     // 第一个货物（工厂，持有 deps）；换实现 = 组合根换工厂
@@ -39,6 +39,6 @@ async fn main() -> Result<()> {
     // let auth: Arc<dyn AuthHandler> = Arc::new(http::HttpAuth::new(config.api_base.clone()));
     // TODO(阶段 5): bus.watch_config（文件轮询 → update_config，机制已就绪）
 
-    server::Server::new(config.listen, bus).await?.run().await?;
+    Server::new(config.listen, bus).await?.run().await?;
     Ok(())
 }

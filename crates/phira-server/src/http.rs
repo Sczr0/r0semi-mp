@@ -18,6 +18,7 @@ pub struct HttpApiClient {
 
 impl HttpApiClient {
     /// 构造。`base` = 官方 API 基地址（Config::api_base）。
+    #[must_use]
     pub fn new(base: String) -> Self {
         Self { base }
     }
@@ -49,6 +50,7 @@ pub struct HttpAuth {
 impl HttpAuth {
     /// 构造。`base` = 官方 API 基地址。
     #[allow(dead_code)] // 阶段 2 鉴权编排接入后启用
+    #[must_use]
     pub fn new(base: String) -> Self {
         Self { base }
     }

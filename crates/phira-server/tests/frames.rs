@@ -1,0 +1,195 @@
+//! 协议帧层集成测试（阶段 1 验收，§14：帧 + 心跳链路）。
+//!
+//! 真实 TCP 连接驱动 `handle_connection`：
+//! 1. 握手：客户端先发版本字节（§6.1），服务端读取
+//! 2. Ping → Pong（心跳应答，§6.1：服务端不发 Ping 只回 Pong）
+//! 3. 多帧连续收发（帧边界正确性）
+//! 4. 服务端主动推送（阶段 2 广播路径的前提）
+//! 5. 恶意帧拒绝（超长 / 非法 tag → 断开）
+//!
+//! 客户端用原始 socket + 手写读帧，不依赖 `Stream` 客户端 API——测线上字节行为
+//! （Oracle 第二形态：不经过测试对象自身的便捷层）。
+
+use std::{sync::Arc, time::Duration};
+
+use phira_api::{ClientCommand, ServerCommand, decode_packet};
+use phira_server::server::handle_connection;
+use phira_server::stream::PROTOCOL_VERSION;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+/// 便捷：编码一帧（ULEB128 长度前缀 + 载荷，§6.1）。
+fn frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut x = payload.len() as u64;
+    loop {
+        let mut b = (x & 0x7f) as u8;
+        x >>= 7;
+        if x != 0 {
+            b |= 0x80;
+        }
+        out.push(b);
+        if x == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(payload);
+    out
+}
+
+/// 建立一对连接：服务端跑 `handle_connection`，返回已握手的原始客户端 socket。
+async fn connect_pair() -> TcpStream {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        handle_connection(stream, addr).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    // 客户端握手：先发 1 字节版本（§6.1）
+    client.write_all(&[PROTOCOL_VERSION]).await.unwrap();
+    client
+}
+
+/// 读一帧：ULEB128 长度 + 载荷，返回载荷字节。
+async fn read_frame(sock: &mut TcpStream) -> Vec<u8> {
+    let mut len = 0u64;
+    let mut pos = 0;
+    loop {
+        let byte = sock.read_u8().await.unwrap();
+        len |= u64::from(byte & 0x7f) << pos;
+        pos += 7;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    let mut payload = vec![0u8; usize::try_from(len).expect("test: frame len fits usize")];
+    sock.read_exact(&mut payload).await.unwrap();
+    payload
+}
+
+#[tokio::test]
+async fn handshake_ping_pong() {
+    let mut client = connect_pair().await;
+
+    // Ping（golden 字节：tag 0）→ 服务端回 Pong（tag 0）
+    client.write_all(&frame(&[0x00])).await.unwrap();
+    let payload = read_frame(&mut client).await;
+    assert_eq!(payload, vec![0x00], "Pong 载荷 = [tag 0]");
+}
+
+#[tokio::test]
+async fn multiple_frames_order() {
+    let mut client = connect_pair().await;
+
+    for _ in 0..5 {
+        client.write_all(&frame(&[0x00])).await.unwrap();
+    }
+    for _ in 0..5 {
+        let payload = read_frame(&mut client).await;
+        assert_eq!(payload, vec![0x00], "连续 Pong 顺序一致");
+    }
+}
+
+#[tokio::test]
+async fn raw_authenticate_frame_accepted() {
+    // 带载荷的命令（Authenticate token="ab" = [tag 1, uleb(2), 'a','b']）
+    // 阶段 1 服务端忽略非 Ping（不回复），但连接保持——随后 Ping/Pong 验证存活
+    let mut client = connect_pair().await;
+    client
+        .write_all(&frame(&[0x01, 0x02, 0x61, 0x62]))
+        .await
+        .unwrap();
+    client.write_all(&frame(&[0x00])).await.unwrap();
+    let payload = read_frame(&mut client).await;
+    assert_eq!(payload, vec![0x00], "非 Ping 命令不打断连接，Ping 仍被应答");
+}
+
+/// 服务端主动推送路径（阶段 2 广播的前提；真实服务端 Stream 的 `send`）。
+#[tokio::test]
+async fn server_initiated_push() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let handler = Box::new(
+            move |tx: Arc<tokio::sync::mpsc::Sender<ServerCommand>>, cmd: ClientCommand| async move {
+                if let ClientCommand::Ping = cmd {
+                    // 主动推送 + 心跳应答（顺序 = 发送顺序）
+                    tx.send(ServerCommand::Chat(Err("stage-2-not-wired".to_owned())))
+                        .await
+                        .unwrap();
+                    tx.send(ServerCommand::Pong).await.unwrap();
+                }
+            },
+        );
+        let stream = phira_server::stream::Stream::<ServerCommand, ClientCommand>::new(
+            None, stream, handler,
+        )
+        .await
+        .unwrap();
+        stream.await_closed().await;
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&[PROTOCOL_VERSION]).await.unwrap();
+    client.write_all(&frame(&[0x00])).await.unwrap(); // Ping
+
+    // 先收主动推送（Chat Err），再收 Pong
+    let chat_payload = read_frame(&mut client).await;
+    let chat: ServerCommand = decode_packet(&chat_payload).unwrap();
+    assert!(matches!(chat, ServerCommand::Chat(Err(_))));
+    let pong_payload = read_frame(&mut client).await;
+    let pong: ServerCommand = decode_packet(&pong_payload).unwrap();
+    assert!(matches!(pong, ServerCommand::Pong));
+
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
+}
+
+/// 恶意帧：帧长 > 2MiB → 服务端拒绝并断开（§6.1 包上限）。
+#[tokio::test]
+async fn oversized_frame_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_done = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = handle_connection(stream, addr).await;
+    });
+
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(&[PROTOCOL_VERSION]).await.unwrap();
+
+    // 帧长 = 2MiB + 1（ULEB128：2097153 = 0x81 0x80 0x80 0x01）
+    sock.write_all(&[0x81, 0x80, 0x80, 0x01]).await.unwrap();
+
+    let mut buf = [0u8; 1];
+    let r = sock.read(&mut buf).await;
+    assert_eq!(r.unwrap(), 0, "服务端应拒绝超长帧并断开");
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
+}
+
+/// 非法包（未知命令 tag）→ 服务端断开（原版语义：解码失败 break）。
+#[tokio::test]
+async fn invalid_packet_disconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_done = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = handle_connection(stream, addr).await;
+    });
+
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(&[PROTOCOL_VERSION]).await.unwrap();
+    sock.write_all(&frame(&[0xFF])).await.unwrap(); // tag 0xFF = 未知命令
+
+    let mut buf = [0u8; 1];
+    let r = sock.read(&mut buf).await;
+    assert_eq!(r.unwrap(), 0, "未知命令应导致断开");
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
+}

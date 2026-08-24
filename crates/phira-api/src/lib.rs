@@ -13,7 +13,11 @@
 #![deny(missing_docs)]
 
 mod auth;
+mod binary;
+mod proto;
 mod rooms;
 
 pub use auth::*;
+pub use binary::*;
+pub use proto::*;
 pub use rooms::*;
