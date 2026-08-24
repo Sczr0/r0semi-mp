@@ -38,7 +38,8 @@ Description=r0semi-mp server
 After=network-online.target
 
 [Service]
-Type=notify                  # sd-notify 就绪通知（bind 成功才认为启动完成）
+Type=simple                  # 不等待 READY 通知：部署稳定优先（Type=notify 需二进制含 sd-notify，
+                             # 否则 systemd 等 90s 超时触发 on-failure 重启循环——2026-08 生产踩坑）
 WorkingDirectory=/opt/r0semi-mp
 ExecStart=/opt/r0semi-mp/r0semi-mp-server
 Restart=on-failure

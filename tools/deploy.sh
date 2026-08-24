@@ -25,14 +25,15 @@ listen: "0.0.0.0:$PORT"
 YML
 echo "[2/3] 配置就绪: listen 0.0.0.0:$PORT"
 
-# 3. systemd 服务（Type=notify：bind 成功即报就绪；SIGTERM 优雅停机 §11）
+# 3. systemd 服务（Type=simple：不等待 READY 通知——Type=notify 需二进制含 sd-notify，
+#    否则 systemd 等 90s 超时 → on-failure 重启循环，2026-08 生产踩坑；SIGTERM 优雅停机 §11）
 cat > /etc/systemd/system/r0semi-mp.service <<'UNIT'
 [Unit]
 Description=r0semi-mp server (phira multi-room)
 After=network-online.target
 
 [Service]
-Type=notify
+Type=simple
 WorkingDirectory=/opt/r0semi-mp
 ExecStart=/opt/r0semi-mp/r0semi-mp-server
 Restart=on-failure
