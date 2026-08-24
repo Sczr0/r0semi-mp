@@ -50,17 +50,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml) + musl target
         uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release
-        run: cargo build --release -p phira-server
+      - name: Build release (musl static——任意 Linux 可跑，不挑 glibc 版本)
+        run: cargo build --release -p phira-server --target x86_64-unknown-linux-musl
 
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
         with:
           name: r0semi-mp-server-linux
-          path: target/release/r0semi-mp-server
+          path: target/x86_64-unknown-linux-musl/release/r0semi-mp-server
           if-no-files-found: error
