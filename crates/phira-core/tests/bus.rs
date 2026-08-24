@@ -979,3 +979,76 @@ async fn metrics_aggregate_internal() {
     // 平均延迟字段存在且 >= 0
     assert!(leave.avg_latency_ms >= 0.0);
 }
+
+#[tokio::test]
+async fn watch_config_polls_and_reloads() {
+    // §4.9-8：文件轮询 → 变化 → update_config 广播（房间收到新配置）
+    let factory = Arc::new(ScriptedFactory::default());
+    let received = factory.received();
+    factory.push(
+        &rid(),
+        vec![(
+            ok(),
+            vec![RoomEvent::RoomCreated {
+                room_id: rid(),
+                host: 1,
+            }],
+        )],
+    );
+    let bus = Bus::new(
+        Arc::clone(&factory) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    );
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // 临时配置文件
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("r0semi-mp-watch-test-{}.yml", std::process::id()));
+    std::fs::write(&path, "monitors: [1]\n").unwrap();
+
+    bus.watch_config(path.clone(), std::time::Duration::from_millis(20));
+
+    // 等第一轮轮询（monitors=[1]）
+    wait_for(&received, |cmds| {
+        cmds.iter().any(
+            |c| matches!(c, RoomCommand::UpdateConfig { config } if config.monitors == vec![1]),
+        )
+    })
+    .await;
+    assert_eq!(bus.room_config().await.monitors, vec![1]);
+
+    // 改文件 → 等下一轮
+    std::fs::write(&path, "monitors: [2, 3]\n").unwrap();
+    wait_for(&received, |cmds| {
+        cmds.iter().any(
+            |c| matches!(c, RoomCommand::UpdateConfig { config } if config.monitors == vec![2, 3]),
+        )
+    })
+    .await;
+    assert_eq!(bus.room_config().await.monitors, vec![2, 3]);
+
+    // 清理
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 轮询等待条件成立（超时 2s panic）。
+async fn wait_for<F>(received: &Arc<std::sync::Mutex<Vec<RoomCommand>>>, mut cond: F)
+where
+    F: FnMut(&Vec<RoomCommand>) -> bool,
+{
+    for _ in 0..100 {
+        if cond(&received.lock().unwrap()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("wait_for timeout");
+}

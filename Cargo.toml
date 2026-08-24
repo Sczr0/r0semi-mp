@@ -31,4 +31,4 @@ async-trait = "0.1"
 rand = "0.9"
 anyhow = "1"
 tracing = "0.1"
-tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros", "signal"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros", "signal", "fs"] }

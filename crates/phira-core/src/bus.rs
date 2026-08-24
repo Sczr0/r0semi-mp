@@ -220,29 +220,57 @@ impl Bus {
     /// 配置热更广播（§4.9-8）：给所有房间派发 `UpdateConfig`。
     ///
     /// 配置不是构造期快照——`RoomsV1::new(config)` 之后配置仍可变。
-    /// TODO(阶段 5): `watch_config` 文件轮询监听（解析 server_config.yml），机制 = 本方法。
     pub async fn update_config(&self, config: Arc<RoomConfig>) {
-        *self.inner.config.write().await = Arc::clone(&config);
-        let senders: Vec<(RoomId, mpsc::Sender<Envelope>)> = {
-            let rooms = self.inner.rooms.read().await;
-            rooms
-                .iter()
-                .map(|(rid, h)| (rid.clone(), h.tx.clone()))
-                .collect()
-        };
-        for (room_id, tx) in senders {
-            let env = Envelope {
-                ctx: CmdCtx {
-                    origin: Origin::System,
-                    room_id,
-                },
-                cmd: RoomCommand::UpdateConfig {
-                    config: Arc::clone(&config),
-                },
-                respond: None,
-            };
-            let _ = tx.send(env).await;
-        }
+        broadcast_config(&self.inner, config).await;
+    }
+
+    /// 配置文件轮询监听（§4.9-8）：周期检查 `server_config.yml`（`R0SEMI_MP_CONFIG` 可改路径），
+    /// 内容变化 → 重新解析 → `update_config` 广播给所有房间。
+    ///
+    /// 后台任务常驻（spawn 后立即返回）；文件不存在 / 解析失败仅 warn 并保留旧配置
+    /// （运行时配置损坏不致命，启动时 `Config::load` 才是硬校验）。
+    pub fn watch_config(&self, path: std::path::PathBuf, interval: Duration) {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            // 直接驱动 BusInner（watch 是系统内务，不走 dispatch 路由）
+            let bus_inner = inner;
+            let mut last: Option<Arc<RoomConfig>> = None;
+            loop {
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(text) => {
+                        let mut cfg = crate::config::Config::default();
+                        match cfg.apply_yaml(&text, Some(&path.display().to_string())) {
+                            Ok(()) => {
+                                let rooms = Arc::new(cfg.rooms);
+                                let changed = last.as_ref().is_none_or(|prev| *prev != rooms);
+                                if changed {
+                                    tracing::info!(
+                                        "config reloaded from {}: {:?}",
+                                        path.display(),
+                                        rooms
+                                    );
+                                    broadcast_config(&bus_inner, Arc::clone(&rooms)).await;
+                                    last = Some(rooms);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("config reload from {} failed: {e}", path.display());
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if last.is_none() {
+                            tracing::warn!(
+                                "config file {} not found; using defaults",
+                                path.display()
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!("config read {}: {e}", path.display()),
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
     }
 
     /// 路由解析 + 投递（§4.9-4 路由规则）。
@@ -583,5 +611,32 @@ fn business(code: RoomErrorCode, msg: &str) -> RoomError {
 fn internal(msg: &str) -> RoomError {
     RoomError::Internal {
         msg: msg.to_owned(),
+    }
+}
+
+/// 配置热更广播（§4.9-8）：更新生效配置 + 给所有房间派发 `UpdateConfig`。
+///
+/// `update_config` 与 `watch_config` 共用（watch 直接驱动 `BusInner`）。
+async fn broadcast_config(inner: &Arc<BusInner>, config: Arc<RoomConfig>) {
+    *inner.config.write().await = Arc::clone(&config);
+    let senders: Vec<(RoomId, mpsc::Sender<Envelope>)> = {
+        let rooms = inner.rooms.read().await;
+        rooms
+            .iter()
+            .map(|(rid, h)| (rid.clone(), h.tx.clone()))
+            .collect()
+    };
+    for (room_id, tx) in senders {
+        let env = Envelope {
+            ctx: CmdCtx {
+                origin: Origin::System,
+                room_id,
+            },
+            cmd: RoomCommand::UpdateConfig {
+                config: Arc::clone(&config),
+            },
+            respond: None,
+        };
+        let _ = tx.send(env).await;
     }
 }

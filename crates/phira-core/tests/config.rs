@@ -64,3 +64,77 @@ fn listen_port_keep_default_when_env_absent() {
     let cfg = Config::load_from(fake_env(&[("R0SEMI_MP_API_BASE", "x")])).unwrap();
     assert_eq!(cfg.listen.port(), 12346);
 }
+
+// —— 阶段 5：server_config.yml（§4.6-4 / §4.9-8）——
+
+#[test]
+fn yaml_full_fields() {
+    // 全字段 yml：listen + api_base + monitors
+    let cfg = Config::load_from_yaml(
+        fake_env(&[]),
+        Some("listen: \"127.0.0.1:19999\"\napi_base: \"http://mock.test\"\nmonitors: [7, 8, 9]\n"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.listen.port(), 19999);
+    assert_eq!(cfg.listen.ip().to_string(), "127.0.0.1");
+    assert_eq!(cfg.api_base, "http://mock.test");
+    assert_eq!(cfg.rooms.monitors, vec![7, 8, 9]);
+}
+
+#[test]
+fn yaml_partial_fields_keep_defaults() {
+    // 只给 monitors：其余保持默认（缺失字段不覆盖）
+    let cfg = Config::load_from_yaml(fake_env(&[]), Some("monitors: [42]\n"), None).unwrap();
+    assert_eq!(cfg.rooms.monitors, vec![42]);
+    assert_eq!(cfg.listen.port(), 12346, "缺失字段保持默认");
+    assert_eq!(cfg.api_base, "https://phira.5wyxi.com", "缺失字段保持默认");
+}
+
+#[test]
+fn yaml_with_comments_and_empty_lines() {
+    let cfg = Config::load_from_yaml(
+        fake_env(&[]),
+        Some("# r0semi-mp 配置\n\n# 观战者白名单\nmonitors:\n  - 2\n  - 5\n"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.rooms.monitors, vec![2, 5]);
+}
+
+#[test]
+fn yaml_env_overrides_file() {
+    // 优先级：yml < 环境变量（部署环境覆盖文件，§4.5）
+    let cfg = Config::load_from_yaml(
+        fake_env(&[("R0SEMI_MP_API_BASE", "https://env-override.test")]),
+        Some("api_base: \"https://file.test\"\n"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.api_base, "https://env-override.test");
+}
+
+#[test]
+fn yaml_invalid_errors() {
+    let err =
+        Config::load_from_yaml(fake_env(&[]), Some("monitors: [not-a-number\n"), None).unwrap_err();
+    assert!(matches!(err, ConfigError::InvalidYaml { .. }), "{err:?}");
+}
+
+#[test]
+fn yaml_invalid_listen_errors() {
+    let err = Config::load_from_yaml(fake_env(&[]), Some("listen: \"nope\"\n"), None).unwrap_err();
+    assert!(matches!(err, ConfigError::InvalidYaml { .. }), "{err:?}");
+}
+
+#[test]
+fn yaml_unknown_fields_ignored() {
+    // 未知字段容忍（向前兼容：老版本服务器读新配置不炸）
+    let cfg = Config::load_from_yaml(
+        fake_env(&[]),
+        Some("monitors: [1]\nfuture_field: \"whatever\"\n"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.rooms.monitors, vec![1]);
+}

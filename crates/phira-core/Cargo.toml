@@ -19,6 +19,9 @@ doc_markdown = "allow"
 [dependencies]
 phira-api = { path = "../phira-api" }
 tokio.workspace = true
+# server_config.yml 解析（§4.6-4 / §4.9-8）；phira-api 零 serde 红线不受影响（DTO 在本 crate）
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
 async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

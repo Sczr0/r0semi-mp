@@ -56,7 +56,14 @@ async fn main() -> Result<()> {
     // 鉴权（回源 /me，§6.5-14）
     let auth: Arc<dyn phira_api::AuthHandler> =
         Arc::new(phira_server::http::HttpAuth::new(config.api_base.clone()));
-    // TODO(阶段 5): bus.watch_config（文件轮询 → update_config，机制已就绪）
+
+    // 配置热重载（§4.9-8）：文件轮询 → update_config；路径 = R0SEMI_MP_CONFIG 或默认
+    let config_path = std::env::var("R0SEMI_MP_CONFIG")
+        .unwrap_or_else(|_| phira_core::DEFAULT_CONFIG_PATH.to_owned());
+    bus.watch_config(
+        std::path::PathBuf::from(config_path),
+        Duration::from_secs(2),
+    );
 
     let ctx = ConnContext {
         bus,

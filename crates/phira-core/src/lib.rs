@@ -13,5 +13,5 @@ pub mod lifecycle;
 pub mod session;
 
 pub use bus::{Bus, CommandStats, EventSink, Metrics};
-pub use config::{Config, ConfigError};
+pub use config::{Config, ConfigError, DEFAULT_CONFIG_PATH};
 pub use session::{LifecycleFact, SessionHandle};
