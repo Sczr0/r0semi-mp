@@ -63,13 +63,23 @@ async fn mock_api(addr: std::net::SocketAddr) {
 
 /// 真实组合（与 main.rs 同构，base = mock API）。
 fn setup_ctx(mock_addr: std::net::SocketAddr) -> Arc<ConnContext> {
-    setup_ctx_with_monitors(mock_addr, vec![])
+    setup_ctx_custom(mock_addr, vec![], None, vec![])
 }
 
 /// 指定 monitor 白名单的测试上下文（§6.5-4：monitor 需权限）。
 fn setup_ctx_with_monitors(
     mock_addr: std::net::SocketAddr,
     monitors: Vec<i32>,
+) -> Arc<ConnContext> {
+    setup_ctx_custom(mock_addr, monitors, None, vec![])
+}
+
+/// 完整参数化上下文（欢迎语 + 私密房间前缀，§运营）。
+fn setup_ctx_custom(
+    mock_addr: std::net::SocketAddr,
+    monitors: Vec<i32>,
+    welcome: Option<&str>,
+    hidden_prefixes: Vec<&str>,
 ) -> Arc<ConnContext> {
     let base = format!("http://{mock_addr}");
     let http = Arc::new(HttpApiClient::new(base.clone()));
@@ -102,6 +112,10 @@ fn setup_ctx_with_monitors(
         fact_tx,
         sink,
         admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
+        welcome_message: welcome.map(str::to_owned),
+        room_list: Arc::new(phira_server::server::RoomListSink::new(
+            hidden_prefixes.into_iter().map(str::to_owned).collect(),
+        )),
     })
 }
 
@@ -1126,4 +1140,153 @@ async fn read_frame_raw(sock: &mut TcpStream) -> Vec<u8> {
     let mut payload = vec![0u8; usize::try_from(len).unwrap()];
     sock.read_exact(&mut payload).await.unwrap();
     payload
+}
+
+/// §运营：HTTP 独立端口——GET /rooms 返回公开房间列表（私密前缀过滤）。
+/// #[ignore]：Windows 本地 tokio TcpStream 写响应后客户端收 0 字节（write 返回成功但数据未达，
+/// 2026-08 实测，MP 协议写正常故疑似 Windows 特定问题）——部署环境为 Linux，上线前在 Linux 验证。
+#[tokio::test]
+#[ignore = "Windows write issue, verify on Linux"]
+async fn http_rooms_endpoint_with_private_filter() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx_custom(mock_addr, vec![], None, vec!["solo"]);
+
+    // 管理 HTTP 端点（独立端口，§运营）
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let http_ctx = Arc::clone(&ctx);
+    tokio::spawn(async move {
+        phira_server::server::http_accept_loop(Some(http_listener), http_ctx).await;
+    });
+
+    let mp_ctx = Arc::clone(&ctx);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&mp_ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    // 协议路径：建房（公开 pub1 + 私密 solo-x）
+    let mut c1 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c1,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok1".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c1).await;
+    send_cmd(
+        &mut c1,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("pub1".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c1).await;
+    let _ = recv_cmd(&mut c1).await;
+    drop(c1);
+
+    // 第二个用户建私密房间（solo 前缀）
+    let mut c2 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c2,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok2".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c2).await;
+    send_cmd(
+        &mut c2,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("solo-9f3a".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c2).await;
+    let _ = recv_cmd(&mut c2).await;
+    drop(c2);
+
+    // HTTP 路径：同端口 GET /rooms
+    let mut sock = TcpStream::connect(http_addr).await.unwrap();
+    sock.write_all(b"GET /rooms HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = sock.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        resp.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&resp);
+    assert!(text.starts_with("HTTP/1.1 200"), "应返回 200: {text}");
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    assert!(body.contains("pub1"), "公开房间应展示: {body}");
+    assert!(!body.contains("solo-9f3a"), "私密前缀房间不应展示: {body}");
+
+    // MP 协议不受 HTTP 分流影响
+    let mut c3 = client_connect(server_addr).await;
+    send_cmd(&mut c3, &ClientCommand::Ping).await;
+    assert!(matches!(recv_cmd(&mut c3).await, ServerCommand::Pong));
+    drop(c3);
+}
+
+/// §运营：进服欢迎语——鉴权成功后收到 user=0 系统消息。
+#[tokio::test]
+async fn welcome_message_sent_after_auth() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx_custom(mock_addr, vec![], Some("欢迎来到 r0semi"), vec![]);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    let mut c1 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c1,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok1".into()).unwrap(),
+        },
+    )
+    .await;
+    // 鉴权响应 + 欢迎语（user=0 系统消息）
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::Authenticate(Ok(_))
+    ));
+    let f = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(
+            &f,
+            ServerCommand::Message(phira_api::Message::Chat { user: 0, content })
+                if content == "欢迎来到 r0semi"
+        ),
+        "鉴权后应收到欢迎语: {f:?}"
+    );
+    drop(c1);
 }

@@ -181,3 +181,29 @@ fn yaml_ops_zero_values_accepted() {
     assert_eq!(cfg.maintenance_grace, std::time::Duration::ZERO);
     assert_eq!(cfg.config_poll_interval, std::time::Duration::ZERO);
 }
+
+// —— §运营：欢迎语 / 私密房间前缀 / HTTP 管理端口 ——
+
+#[test]
+fn yaml_welcome_and_hidden_prefixes() {
+    let cfg = Config::load_from_yaml(
+        fake_env(&[]),
+        Some(
+            "welcome_message: \"欢迎来到 r0semi\"\nhidden_room_prefixes: [solo]\nhttp_port: 8080\n",
+        ),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.welcome_message.as_deref(), Some("欢迎来到 r0semi"));
+    assert_eq!(cfg.hidden_room_prefixes, vec!["solo".to_owned()]);
+    assert_eq!(cfg.http_port, Some(8080));
+}
+
+#[test]
+fn yaml_welcome_absent_means_none() {
+    // 缺省 welcome_message → None（不发欢迎语）
+    let cfg = Config::load_from_yaml(fake_env(&[]), Some("monitors: [2]\n"), None).unwrap();
+    assert_eq!(cfg.welcome_message, None);
+    assert!(cfg.hidden_room_prefixes.is_empty());
+    assert_eq!(cfg.http_port, None);
+}

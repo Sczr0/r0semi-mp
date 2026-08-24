@@ -12,7 +12,7 @@ use tokio::time::Instant;
 use anyhow::Result;
 use phira_api::{
     AuthError, AuthHandler, ClientCommand, CmdCtx, HEARTBEAT_DISCONNECT_TIMEOUT, Origin,
-    RoomCommand, RoomEvent, RoomResponse, ServerCommand, UserInfo,
+    RoomCommand, RoomEvent, RoomId, RoomResponse, ServerCommand, UserInfo,
 };
 use phira_core::{
     Bus, EventSink,
@@ -34,6 +34,8 @@ pub struct Server {
     maintenance_notice: String,
     /// 停机宽限窗口（§11，yml `maintenance_grace`）。
     maintenance_grace: std::time::Duration,
+    /// 管理 HTTP 监听器（§运营：/rooms 房间列表，yml `http_port`）。
+    http_listener: Option<TcpListener>,
 }
 
 impl Server {
@@ -47,13 +49,23 @@ impl Server {
         ctx: ConnContext,
         maintenance_notice: String,
         maintenance_grace: std::time::Duration,
+        http_port: Option<u16>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
+        let http_listener = match http_port {
+            Some(port) => {
+                let l = TcpListener::bind(("0.0.0.0", port)).await?;
+                info!("http admin listening on :{port} (rooms list)");
+                Some(l)
+            }
+            None => None,
+        };
         Ok(Self {
             listener,
             ctx: Arc::new(ctx),
             maintenance_notice,
             maintenance_grace,
+            http_listener,
         })
     }
 
@@ -71,8 +83,12 @@ impl Server {
         let ctx = Arc::clone(&self.ctx);
         let notice = self.maintenance_notice.clone();
         let grace = self.maintenance_grace;
+        // 拆字段给两个 accept 循环（select 分支不能同时 move self）
+        let listener = self.listener;
+        let http_listener = self.http_listener;
 
         tokio::select! {
+            () = http_accept_loop(http_listener, Arc::clone(&ctx)) => {}
             () = shutdown => {
                 info!("shutdown signal received, broadcasting maintenance notice");
                 // §11：广播"服务器维护中"（系统 Chat，user=0）+ 宽限窗口供玩家看到。
@@ -86,26 +102,192 @@ impl Server {
                 info!("maintenance grace window {grace:?}");
                 tokio::time::sleep(grace).await;
             }
-            () = self.accept_loop() => {}
+            () = accept_loop(listener, Arc::clone(&ctx)) => {}
         }
         Ok(())
     }
+}
 
-    async fn accept_loop(self) {
-        let accept = self.listener;
-        loop {
-            match accept.accept().await {
-                Ok((stream, addr)) => {
-                    info!("connection from {addr}");
-                    let ctx = Arc::clone(&self.ctx);
-                    tokio::spawn(async move {
-                        if let Err(err) = handle_connection(stream, addr, ctx).await {
-                            warn!("connection handler error from {addr}: {err:?}");
-                        }
-                    });
-                }
-                Err(err) => warn!("failed to accept: {err:?}"),
+/// MP 协议 accept 循环（组合根 run() 调用）。
+async fn accept_loop(listener: TcpListener, ctx: Arc<ConnContext>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                info!("connection from {addr}");
+                let ctx = Arc::clone(&ctx);
+                tokio::spawn(async move {
+                    if let Err(err) = handle_connection(stream, addr, ctx).await {
+                        warn!("connection handler error from {addr}: {err:?}");
+                    }
+                });
             }
+            Err(err) => warn!("failed to accept: {err:?}"),
+        }
+    }
+}
+
+/// 管理 HTTP accept 循环（独立端口，§运营：/rooms；http_port 未配置时立即结束）。
+pub async fn http_accept_loop(listener: Option<TcpListener>, ctx: Arc<ConnContext>) {
+    let Some(listener) = listener else {
+        return;
+    };
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                let ctx = Arc::clone(&ctx);
+                tokio::spawn(async move {
+                    if let Err(err) = http_serve(stream, addr, ctx).await {
+                        warn!("http handler error from {addr}: {err:?}");
+                    }
+                });
+            }
+            Err(err) => warn!("http accept failed: {err:?}"),
+        }
+    }
+}
+
+/// 房间列表快照项（§运营：公开房间列表，`/rooms` HTTP 端点返回）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoomInfo {
+    /// 房间 id。
+    pub id: String,
+    /// 房主用户 id。
+    pub host: i32,
+    /// 当前人数。
+    pub users: usize,
+    /// 房间状态。
+    pub state: String,
+    /// 是否锁定。
+    pub locked: bool,
+}
+
+/// 房间列表观察者（§7.3 观察者模式）：订阅事件维护活动房间快照。
+///
+/// 纯观察者——不碰核心（bus/actor），数据源 = EventSink 事件流。
+/// 隐私过滤：房间 id 匹配 `hidden_prefixes` 任一前缀 → 不进入公开列表。
+pub struct RoomListSink {
+    rooms: tokio::sync::RwLock<std::collections::HashMap<RoomId, RoomInfo>>,
+    /// 私密房间 id 前缀（yml `hidden_room_prefixes`，如 `["solo"]`）。
+    hidden_prefixes: Vec<String>,
+}
+
+impl RoomListSink {
+    /// 构造。`hidden_prefixes` = 私密房间 id 前缀（命中则不公开展示）。
+    #[must_use]
+    pub fn new(hidden_prefixes: Vec<String>) -> Self {
+        Self {
+            rooms: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            hidden_prefixes,
+        }
+    }
+
+    fn hidden(&self, id: &RoomId) -> bool {
+        self.hidden_prefixes
+            .iter()
+            .any(|p| id.as_str().starts_with(p))
+    }
+
+    /// 公开房间列表快照（已过滤私密房间）。
+    pub async fn snapshot(&self) -> Vec<RoomInfo> {
+        let mut list: Vec<_> = self.rooms.read().await.values().cloned().collect();
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        list
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for RoomListSink {
+    async fn deliver(&self, _user_id: i32, event: &RoomEvent) {
+        use phira_api::RoomEvent as E;
+        match event {
+            E::RoomCreated { room_id, host } => {
+                if !self.hidden(room_id) {
+                    self.rooms.write().await.insert(
+                        room_id.clone(),
+                        RoomInfo {
+                            id: room_id.as_str().to_owned(),
+                            host: *host,
+                            users: 1,
+                            state: "SelectChart".to_owned(),
+                            locked: false,
+                        },
+                    );
+                }
+            }
+            E::RoomClosed { room_id } => {
+                self.rooms.write().await.remove(room_id);
+            }
+            E::UserJoined { room_id, .. } => {
+                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
+                    r.users += 1;
+                }
+            }
+            E::UserLeft { room_id, .. } => {
+                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
+                    r.users = r.users.saturating_sub(1);
+                }
+            }
+            E::NewHost {
+                room_id, new_host, ..
+            } => {
+                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
+                    r.host = *new_host;
+                }
+            }
+            E::SelectChart { room_id, id, .. } => {
+                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
+                    r.state = format!("SelectChart({id})");
+                }
+            }
+            E::GameStart { room_id, .. } => {
+                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
+                    "WaitingForReady".clone_into(&mut r.state);
+                }
+            }
+            E::StartPlaying { room_id } => {
+                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
+                    "Playing".clone_into(&mut r.state);
+                }
+            }
+            E::GameEnd { room_id, chart } | E::CancelGame { room_id, chart, .. } => {
+                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
+                    r.state = match chart {
+                        Some(id) => format!("SelectChart({id})"),
+                        None => "SelectChart".to_owned(),
+                    };
+                }
+            }
+            E::LockRoom { room_id, lock } => {
+                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
+                    r.locked = *lock;
+                }
+            }
+            // 热路径（RelayTouches/Judges）与不改变列表展示的（Chat/Ready/Played/Abort/CycleRoom）
+            // 不更新快照
+            _ => {}
+        }
+    }
+}
+
+/// 组合投递目标：多个 EventSink 的扇出（§4.9-5 观察者组合，bus 零改动）。
+#[derive(Default)]
+pub struct CompositeSink {
+    sinks: tokio::sync::RwLock<Vec<Arc<dyn EventSink>>>,
+}
+
+impl CompositeSink {
+    /// 追加一个观察者。
+    pub async fn push(&self, sink: Arc<dyn EventSink>) {
+        self.sinks.write().await.push(sink);
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for CompositeSink {
+    async fn deliver(&self, user_id: i32, event: &RoomEvent) {
+        let sinks = self.sinks.read().await.clone();
+        for sink in sinks {
+            sink.deliver(user_id, event).await;
         }
     }
 }
@@ -125,6 +307,10 @@ pub struct ConnContext {
     pub sink: Arc<SessionSink>,
     /// 连接准入（§10.4：未鉴权连接上限 + 每 IP 限额）。
     pub admission: Arc<ConnectionAdmission>,
+    /// 进服欢迎语（yml `welcome_message`；鉴权成功后发给本人，None = 不发）。
+    pub welcome_message: Option<String>,
+    /// 房间列表快照（§运营 `/rooms`；HTTP 分流端点读取）。
+    pub room_list: Arc<RoomListSink>,
 }
 
 /// 事件投递：`user_id → 会话发送通道`映射 + 转换层目标过滤。
@@ -311,6 +497,8 @@ pub async fn handle_connection(
     ctx: Arc<ConnContext>,
 ) -> Result<()> {
     // 连接准入（§10.4）：未鉴权连接上限 + 每 IP 限额——超限直接断开
+    // 注：HTTP 管理端点走独立端口（`http_port`），不混入 MP 入口（peek 分流在
+    // Windows/current_thread 下不稳定，2026-08 实测 5s 延迟 + 后续卡死）
     let peer_ip = addr.ip();
     if !ctx.admission.try_acquire(peer_ip) {
         return Ok(());
@@ -429,6 +617,80 @@ pub async fn handle_connection(
     Ok(())
 }
 
+/// 管理 HTTP 端点（§运营，独立端口 `http_port`）：房间列表 `/rooms`。
+///
+/// 极简 HTTP/1.1 响应（手写，与回源客户端对称）；仅读请求头（≤4KiB 防滥用）。
+///
+/// # Errors
+///
+/// 读写对端失败时返回 IO 错误。
+pub async fn http_serve(
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    ctx: Arc<ConnContext>,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 读请求头（到空行，<=4KiB）
+    let mut head = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&buf[..n]);
+        if head.windows(4).any(|w| {
+            w == b"
+
+"
+        }) || head.len() > 4096
+        {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&head);
+    let path = text
+        .lines()
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .unwrap_or("/");
+
+    // 路由
+    let (status, body, ctype) = match path {
+        "/rooms" => {
+            let rooms = ctx.room_list.snapshot().await;
+            let body = serde_json::to_string(&rooms).unwrap_or_else(|_| "[]".to_owned());
+            ("200 OK", body, "application/json; charset=utf-8")
+        }
+        "/" => (
+            "200 OK",
+            r#"{"service":"r0semi-mp","endpoints":["/rooms"]}"#.to_owned(),
+            "application/json; charset=utf-8",
+        ),
+        _ => ("404 Not Found", "not found".to_owned(), "text/plain"),
+    };
+
+    let resp = format!(
+        "HTTP/1.1 {status}
+Content-Type: {ctype}
+Content-Length: {}
+Connection: close
+
+{body}",
+        body.len()
+    );
+    info!(
+        "[dbg-http] resp len {} status {status} path {path}",
+        resp.len()
+    );
+    let n = stream.write(resp.as_bytes()).await?;
+    info!("[dbg-http] wrote {n}/{resp} bytes");
+    let _ = stream.shutdown().await;
+    info!("http {path} from {addr} -> {status}");
+    Ok(())
+}
+
 /// 单帧处理（handler 主体）：心跳 / 鉴权 / 命令派发。
 async fn handle_frame(
     ctx: &ConnContext,
@@ -538,6 +800,15 @@ async fn authenticate_flow(
             let _ = send_tx
                 .send(ServerCommand::Authenticate(Ok((info, room_state))))
                 .await;
+            // 进服欢迎语（§运营）：鉴权成功后发给本人（user=0 系统消息，协议兼容）
+            if let Some(welcome) = &ctx.welcome_message {
+                let _ = send_tx
+                    .send(ServerCommand::Message(phira_api::Message::Chat {
+                        user: 0,
+                        content: welcome.clone(),
+                    }))
+                    .await;
+            }
             state.authed.store(true, Ordering::SeqCst);
             // 鉴权转正：释放未鉴权准入计数（§10.4）
             if state.admission_held.swap(false, Ordering::SeqCst) {

@@ -27,6 +27,12 @@ pub struct Config {
     pub config_poll_interval: std::time::Duration,
     /// 停机维护通知文案（§11 系统 Chat，默认中文提示）。
     pub maintenance_notice: String,
+    /// 进服欢迎语（§运营：鉴权成功后广播给本人，user=0 系统消息；None = 不发）。
+    pub welcome_message: Option<String>,
+    /// 私密房间 id 前缀（§运营：房间列表 `/rooms` 不展示这些房间，如 `["solo"]`）。
+    pub hidden_room_prefixes: Vec<String>,
+    /// 管理 HTTP 端口（§运营：`/rooms` 房间列表；None = 不开启）。
+    pub http_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -41,6 +47,9 @@ impl Default for Config {
             maintenance_grace: std::time::Duration::from_secs(10),
             config_poll_interval: std::time::Duration::from_secs(2),
             maintenance_notice: "服务器维护中，房间即将关闭，请稍后再来".to_owned(),
+            welcome_message: None,
+            hidden_room_prefixes: Vec::new(),
+            http_port: None,
         }
     }
 }
@@ -179,6 +188,15 @@ impl Config {
         if let Some(notice) = yaml.maintenance_notice {
             self.maintenance_notice = notice;
         }
+        if let Some(msg) = yaml.welcome_message {
+            self.welcome_message = Some(msg);
+        }
+        if let Some(prefixes) = yaml.hidden_room_prefixes {
+            self.hidden_room_prefixes = prefixes;
+        }
+        if let Some(port) = yaml.http_port {
+            self.http_port = Some(port);
+        }
         Ok(())
     }
 }
@@ -207,4 +225,10 @@ struct YamlConfig {
     config_poll_interval: Option<u64>,
     /// 停机维护通知文案。
     maintenance_notice: Option<String>,
+    /// 进服欢迎语（None/缺省 = 不发）。
+    welcome_message: Option<String>,
+    /// 私密房间 id 前缀（房间列表不展示）。
+    hidden_room_prefixes: Option<Vec<String>>,
+    /// 管理 HTTP 端口（None = 不开启）。
+    http_port: Option<u16>,
 }

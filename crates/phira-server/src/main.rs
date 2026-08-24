@@ -49,9 +49,19 @@ async fn main() -> Result<()> {
         LifecycleTask::new(bus.clone(), config.reconnect_window);
     tokio::spawn(lifecycle_task.run());
 
-    // 事件投递（§6.6 表 2）：user → 会话写通道
+    // 事件投递（§6.6 表 2）：user → 会话写通道 + 房间列表观察者（§7.3 组合）
     let sink = Arc::new(SessionSink::new());
-    bus.attach_sink(Arc::clone(&sink) as Arc<dyn EventSink>);
+    let room_list = Arc::new(phira_server::server::RoomListSink::new(
+        config.hidden_room_prefixes.clone(),
+    ));
+    let composite = Arc::new(phira_server::server::CompositeSink::default());
+    composite
+        .push(Arc::clone(&sink) as Arc<dyn EventSink>)
+        .await;
+    composite
+        .push(Arc::clone(&room_list) as Arc<dyn EventSink>)
+        .await;
+    bus.attach_sink(composite as Arc<dyn EventSink>);
 
     // 鉴权（回源 /me，§6.5-14）
     let auth: Arc<dyn phira_api::AuthHandler> =
@@ -76,12 +86,16 @@ async fn main() -> Result<()> {
         sink,
         // 连接准入（§10.4）：未鉴权连接上限 + 每 IP 限额
         admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
+        // 进服欢迎语（yml welcome_message，None = 不发）
+        welcome_message: config.welcome_message.clone(),
+        room_list,
     };
     let server = Server::new(
         config.listen,
         ctx,
         config.maintenance_notice.clone(),
         config.maintenance_grace,
+        config.http_port,
     )
     .await?;
     // systemd 就绪通知（§部署）：bind 成功即"准备好接受连接"（配合 Type=notify）
