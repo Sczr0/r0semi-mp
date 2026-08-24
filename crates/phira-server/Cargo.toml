@@ -32,5 +32,5 @@ webpki-roots = "1.0"
 
 [dev-dependencies]
 # 测试专用：本地 TLS 服务器自签证书生成（§10.3 测试覆盖 TLS 握手路径）
-rcgen = "0.13"
-rustls-pemfile = "2" 
+# 证书直接用 rcgen 的 der()，无需 pemfile（2026-08 删：未使用且被 RUSTSEC-2025-0134 标记 unmaintained）
+rcgen = "0.13" 
