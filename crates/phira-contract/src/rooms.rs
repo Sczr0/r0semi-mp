@@ -121,7 +121,13 @@ fn assert_business(resp: &RoomResponse, code: RoomErrorCode) {
 /// 建房（host = 1）并断言成功。
 async fn create_room(room: &mut Box<dyn RoomActor>) {
     let (resp, events) = room
-        .handle(ctx(1), RoomCommand::CreateRoom { id: rid() })
+        .handle(
+            ctx(1),
+            RoomCommand::CreateRoom {
+                id: rid(),
+                name: "user1".to_owned(),
+            },
+        )
         .await;
     assert!(matches!(resp, Some(RoomResponse::Ok)));
     assert_eq!(
@@ -141,6 +147,7 @@ async fn setup_playing(room: &mut Box<dyn RoomActor>) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await;
@@ -149,6 +156,7 @@ async fn setup_playing(room: &mut Box<dyn RoomActor>) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user3".to_owned(),
         },
     )
     .await;
@@ -188,6 +196,7 @@ async fn create_and_join_flow<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: false,
+                name: "user2".to_owned(),
             },
         )
         .await;
@@ -216,6 +225,7 @@ async fn create_and_join_flow<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: false,
+                name: "user2".to_owned(),
             },
         )
         .await;
@@ -232,6 +242,7 @@ async fn create_and_join_flow<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: false,
+                name: "user3".to_owned(),
             },
         )
         .await;
@@ -292,6 +303,7 @@ async fn permissions_and_state<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await;
@@ -324,6 +336,7 @@ async fn permissions_and_state<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user3".to_owned(),
         },
     )
     .await;
@@ -341,6 +354,7 @@ async fn permissions_and_state<F: RoomFactory>(factory: &F) {
 }
 
 /// 游戏流程（§6.5-8/10/11）：Ready → StartPlaying → Played → GameEnd/cycle
+#[allow(clippy::too_many_lines)] // 游戏全流程脚本长是验收场景需求
 async fn game_flow<F: RoomFactory>(factory: &F) {
     let mut room = factory.create(rid());
     setup_playing(&mut room).await;
@@ -415,6 +429,7 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await;
@@ -423,6 +438,7 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user3".to_owned(),
         },
     )
     .await;
@@ -469,6 +485,7 @@ async fn disconnect_reconnect<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await;
@@ -506,6 +523,7 @@ async fn disconnect_reconnect<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await;
@@ -545,6 +563,7 @@ async fn disconnect_reconnect<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await;
@@ -597,6 +616,7 @@ async fn disconnect_reconnect<F: RoomFactory>(factory: &F) {
 }
 
 /// monitor 与热路径转发（§6.5-1/4/16/17）
+#[allow(clippy::too_many_lines)] // monitor 权限/热路径脚本长是验收场景需求
 async fn monitor_and_relay<F: RoomFactory>(factory: &F) {
     // —— 白名单 monitor：UpdateConfig 动态注入（§4.9-8）——
     let config = RoomConfig { monitors: vec![9] };
@@ -617,6 +637,7 @@ async fn monitor_and_relay<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: true,
+                name: "user9".to_owned(),
             },
         )
         .await;
@@ -640,6 +661,7 @@ async fn monitor_and_relay<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: true,
+                name: "user5".to_owned(),
             },
         )
         .await;
@@ -689,6 +711,7 @@ async fn monitor_and_relay<F: RoomFactory>(factory: &F) {
                 RoomCommand::JoinRoom {
                     id: rid(),
                     monitor: false,
+                    name: format!("user{u}"),
                 },
             )
             .await;
@@ -703,6 +726,7 @@ async fn monitor_and_relay<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: false,
+                name: "user9".to_owned(),
             },
         )
         .await;
@@ -719,6 +743,7 @@ async fn config_and_client_state<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await;
@@ -811,6 +836,7 @@ async fn chat_and_edge_cases<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await;
@@ -819,6 +845,7 @@ async fn chat_and_edge_cases<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user3".to_owned(),
         },
     )
     .await;
@@ -890,6 +917,7 @@ async fn monitor_capacity_and_config_hotswap<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: false,
+                name: format!("user{u}"),
             },
         )
         .await;
@@ -901,6 +929,7 @@ async fn monitor_capacity_and_config_hotswap<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: false,
+                name: "user9".to_owned(),
             },
         )
         .await;
@@ -912,6 +941,7 @@ async fn monitor_capacity_and_config_hotswap<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: true,
+                name: "user99".to_owned(),
             },
         )
         .await;
@@ -930,6 +960,7 @@ async fn monitor_capacity_and_config_hotswap<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: true,
+                name: "user7".to_owned(),
             },
         )
         .await;
@@ -948,6 +979,7 @@ async fn monitor_capacity_and_config_hotswap<F: RoomFactory>(factory: &F) {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: true,
+                name: "user7".to_owned(),
             },
         )
         .await;
@@ -966,6 +998,7 @@ async fn host_leave_migrates<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await;
@@ -974,6 +1007,7 @@ async fn host_leave_migrates<F: RoomFactory>(factory: &F) {
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user3".to_owned(),
         },
     )
     .await;

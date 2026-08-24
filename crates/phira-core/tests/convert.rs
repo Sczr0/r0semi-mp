@@ -39,7 +39,10 @@ fn table1_full_mapping() {
         ),
         (
             ClientCommand::CreateRoom { id: rid() },
-            RoomCommand::CreateRoom { id: rid() },
+            RoomCommand::CreateRoom {
+                id: rid(),
+                name: "user1".to_owned(),
+            },
         ),
         (
             ClientCommand::JoinRoom {
@@ -49,6 +52,7 @@ fn table1_full_mapping() {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: true,
+                name: "user1".to_owned(),
             },
         ),
         (ClientCommand::LeaveRoom, RoomCommand::LeaveRoom),
@@ -74,7 +78,7 @@ fn table1_full_mapping() {
         (ClientCommand::Abort, RoomCommand::Abort),
     ];
     for (client, expected) in cases {
-        assert_eq!(client_to_room(client), Some(expected));
+        assert_eq!(client_to_room(client, "user1".to_owned()), Some(expected));
     }
 }
 
@@ -82,14 +86,17 @@ fn table1_full_mapping() {
 fn table1_ping_auth_are_core() {
     // 心跳 / 鉴权归 core，不派发房间（§4.9-3）
     assert_eq!(
-        client_to_room(ClientCommand::Ping),
+        client_to_room(ClientCommand::Ping, String::new()),
         None,
         "Ping 不应派发房间"
     );
     assert_eq!(
-        client_to_room(ClientCommand::Authenticate {
-            token: Varchar::new("t".into()).unwrap(),
-        }),
+        client_to_room(
+            ClientCommand::Authenticate {
+                token: Varchar::new("t".into()).unwrap(),
+            },
+            String::new(),
+        ),
         None,
         "Authenticate 不应派发房间"
     );

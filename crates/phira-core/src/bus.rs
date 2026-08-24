@@ -264,7 +264,7 @@ impl Bus {
             return Err(business(RoomErrorCode::AlreadyInRoom, "already in room"));
         }
         let (room_id, tx) = match &cmd {
-            RoomCommand::CreateRoom { id } => {
+            RoomCommand::CreateRoom { id, .. } => {
                 // 新建房间：factory.create（出生证明）+ channel + 任务（§4.9-9）
                 let mut rooms = self.inner.rooms.write().await;
                 if rooms.contains_key(id) {
@@ -503,13 +503,24 @@ async fn process_events(
                     }
                 },
                 _ => {
-                    // 领域事件：恒 All（§4.4 分类；UserJoined 对称情形进 Oracle 核实清单）
+                    // 领域事件：恒 All（§4.4 分类）。
+                    // 加入者/房主本人也在投递列表：其路由增量在本节之后才应用（§4.9-4
+                    // 时序不变量“先解析后应用”只对“离开者仍被解析到”成立；加入者须手动补入）
                     deliveries.extend(
                         routes
                             .iter()
                             .filter(|(_, rid)| **rid == *room_id)
                             .map(|(u, _)| (*u, ev.clone())),
                     );
+                    match ev {
+                        RoomEvent::RoomCreated { host, .. } => {
+                            deliveries.push((*host, ev.clone()));
+                        }
+                        RoomEvent::UserJoined { user, .. } => {
+                            deliveries.push((user.id, ev.clone()));
+                        }
+                        _ => {}
+                    }
                 }
             }
         }

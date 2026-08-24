@@ -28,13 +28,22 @@ use tracing::{debug, warn};
 
 use crate::bus::Bus;
 
-/// 会话注册表：`user_id → 当前会话纪元`（§4.9-3）。
+/// 会话注册表：`user_id → (当前会话纪元, 昵称)`（§4.9-3）。
 ///
 /// 独立于任务（server 侧 `register` 与任务侧 `is_current` 并发访问）——
 /// 用 `std::sync::Mutex`（临界区极短，无 await）。
-#[derive(Default)]
+/// 昵称存这里：`CreateRoom`/`JoinRoom` 派发时需要（§6.6 表 2），
+/// 避免 impl 猜名字 / core 另持影子状态。
 pub struct SessionRegistry {
-    inner: Mutex<HashMap<i32, u64>>,
+    inner: Mutex<HashMap<i32, (u64, String)>>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -44,19 +53,28 @@ impl SessionRegistry {
         Self::default()
     }
 
-    /// 用户连接建立：分配新纪元（旧纪元 + 1）并替换。
+    /// 用户连接建立：分配新纪元（旧纪元 + 1）并替换，记录昵称。
     ///
     /// 同 id 重连 = 再次调用 → epoch+1（§6.5-19 替换会话语义）。
     /// 由 server 鉴权成功后调用。
     #[must_use]
-    pub fn register(&self, user_id: i32) -> u64 {
+    pub fn register(&self, user_id: i32, name: String) -> u64 {
         let mut m = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let epoch = m.get(&user_id).copied().unwrap_or(0) + 1;
-        m.insert(user_id, epoch);
+        let epoch = m.get(&user_id).map_or(0, |(e, _)| *e) + 1;
+        m.insert(user_id, (epoch, name));
         epoch
+    }
+
+    /// 用户当前昵称（CreateRoom/JoinRoom 派发填充，§6.6 表 2）。
+    pub fn name_of(&self, user_id: i32) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&user_id)
+            .map(|(_, n)| n.clone())
     }
 
     /// `epoch` 是否为该用户当前纪元（事实/定时器有效性校验，§4.9-3）。
@@ -65,8 +83,7 @@ impl SessionRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&user_id)
-            .copied()
-            == Some(epoch)
+            .is_some_and(|(e, _)| *e == epoch)
     }
 }
 

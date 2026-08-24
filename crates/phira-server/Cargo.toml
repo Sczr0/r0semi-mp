@@ -22,3 +22,6 @@ rand.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

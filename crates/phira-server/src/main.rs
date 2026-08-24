@@ -5,16 +5,24 @@
 //! 换实现 = 组合根换工厂（§3.2：灰度已降级为运维选项，项目内零灰度代码）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use phira_api::{ApiClient, RandomSource, RoomConfig, RoomDeps, RoomFactory};
-use phira_core::{Bus, Config};
-use phira_server::server::Server;
+use phira_core::{Bus, Config, EventSink, lifecycle::LifecycleTask};
+use phira_server::server::{ConnContext, Server, SessionSink};
 
 /// 老板接线（§4.5）。
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
     let config = Config::load()?;
+    eprintln!("[boot] api_base = {}", config.api_base);
 
     // 老板接线：决定谁上架 + 注入外部依赖（§4.9-6）
     // 单一 HTTP 实例，auth 与 chart/record 共享（评审 §8 五-1）
@@ -35,10 +43,28 @@ async fn main() -> Result<()> {
         Arc::new(rooms) as Arc<dyn RoomFactory>,
         Arc::new(config.rooms.clone()) as Arc<RoomConfig>,
     );
-    // TODO(阶段 2): 鉴权编排（token → AuthHandler → 用户注册表 → 会话替换，§4.9-3）
-    // let auth: Arc<dyn AuthHandler> = Arc::new(http::HttpAuth::new(config.api_base.clone()));
+
+    // 用户生命周期（§4.9-3）：单一生产者任务 + 注册表（10s 重连窗口，§6.5-21）
+    let (lifecycle_task, registry, fact_tx) =
+        LifecycleTask::new(bus.clone(), Duration::from_secs(10));
+    tokio::spawn(lifecycle_task.run());
+
+    // 事件投递（§6.6 表 2）：user → 会话写通道
+    let sink = Arc::new(SessionSink::new());
+    bus.attach_sink(Arc::clone(&sink) as Arc<dyn EventSink>);
+
+    // 鉴权（回源 /me，§6.5-14）
+    let auth: Arc<dyn phira_api::AuthHandler> =
+        Arc::new(phira_server::http::HttpAuth::new(config.api_base.clone()));
     // TODO(阶段 5): bus.watch_config（文件轮询 → update_config，机制已就绪）
 
-    Server::new(config.listen, bus).await?.run().await?;
+    let ctx = ConnContext {
+        bus,
+        auth,
+        registry,
+        fact_tx,
+        sink,
+    };
+    Server::new(config.listen, ctx).await?.run().await?;
     Ok(())
 }

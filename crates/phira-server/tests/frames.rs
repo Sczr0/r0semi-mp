@@ -12,11 +12,68 @@
 
 use std::{sync::Arc, time::Duration};
 
-use phira_api::{ClientCommand, ServerCommand, decode_packet};
-use phira_server::server::handle_connection;
+use phira_api::{
+    AuthError, AuthHandler, ClientCommand, CmdCtx, RoomCommand, RoomConfig, RoomEvent, RoomFactory,
+    RoomId, RoomResponse, ServerCommand, UserIdentity, decode_packet,
+};
+use phira_core::{Bus, lifecycle::LifecycleTask};
+use phira_server::server::{ConnContext, SessionSink, handle_connection};
 use phira_server::stream::PROTOCOL_VERSION;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+/// 最小测试上下文：无操作工厂 + 拒绝鉴权（心跳测试不鉴权，只验证帧层）。
+fn test_ctx() -> Arc<ConnContext> {
+    let factory = Arc::new(NoopFactory);
+    let bus = Bus::new(
+        factory as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig { monitors: vec![] }),
+    );
+    let (task, registry, fact_tx) = LifecycleTask::new(bus.clone(), Duration::from_secs(10));
+    tokio::spawn(task.run());
+    let sink = Arc::new(SessionSink::new());
+    bus.attach_sink(Arc::clone(&sink) as Arc<dyn phira_core::EventSink>);
+    Arc::new(ConnContext {
+        bus,
+        auth: Arc::new(NoopAuth),
+        registry,
+        fact_tx,
+        sink,
+    })
+}
+
+struct NoopFactory;
+
+impl RoomFactory for NoopFactory {
+    fn create(&self, _room_id: RoomId) -> Box<dyn phira_api::RoomActor> {
+        Box::new(NoopActor)
+    }
+}
+
+struct NoopActor;
+
+#[async_trait::async_trait]
+impl phira_api::RoomActor for NoopActor {
+    async fn handle(
+        &mut self,
+        _ctx: CmdCtx,
+        _cmd: RoomCommand,
+    ) -> (Option<RoomResponse>, Vec<RoomEvent>) {
+        (None, Vec::new())
+    }
+}
+
+struct NoopAuth;
+
+#[async_trait::async_trait]
+impl AuthHandler for NoopAuth {
+    async fn authenticate(&self, _token: &str) -> Result<UserIdentity, AuthError> {
+        Err(AuthError::Business {
+            code: phira_api::AuthErrorCode::InvalidToken,
+            msg: "noop auth".to_owned(),
+        })
+    }
+}
 
 /// 便捷：编码一帧（ULEB128 长度前缀 + 载荷，§6.1）。
 fn frame(payload: &[u8]) -> Vec<u8> {
@@ -44,7 +101,7 @@ async fn connect_pair() -> TcpStream {
 
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        handle_connection(stream, addr).await.unwrap();
+        handle_connection(stream, addr, test_ctx()).await.unwrap();
     });
 
     let mut client = TcpStream::connect(addr).await.unwrap();
@@ -94,17 +151,38 @@ async fn multiple_frames_order() {
 }
 
 #[tokio::test]
-async fn raw_authenticate_frame_accepted() {
-    // 带载荷的命令（Authenticate token="ab" = [tag 1, uleb(2), 'a','b']）
-    // 阶段 1 服务端忽略非 Ping（不回复），但连接保持——随后 Ping/Pong 验证存活
+async fn pre_auth_non_ping_ignored() {
+    // §6.5-13：鉴权前收到非 Ping/Authenticate 包 → 忽略（不回复、不打断连接）
+    // Chat = [tag 2, uleb(2), 'h','i']
+    let mut client = connect_pair().await;
+    client
+        .write_all(&frame(&[0x02, 0x02, 0x68, 0x69]))
+        .await
+        .unwrap();
+    // 随后 Ping 仍被应答 → 连接未被破坏
+    client.write_all(&frame(&[0x00])).await.unwrap();
+    let payload = read_frame(&mut client).await;
+    assert_eq!(payload, vec![0x00], "鉴权前非 Ping 忽略，Ping 仍被应答");
+}
+
+#[tokio::test]
+async fn auth_failure_responds_and_stops() {
+    // 鉴权（NoopAuth 拒绝）→ Authenticate(Err) 响应；随后帧被忽略（panicked）
     let mut client = connect_pair().await;
     client
         .write_all(&frame(&[0x01, 0x02, 0x61, 0x62]))
         .await
         .unwrap();
-    client.write_all(&frame(&[0x00])).await.unwrap();
     let payload = read_frame(&mut client).await;
-    assert_eq!(payload, vec![0x00], "非 Ping 命令不打断连接，Ping 仍被应答");
+    let resp: ServerCommand = decode_packet(&payload).unwrap();
+    assert!(
+        matches!(resp, ServerCommand::Authenticate(Err(_))),
+        "NoopAuth 拒绝应回 Authenticate(Err): {resp:?}"
+    );
+    // panicked：后续 Ping 无响应
+    client.write_all(&frame(&[0x00])).await.unwrap();
+    let r = tokio::time::timeout(Duration::from_millis(200), read_frame(&mut client)).await;
+    assert!(r.is_err(), "鉴权失败后不应再有响应");
 }
 
 /// 服务端主动推送路径（阶段 2 广播的前提；真实服务端 Stream 的 `send`）。
@@ -158,7 +236,7 @@ async fn oversized_frame_rejected() {
 
     let server_done = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let _ = handle_connection(stream, addr).await;
+        let _ = handle_connection(stream, addr, test_ctx()).await;
     });
 
     let mut sock = TcpStream::connect(addr).await.unwrap();
@@ -181,7 +259,7 @@ async fn invalid_packet_disconnects() {
 
     let server_done = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let _ = handle_connection(stream, addr).await;
+        let _ = handle_connection(stream, addr, test_ctx()).await;
     });
 
     let mut sock = TcpStream::connect(addr).await.unwrap();

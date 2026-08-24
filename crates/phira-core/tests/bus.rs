@@ -123,6 +123,7 @@ fn ok() -> Option<RoomResponse> {
     Some(RoomResponse::Ok)
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn create_room_registers_route() {
     let factory = Arc::new(ScriptedFactory::default());
@@ -147,7 +148,13 @@ async fn create_room_registers_route() {
 
     // 建房 → 路由增量 host→room
     let resp = bus
-        .dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
+        .dispatch(
+            client_ctx(1),
+            RoomCommand::CreateRoom {
+                id: rid(),
+                name: "user1".to_owned(),
+            },
+        )
         .await
         .unwrap();
     assert!(matches!(resp, RoomResponse::Ok));
@@ -194,15 +201,22 @@ async fn join_then_select_chart_pipeline() {
         Arc::new(RoomConfig::default()),
     );
 
-    bus.dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
     let resp = bus
         .dispatch(
             client_ctx(2),
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: false,
+                name: "user2".to_owned(),
             },
         )
         .await
@@ -262,14 +276,21 @@ async fn leaver_receives_own_leave_room() {
     let sink = FakeSink::default();
     bus.attach_sink(Arc::new(sink.clone()));
 
-    bus.dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
     bus.dispatch(
         client_ctx(2),
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await
@@ -316,9 +337,15 @@ async fn room_closed_cleans_up() {
         Arc::new(RoomConfig::default()),
     );
 
-    bus.dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
     // 触发空房自毁
     bus.dispatch(client_ctx(1), RoomCommand::LeaveRoom)
         .await
@@ -331,6 +358,7 @@ async fn room_closed_cleans_up() {
             RoomCommand::JoinRoom {
                 id: rid(),
                 monitor: false,
+                name: "user2".to_owned(),
             },
         )
         .await;
@@ -348,7 +376,13 @@ async fn room_closed_cleans_up() {
     // 同 id 可重新建房（表已清理；新房间 = 新 actor = 新脚本）
     factory.push(&rid(), vec![(ok(), vec![])]);
     let resp = bus
-        .dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
+        .dispatch(
+            client_ctx(1),
+            RoomCommand::CreateRoom {
+                id: rid(),
+                name: "user1".to_owned(),
+            },
+        )
         .await;
     assert!(resp.is_ok(), "清理后可重建同 id 房间: {resp:?}");
 }
@@ -407,9 +441,15 @@ async fn relay_specific_targets_only() {
     let sink = FakeSink::default();
     bus.attach_sink(Arc::new(sink.clone()));
 
-    bus.dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
     // host 自己发触摸流（无需入房步骤）
     bus.dispatch(
         client_ctx(1),
@@ -423,9 +463,14 @@ async fn relay_specific_targets_only() {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     let deliveries = sink.deliveries.lock().unwrap();
-    assert_eq!(deliveries.len(), 1, "只投递给 monitor 9: {deliveries:?}");
-    assert_eq!(deliveries[0].0, 9);
-    assert!(matches!(deliveries[0].1, RoomEvent::RelayTouches { .. }));
+    // RoomCreated 广播给房主是正确行为（§4.9-4 加入者本人也收）；只断言 Relay 投递
+    let relay: Vec<_> = deliveries
+        .iter()
+        .filter(|(_, ev)| matches!(ev, RoomEvent::RelayTouches { .. }))
+        .collect();
+    assert_eq!(relay.len(), 1, "只投递给 monitor 9: {deliveries:?}");
+    assert_eq!(relay[0].0, 9);
+    assert!(matches!(relay[0].1, RoomEvent::RelayTouches { .. }));
 }
 
 #[tokio::test]
@@ -451,9 +496,15 @@ async fn update_config_broadcast() {
         Arc::new(RoomConfig::default()),
     );
 
-    bus.dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
     let new_cfg = Arc::new(RoomConfig {
         monitors: vec![9, 10],
     });
@@ -499,9 +550,15 @@ async fn system_command_routes_by_ctx_room_id() {
         Arc::new(RoomConfig::default()),
     );
 
-    bus.dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
     // 生命周期任务/定时器直接按 room_id 派发
     let resp = bus
         .dispatch_system(rid(), RoomCommand::Tick { now: 12345 })
@@ -541,9 +598,15 @@ async fn get_client_state_returns_response() {
         Arc::new(RoomConfig::default()),
     );
 
-    bus.dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
     let resp = bus
         .dispatch_system(rid(), RoomCommand::GetClientState { user_id: 1 })
         .await
@@ -573,11 +636,23 @@ async fn duplicate_create_room_rejected() {
         Arc::new(RoomConfig::default()),
     );
 
-    bus.dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
     let resp = bus
-        .dispatch(client_ctx(2), RoomCommand::CreateRoom { id: rid() })
+        .dispatch(
+            client_ctx(2),
+            RoomCommand::CreateRoom {
+                id: rid(),
+                name: "user1".to_owned(),
+            },
+        )
         .await;
     assert!(
         matches!(
@@ -629,6 +704,7 @@ fn _business_err_construct() -> RoomError {
 
 // —— 补全：跨房间判重 / 多房间隔离 / 队列压力 / Metrics 聚合 ——
 
+#[allow(clippy::too_many_lines)] // 跨房间判重场景脚本长
 #[tokio::test]
 async fn cross_room_duplicate_join_rejected() {
     // §6.5-27 全局判重：用户在房 A，JoinRoom/CreateRoom 房 B → AlreadyInRoom（bus 层）
@@ -669,15 +745,22 @@ async fn cross_room_duplicate_join_rejected() {
     );
 
     // 用户 1 建房 A
-    bus.dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
     // 用户 2 入房 A
     bus.dispatch(
         client_ctx(2),
         RoomCommand::JoinRoom {
             id: rid(),
             monitor: false,
+            name: "user2".to_owned(),
         },
     )
     .await
@@ -690,6 +773,7 @@ async fn cross_room_duplicate_join_rejected() {
             RoomCommand::JoinRoom {
                 id: room_b.clone(),
                 monitor: false,
+                name: "user2".to_owned(),
             },
         )
         .await;
@@ -708,7 +792,10 @@ async fn cross_room_duplicate_join_rejected() {
     let resp = bus
         .dispatch(
             client_ctx(2),
-            RoomCommand::CreateRoom { id: room_b.clone() },
+            RoomCommand::CreateRoom {
+                id: room_b.clone(),
+                name: "user2".to_owned(),
+            },
         )
         .await;
     assert!(
@@ -729,6 +816,7 @@ async fn cross_room_duplicate_join_rejected() {
             RoomCommand::JoinRoom {
                 id: room_b,
                 monitor: false,
+                name: "user2".to_owned(),
             },
         )
         .await;
@@ -794,8 +882,20 @@ async fn rooms_are_isolated() {
 
     // 并发建房
     let (ra, rb) = tokio::join!(
-        bus.dispatch(ctx_a, RoomCommand::CreateRoom { id: room_a.clone() }),
-        bus.dispatch(ctx_b, RoomCommand::CreateRoom { id: room_b.clone() }),
+        bus.dispatch(
+            ctx_a,
+            RoomCommand::CreateRoom {
+                id: room_a.clone(),
+                name: "user1".to_owned(),
+            },
+        ),
+        bus.dispatch(
+            ctx_b,
+            RoomCommand::CreateRoom {
+                id: room_b.clone(),
+                name: "user2".to_owned(),
+            }
+        ),
     );
     assert!(ra.is_ok());
     assert!(rb.is_ok());
@@ -829,9 +929,15 @@ async fn hot_path_drops_when_queue_full() {
         Arc::clone(&factory) as Arc<dyn RoomFactory>,
         Arc::new(RoomConfig::default()),
     );
-    bus.dispatch(client_ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
 
     // 连续压入热路径命令（远超队列容量 1024）：每条都是 try_send，满则静默丢弃
     // —— 验证：热路径绝不阻塞、绝不返回错误（§4.9-9 DropIfFull）

@@ -2,16 +2,25 @@
 //!
 //! v1 生产实现直接放组合根，第二实现出现再抽独立 crate（原则 5 对自己生效，§4.5）。
 
+use std::time::Duration;
+
 use phira_api::{
-    ApiClient, ApiError, AuthError, AuthErrorCode, AuthHandler, Chart, RandomSource, Record,
-    UserIdentity,
+    ApiClient, ApiError, AuthError, AuthHandler, Chart, RandomSource, Record, UserIdentity,
 };
 use rand::Rng;
+use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tracing::debug;
+
+/// 回源 HTTP 请求超时（§4.4：每次请求自带超时，评审 §8 三）。
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 回源 HTTP 客户端（§4.9-6 / §6.5-15）。
 ///
-/// TODO(阶段 2): 手写 HTTP/1.1 GET + rustls 单栈（§10.1 / 附录 D P1）——
-/// 回源只是带 Bearer 的 GET，约两百行，最贴合内存目标；当前为占位（返回 Internal）。
+/// 手写 HTTP/1.1 GET（§10.1，约两百行，最贴合内存目标）：
+/// 当前为**明文**实现（本地 mock API 场景，§9 Oracle 环境）；
+/// TLS（`https://` 生产基址）为 TODO(阶段 4)——明文对 https 报错而不是静默失败。
 pub struct HttpApiClient {
     base: String,
 }
@@ -22,34 +31,83 @@ impl HttpApiClient {
     pub fn new(base: String) -> Self {
         Self { base }
     }
+
+    async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, ApiError> {
+        let bytes = http_get(&self.base, path, None).await?;
+        serde_json::from_slice(&bytes).map_err(|e| ApiError::Internal {
+            msg: format!("invalid JSON from {path}: {e}"),
+        })
+    }
+}
+
+/// `/chart/{id}` 响应 DTO（字段名 = 官方 API snake_case，原版 serde 默认）。
+#[derive(Deserialize)]
+struct ChartDto {
+    id: i32,
+    name: String,
+}
+
+/// `/record/{id}` 响应 DTO。
+#[derive(Deserialize)]
+struct RecordDto {
+    id: i32,
+    player: i32,
+    score: i32,
+    perfect: i32,
+    good: i32,
+    bad: i32,
+    miss: i32,
+    max_combo: i32,
+    accuracy: f32,
+    full_combo: bool,
+    std: f32,
+    std_score: f32,
+}
+
+/// `/me` 响应 DTO（原版字段 `language`）。
+#[derive(Deserialize)]
+struct MeDto {
+    id: i32,
+    name: String,
+    language: String,
 }
 
 #[async_trait::async_trait]
 impl ApiClient for HttpApiClient {
-    async fn fetch_chart(&self, _id: i32) -> Result<Chart, ApiError> {
-        Err(ApiError::Internal {
-            msg: format!("http client not implemented (phase 2), base={}", self.base),
+    async fn fetch_chart(&self, id: i32) -> Result<Chart, ApiError> {
+        let dto: ChartDto = self.get_json(&format!("/chart/{id}")).await?;
+        Ok(Chart {
+            id: dto.id,
+            name: dto.name,
         })
     }
 
-    async fn fetch_record(&self, _id: i32) -> Result<Record, ApiError> {
-        Err(ApiError::Internal {
-            msg: format!("http client not implemented (phase 2), base={}", self.base),
+    async fn fetch_record(&self, id: i32) -> Result<Record, ApiError> {
+        let dto: RecordDto = self.get_json(&format!("/record/{id}")).await?;
+        Ok(Record {
+            id: dto.id,
+            player: dto.player,
+            score: dto.score,
+            perfect: dto.perfect,
+            good: dto.good,
+            bad: dto.bad,
+            miss: dto.miss,
+            max_combo: dto.max_combo,
+            accuracy: dto.accuracy,
+            full_combo: dto.full_combo,
+            std: dto.std,
+            std_score: dto.std_score,
         })
     }
 }
 
 /// 鉴权处理器（§4.4 / §6.5-14）。
-///
-/// TODO(阶段 2): 回源 `GET {base}/me`（Bearer token）→ 身份解析。
-#[allow(dead_code)] // 阶段 2 鉴权编排接入后启用
 pub struct HttpAuth {
     base: String,
 }
 
 impl HttpAuth {
     /// 构造。`base` = 官方 API 基地址。
-    #[allow(dead_code)] // 阶段 2 鉴权编排接入后启用
     #[must_use]
     pub fn new(base: String) -> Self {
         Self { base }
@@ -58,10 +116,19 @@ impl HttpAuth {
 
 #[async_trait::async_trait]
 impl AuthHandler for HttpAuth {
-    async fn authenticate(&self, _token: &str) -> Result<UserIdentity, AuthError> {
-        Err(AuthError::Business {
-            code: AuthErrorCode::InvalidToken,
-            msg: format!("auth not implemented (phase 2), base={}", self.base),
+    async fn authenticate(&self, token: &str) -> Result<UserIdentity, AuthError> {
+        let bytes = http_get(&self.base, "/me", Some(token))
+            .await
+            .map_err(|e| match e {
+                ApiError::Internal { msg } => AuthError::Internal { msg },
+            })?;
+        let me: MeDto = serde_json::from_slice(&bytes).map_err(|e| AuthError::Internal {
+            msg: format!("invalid JSON from /me: {e}"),
+        })?;
+        Ok(UserIdentity {
+            user_id: me.id,
+            name: me.name,
+            lang: me.language,
         })
     }
 }
@@ -78,4 +145,169 @@ impl RandomSource for ThreadRngSource {
             Some(rand::rng().random_range(0..len))
         }
     }
+}
+
+/// 解析基址：`scheme://host[:port]`。明文实现只支持 `http://`（本地 mock，§9）。
+fn parse_base(base: &str) -> Result<(String, u16), ApiError> {
+    let rest = base
+        .strip_prefix("http://")
+        .or_else(|| base.strip_prefix("https://"))
+        .ok_or_else(|| ApiError::Internal {
+            msg: format!("unsupported base url scheme: {base}"),
+        })?;
+    let is_tls = base.starts_with("https://");
+    let (host, port) = match rest.split_once(':') {
+        Some((h, p)) => (
+            h.to_owned(),
+            p.parse::<u16>().map_err(|_| ApiError::Internal {
+                msg: format!("invalid port in base url: {base}"),
+            })?,
+        ),
+        None => (rest.to_owned(), if is_tls { 443 } else { 80 }),
+    };
+    if is_tls {
+        return Err(ApiError::Internal {
+            msg: "https not yet implemented (phase 4 TLS); use http:// local mock".to_owned(),
+        });
+    }
+    Ok((host, port))
+}
+
+/// 手写 HTTP/1.1 GET（§10.1）：请求 + 读响应头 + Content-Length 读体。
+async fn http_get(base: &str, path: &str, bearer: Option<&str>) -> Result<Vec<u8>, ApiError> {
+    let (host, port) = parse_base(base)?;
+    let addr = format!("{host}:{port}");
+    let socket = TcpStream::connect(&addr)
+        .await
+        .map_err(|e| ApiError::Internal {
+            msg: format!("connect {addr}: {e}"),
+        })?;
+    let _ = socket.set_nodelay(true);
+    let (mut read, mut write) = socket.into_split();
+
+    // 请求行 + 头（Connection: close——回源低频，每次新建连接简单可靠）
+    let mut req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\nConnection: close\r\n"
+    );
+    if let Some(token) = bearer {
+        use std::fmt::Write as _;
+        let _ = write!(req, "Authorization: Bearer {token}\r\n");
+    }
+    req.push_str("\r\n");
+    debug!("http GET {path}");
+
+    let result = tokio::time::timeout(HTTP_TIMEOUT, async {
+        write
+            .write_all(req.as_bytes())
+            .await
+            .map_err(|e| ApiError::Internal {
+                msg: format!("write request: {e}"),
+            })?;
+
+        // 读响应头（≤64KiB 防护）
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = read.read(&mut buf).await.map_err(|e| ApiError::Internal {
+                msg: format!("read headers: {e}"),
+            })?;
+            if n == 0 {
+                return Err(ApiError::Internal {
+                    msg: "connection closed before headers".to_owned(),
+                });
+            }
+            head.extend_from_slice(&buf[..n]);
+            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if head.len() > 64 * 1024 {
+                return Err(ApiError::Internal {
+                    msg: "response headers too large".to_owned(),
+                });
+            }
+        }
+
+        // 状态行：`HTTP/1.1 200 OK`
+        let status = parse_status(&head)?;
+        if status != 200 {
+            return Err(ApiError::Internal {
+                msg: format!("HTTP {status} from {path}"),
+            });
+        }
+
+        // Content-Length（缺失则按"无 body"处理——本实现只打自己的 mock API）
+        let len = content_length(&head)?;
+
+        // body：头内已读部分 + 余量
+        let body_start = head
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(0, |i| i + 4);
+        let mut body = head[body_start..].to_vec();
+        while body.len() < len {
+            let mut buf = [0u8; 2048];
+            let n = read.read(&mut buf).await.map_err(|e| ApiError::Internal {
+                msg: format!("read body: {e}"),
+            })?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..n]);
+        }
+        if body.len() < len {
+            return Err(ApiError::Internal {
+                msg: "body truncated".to_owned(),
+            });
+        }
+        body.truncate(len);
+        Ok(body)
+    })
+    .await;
+
+    match result {
+        Ok(r) => r,
+        Err(_) => Err(ApiError::Internal {
+            msg: format!("http timeout after {HTTP_TIMEOUT:?}: {path}"),
+        }),
+    }
+}
+
+/// 解析状态行取状态码。
+fn parse_status(head: &[u8]) -> Result<u16, ApiError> {
+    let line = head
+        .split(|b| *b == b'\r')
+        .next()
+        .ok_or_else(|| ApiError::Internal {
+            msg: "empty status line".to_owned(),
+        })?;
+    // `HTTP/1.1 200 OK`
+    let mut parts = line.split(|b| *b == b' ');
+    let _version = parts.next();
+    let code = parts.next().ok_or_else(|| ApiError::Internal {
+        msg: "malformed status line".to_owned(),
+    })?;
+    let text = std::str::from_utf8(code).map_err(|_| ApiError::Internal {
+        msg: "malformed status code".to_owned(),
+    })?;
+    text.parse::<u16>().map_err(|_| ApiError::Internal {
+        msg: format!("invalid status code: {text}"),
+    })
+}
+
+/// 解析 Content-Length 头（缺失 = 0）。
+fn content_length(head: &[u8]) -> Result<usize, ApiError> {
+    let text = String::from_utf8_lossy(head);
+    for line in text.split("\r\n") {
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            return value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| ApiError::Internal {
+                    msg: "invalid content-length".to_owned(),
+                });
+        }
+    }
+    Ok(0)
 }

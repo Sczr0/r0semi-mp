@@ -535,6 +535,8 @@ pub enum RoomCommand {
     CreateRoom {
         /// 房间 id。
         id: RoomId,
+        /// 房主昵称（core 从身份注册表填；impl 构造 `UserInfo` 需要，§6.6 表 2）。
+        name: String,
     },
     /// 入房（自带 room id；路由目标是目标房间）。
     JoinRoom {
@@ -542,6 +544,8 @@ pub enum RoomCommand {
         id: RoomId,
         /// 是否以 monitor 身份加入。
         monitor: bool,
+        /// 加入者昵称（core 从身份注册表填；impl 构造 `UserInfo` 需要，§6.6 表 2）。
+        name: String,
     },
     /// 离开房间。
     LeaveRoom,

@@ -260,16 +260,23 @@ impl RoomV1 {
 
     // —— 命令处理 ——
 
-    fn handle_create(&mut self, ctx: CmdCtx) -> (Option<RoomResponse>, Vec<RoomEvent>) {
+    fn handle_create(
+        &mut self,
+        ctx: CmdCtx,
+        cmd: RoomCommand,
+    ) -> (Option<RoomResponse>, Vec<RoomEvent>) {
         let Origin::Client { user_id } = ctx.origin else {
             return (None, Vec::new());
+        };
+        let RoomCommand::CreateRoom { name, .. } = cmd else {
+            unreachable!("handle_create 只收 CreateRoom")
         };
         self.host = Some(user_id);
         self.users.insert(
             user_id,
             UserInfo {
                 id: user_id,
-                name: format!("user{user_id}"),
+                name,
                 monitor: false,
             },
         );
@@ -286,10 +293,13 @@ impl RoomV1 {
     fn handle_join(
         &mut self,
         ctx: CmdCtx,
-        monitor: bool,
+        cmd: RoomCommand,
     ) -> (Option<RoomResponse>, Vec<RoomEvent>) {
         let Origin::Client { user_id } = ctx.origin else {
             return (None, Vec::new());
+        };
+        let RoomCommand::JoinRoom { monitor, name, .. } = cmd else {
+            unreachable!("handle_join 只收 JoinRoom")
         };
         let result = (|| -> Result<(), RoomError> {
             if self.in_room(user_id) {
@@ -330,7 +340,7 @@ impl RoomV1 {
 
         let info = UserInfo {
             id: user_id,
-            name: format!("user{user_id}"),
+            name,
             monitor,
         };
         if monitor {
@@ -786,8 +796,8 @@ impl RoomActor for RoomV1 {
         cmd: RoomCommand,
     ) -> (Option<RoomResponse>, Vec<RoomEvent>) {
         match cmd {
-            RoomCommand::CreateRoom { .. } => self.handle_create(ctx),
-            RoomCommand::JoinRoom { monitor, .. } => self.handle_join(ctx, monitor),
+            RoomCommand::CreateRoom { .. } => self.handle_create(ctx, cmd),
+            RoomCommand::JoinRoom { .. } => self.handle_join(ctx, cmd),
             RoomCommand::LeaveRoom => self.handle_leave(ctx),
             RoomCommand::Chat { message } => self.handle_chat(ctx, message.into_inner()),
             RoomCommand::SelectChart { id } => self.handle_select_chart(ctx, id).await,

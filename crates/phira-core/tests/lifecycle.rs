@@ -120,9 +120,15 @@ async fn setup(
         Arc::new(RoomConfig { monitors: vec![] }),
     );
     // 用户 1 建房（路由注册）
-    bus.dispatch(ctx(1), RoomCommand::CreateRoom { id: rid() })
-        .await
-        .unwrap();
+    bus.dispatch(
+        ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
 
     let (task, registry, fact_tx) = LifecycleTask::new(bus.clone(), window);
     tokio::spawn(task.run());
@@ -146,7 +152,7 @@ async fn wait_received(
 #[tokio::test]
 async fn disconnect_dispatches_to_room() {
     let (_bus, registry, fact_tx, received) = setup(Duration::from_secs(10)).await;
-    let e1 = registry.register(1);
+    let e1 = registry.register(1, "u1".to_owned());
 
     fact_tx
         .send(LifecycleEvent::Connected {
@@ -177,7 +183,7 @@ async fn disconnect_dispatches_to_room() {
 #[tokio::test]
 async fn reconnect_within_window_preserves_seat() {
     let (_bus, registry, fact_tx, received) = setup(Duration::from_secs(10)).await;
-    let e1 = registry.register(1);
+    let e1 = registry.register(1, "u1".to_owned());
 
     fact_tx
         .send(LifecycleEvent::Connected {
@@ -194,7 +200,7 @@ async fn reconnect_within_window_preserves_seat() {
         .await
         .unwrap();
     // 窗口内重连（epoch+1）
-    let e2 = registry.register(1);
+    let e2 = registry.register(1, "u1".to_owned());
     assert_eq!(e2, 2, "重连应分配新纪元");
     fact_tx
         .send(LifecycleEvent::Connected {
@@ -222,7 +228,7 @@ async fn reconnect_within_window_preserves_seat() {
 #[tokio::test]
 async fn dangle_expired_after_window() {
     let (_bus, registry, fact_tx, received) = setup(Duration::from_millis(50)).await;
-    let e1 = registry.register(1);
+    let e1 = registry.register(1, "u1".to_owned());
 
     fact_tx
         .send(LifecycleEvent::Connected {
@@ -253,7 +259,7 @@ async fn dangle_expired_after_window() {
 #[tokio::test]
 async fn stale_disconnect_ignored_after_reconnect() {
     let (_bus, registry, fact_tx, received) = setup(Duration::from_millis(50)).await;
-    let e1 = registry.register(1);
+    let e1 = registry.register(1, "u1".to_owned());
 
     fact_tx
         .send(LifecycleEvent::Connected {
@@ -269,7 +275,7 @@ async fn stale_disconnect_ignored_after_reconnect() {
         })
         .await
         .unwrap();
-    let e2 = registry.register(1);
+    let e2 = registry.register(1, "u1".to_owned());
     fact_tx
         .send(LifecycleEvent::Connected {
             user_id: 1,
@@ -310,8 +316,12 @@ async fn stale_disconnect_ignored_after_reconnect() {
 #[tokio::test]
 async fn registry_epoch_sequence() {
     let registry = phira_core::lifecycle::SessionRegistry::new();
-    assert_eq!(registry.register(1), 1);
-    assert_eq!(registry.register(1), 2, "同 id 再次注册 epoch+1");
-    assert_eq!(registry.register(2), 1, "不同用户独立计数");
-    assert_eq!(registry.register(1), 3);
+    assert_eq!(registry.register(1, "u1".to_owned()), 1);
+    assert_eq!(
+        registry.register(1, "u1".to_owned()),
+        2,
+        "同 id 再次注册 epoch+1"
+    );
+    assert_eq!(registry.register(2, "u2".to_owned()), 1, "不同用户独立计数");
+    assert_eq!(registry.register(1, "u1".to_owned()), 3);
 }
