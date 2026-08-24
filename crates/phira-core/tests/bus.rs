@@ -11,7 +11,10 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use phira_api::{
@@ -19,7 +22,7 @@ use phira_api::{
     RoomId, RoomResponse, RoomState, Targets, UserInfo,
 };
 use phira_core::{Bus, EventSink};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 /// 脚本项：一条命令的（响应, 事件集）。
 type ScriptItem = (Option<RoomResponse>, Vec<RoomEvent>);
@@ -1051,4 +1054,172 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     panic!("wait_for timeout");
+}
+
+// —— §4.9-9 队列压力分级：Wait（生命周期事实不丢）vs Reject（客户端命令满则拒）——
+
+/// 可阻塞 actor：`block=true` 时 handle 挂起等待 gate 释放。
+struct BlockingActor {
+    received: Arc<Mutex<Vec<RoomCommand>>>,
+    block: Arc<AtomicBool>,
+    gate: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl phira_api::RoomActor for BlockingActor {
+    async fn handle(
+        &mut self,
+        ctx: CmdCtx,
+        cmd: RoomCommand,
+    ) -> (Option<RoomResponse>, Vec<RoomEvent>) {
+        self.received.lock().unwrap().push(cmd.clone());
+        if self.block.load(Ordering::SeqCst) {
+            self.gate.notified().await;
+        }
+        match cmd {
+            // 建房必须带 RoomCreated 事件（bus 路由增量 + 响应，§4.9-4）
+            RoomCommand::CreateRoom { .. } => (
+                Some(RoomResponse::Ok),
+                vec![RoomEvent::RoomCreated {
+                    room_id: ctx.room_id,
+                    host: 1,
+                }],
+            ),
+            _ => (None, Vec::new()),
+        }
+    }
+}
+
+/// 阻塞工厂：所有房间共用同一个 gate + 记录。
+#[derive(Clone)]
+struct BlockingFactory {
+    received: Arc<Mutex<Vec<RoomCommand>>>,
+    block: Arc<AtomicBool>,
+    gate: Arc<Notify>,
+}
+
+impl BlockingFactory {
+    fn new() -> Self {
+        Self {
+            received: Arc::new(Mutex::new(Vec::new())),
+            block: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl RoomFactory for BlockingFactory {
+    fn create(&self, _room_id: RoomId) -> Box<dyn phira_api::RoomActor> {
+        Box::new(BlockingActor {
+            received: Arc::clone(&self.received),
+            block: Arc::clone(&self.block),
+            gate: Arc::clone(&self.gate),
+        })
+    }
+}
+
+#[tokio::test]
+async fn wait_preserves_lifecycle_when_queue_full() {
+    // §4.9-9：队列满时——生命周期事实（Wait）等待不丢；客户端命令（Reject）立即拒
+    let factory = BlockingFactory::new();
+    let bus = Bus::new(
+        Arc::new(factory.clone()) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    );
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "user1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // actor 开始阻塞 → 队列将满
+    factory.block.store(true, Ordering::SeqCst);
+
+    // 并发压满队列：用无响应的系统命令（UpdateConfig 立即返回，不挂起等待 actor）
+    let mut backfill = Vec::new();
+    for _ in 0..2000 {
+        backfill.push(tokio::spawn({
+            let bus = bus.clone();
+            async move {
+                bus.dispatch(
+                    CmdCtx {
+                        origin: Origin::System,
+                        room_id: rid(),
+                    },
+                    RoomCommand::UpdateConfig {
+                        config: Arc::new(RoomConfig::default()),
+                    },
+                )
+                .await
+            }
+        }));
+    }
+    for h in backfill {
+        let _ = h.await; // 满后的 UpdateConfig 返回 Err（Reject 语义，预期内）
+    }
+    // 队列已满（1300 条：actor recv 1 阻塞中 + 1024 缓冲，多压 100 条兜底）
+
+    // Reject：队列满时新命令立即拒（try_send 失败）。用无响应的 UpdateConfig
+    // 验证——需响应的命令（如 Chat）入队成功后会挂起等 actor 响应，混淆断言。
+    // 注意：actor 阻塞时 recv 腾出 1 位——第一条是"补位"入队成功，其余应全 FULL。
+    let rejected: Vec<_> = {
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            out.push(
+                bus.dispatch(
+                    CmdCtx {
+                        origin: Origin::System,
+                        room_id: rid(),
+                    },
+                    RoomCommand::UpdateConfig {
+                        config: Arc::new(RoomConfig::default()),
+                    },
+                )
+                .await,
+            );
+        }
+        out
+    };
+    assert!(
+        rejected.iter().skip(1).all(std::result::Result::is_err),
+        "队列满后命令应被拒（Reject，§4.9-9；首条为补位）: {rejected:?}"
+    );
+
+    // Wait：生命周期事实不可丢——队列满时挂起，释放后成功处理
+    let wait_handle = tokio::spawn({
+        let bus = bus.clone();
+        async move {
+            bus.dispatch(
+                CmdCtx {
+                    origin: Origin::System,
+                    room_id: rid(),
+                },
+                RoomCommand::UserDisconnected {
+                    user_id: 1,
+                    epoch: 1,
+                },
+            )
+            .await
+        }
+    });
+    // 挂起中（Wait 等待，不立即返回）
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(!wait_handle.is_finished(), "Wait 命令应等待而非被拒");
+
+    // 释放 actor → 队列清空 → Wait 命令完成且 actor 收到
+    factory.block.store(false, Ordering::SeqCst);
+    factory.gate.notify_waiters();
+    let resp = wait_handle.await.unwrap();
+    assert!(resp.is_ok(), "UserDisconnected 最终应成功: {resp:?}");
+
+    // actor 处理完队列中的 UpdateConfig 后才轮到 UserDisconnected——轮询等待
+    wait_for(&factory.received, |cmds| {
+        cmds.iter()
+            .any(|c| matches!(c, RoomCommand::UserDisconnected { user_id: 1, .. }))
+    })
+    .await;
 }

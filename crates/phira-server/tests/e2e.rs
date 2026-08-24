@@ -1018,3 +1018,111 @@ async fn non_host_privilege_escalation_rejected() {
     drop(c1);
     drop(c2);
 }
+
+/// 服务器逻辑闭环：玩家断线（心跳 10s 超时）→ Disconnected → 房间驱逐 → 房内用户收到 LeaveRoom。
+#[tokio::test]
+async fn disconnect_evicts_from_room() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx(mock_addr);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    let mut c1 = client_connect(server_addr).await;
+    let mut c2 = client_connect(server_addr).await;
+    for (c, tok) in [(&mut c1, "tok1"), (&mut c2, "tok2")] {
+        send_cmd(
+            c,
+            &ClientCommand::Authenticate {
+                token: Varchar::new(tok.into()).unwrap(),
+            },
+        )
+        .await;
+        let r = recv_cmd(c).await;
+        assert!(matches!(r, ServerCommand::Authenticate(Ok(_))));
+    }
+
+    // user1 建房 + user2 加入
+    send_cmd(
+        &mut c1,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c1).await;
+    let _ = recv_cmd(&mut c1).await;
+    send_cmd(
+        &mut c2,
+        &ClientCommand::JoinRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+            monitor: false,
+        },
+    )
+    .await;
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c1).await;
+    }
+    for _ in 0..3 {
+        let _ = recv_cmd(&mut c2).await;
+    }
+
+    // user1 直接断开（不 LeaveRoom）→ 10s 心跳超时 → 服务器驱逐 → user2 收到 LeaveRoom
+    drop(c1);
+
+    // c2 持续心跳保持存活（否则自己也 10s 超时）；同时读帧等 LeaveRoom 广播。
+    // 无超时读帧（外层 20s 兜底）——recv_cmd 的 2s 不够等 10s 心跳。
+    let deadline = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(2)) => {
+                    send_cmd(&mut c2, &ClientCommand::Ping).await;
+                }
+                f = read_frame_raw(&mut c2) => {
+                    let cmd: ServerCommand = phira_api::decode_packet(&f).unwrap();
+                    if matches!(
+                        &cmd,
+                        ServerCommand::Message(phira_api::Message::LeaveRoom { user: 1, .. })
+                    ) {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        deadline.is_ok(),
+        "20s 内 user2 应收到 user1 断线的 LeaveRoom 广播"
+    );
+    drop(c2);
+}
+
+/// 无超时读一帧（raw 载荷）。
+async fn read_frame_raw(sock: &mut TcpStream) -> Vec<u8> {
+    let mut len = 0u64;
+    let mut pos = 0;
+    loop {
+        let byte = sock.read_u8().await.unwrap();
+        len |= u64::from(byte & 0x7f) << pos;
+        pos += 7;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    let mut payload = vec![0u8; usize::try_from(len).unwrap()];
+    sock.read_exact(&mut payload).await.unwrap();
+    payload
+}
