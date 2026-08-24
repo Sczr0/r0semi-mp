@@ -198,3 +198,94 @@ async fn huge_content_length_times_out_without_oom() {
     );
     mock.await.unwrap();
 }
+
+/// 配置化接线：`http_timeout`（yml）穿透——自定义 1s 超时 + 慢回源 → 1s 内快速失败。
+#[tokio::test]
+async fn custom_http_timeout_applies() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    // mock：收到请求后 sleep 3s 再响应（客户端 1s 超时应先触发）
+    let mock = tokio::spawn(async move {
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .await;
+    });
+
+    let client = HttpApiClient::new_with_timeout(
+        format!("http://{addr}"),
+        std::time::Duration::from_secs(1),
+    );
+    let start = std::time::Instant::now();
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("timeout")),
+        "1s 超时应触发: {err:?}"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "应在 ~1s 超时而非等 3s: {:?}",
+        start.elapsed()
+    );
+    mock.await.unwrap();
+}
+
+/// 配置化接线：HttpAuth 的 timeout 同样穿透（/me 慢响应 → 快速失败）。
+#[tokio::test]
+async fn custom_auth_timeout_applies() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let mock = tokio::spawn(async move {
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .await;
+    });
+
+    let auth =
+        HttpAuth::new_with_timeout(format!("http://{addr}"), std::time::Duration::from_secs(1));
+    let err = auth.authenticate("tok").await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::AuthError::Internal { msg } if msg.contains("timeout")),
+        "HttpAuth 1s 超时应触发: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 反向：短超时 + 即时响应 → 正常成功（超时参数不误伤快路径）。
+#[tokio::test]
+async fn short_timeout_still_succeeds_on_fast_path() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let mock = tokio::spawn(mock_server(
+        addr,
+        vec![(
+            "/chart/3".into(),
+            r#"{"id": 3, "name": "Fast Chart"}"#.into(),
+            String::new(),
+        )],
+    ));
+
+    let client = HttpApiClient::new_with_timeout(
+        format!("http://{addr}"),
+        std::time::Duration::from_millis(100),
+    );
+    let chart = client.fetch_chart(3).await.unwrap();
+    assert_eq!(chart.id, 3);
+    assert_eq!(chart.name, "Fast Chart");
+    mock.await.unwrap();
+}

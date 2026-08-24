@@ -111,6 +111,7 @@ impl Server {
 }
 
 /// 连接处理上下文（组合根接线；accept 时 Arc 共享）。
+#[derive(Clone)]
 pub struct ConnContext {
     /// 柜台：命令路由 + 事件广播。
     pub bus: Bus,

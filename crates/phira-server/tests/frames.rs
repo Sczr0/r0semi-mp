@@ -348,3 +348,38 @@ async fn heartbeat_timeout_disconnects() {
     );
     let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
 }
+
+/// 配置化接线（unix）：Server::run 收到 SIGTERM → 用配置的 grace（0 = 立即退出）。
+/// 用外部 `kill` 命令发信号（避免 unsafe；Windows 无 SIGTERM 语义，cfg 掉）。
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_signal_grace_zero_exits() {
+    use phira_server::server::Server;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    // 配置化参数：自定义 notice + grace=0（yml 接线点）
+    let server = Server::new(
+        addr,
+        (*test_ctx()).clone(),
+        "test maintenance notice".to_owned(),
+        Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    let run = tokio::spawn(async move { server.run().await });
+
+    // 等监听就绪 → 发 SIGTERM
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &std::process::id().to_string()])
+        .status()
+        .expect("kill 命令可执行");
+    assert!(status.success());
+
+    // grace=0 → run 快速返回（而非挂在宽限窗口）
+    let r = tokio::time::timeout(Duration::from_secs(3), run).await;
+    assert!(r.is_ok(), "SIGTERM 后 run 应返回（grace=0 立即退出）");
+}
