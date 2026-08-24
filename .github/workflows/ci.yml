@@ -1,4 +1,4 @@
-# CI 五道闸门（§5.4）：格式 / lint / 依赖方向 / 测试（含契约测试）/ 许可
+# CI 六道闸门（§5.4 + §5.6）：格式 / lint / 依赖方向 / 测试（含契约测试）/ 许可 / API semver
 name: CI
 
 on:
@@ -33,3 +33,10 @@ jobs:
 
       - name: 5. Third-party licenses
         uses: EmbarkStudios/cargo-deny-action@v2
+
+      - name: 6. API semver (contract evolution, §5.6)
+        # 盯 phira-api 契约 crate：破坏性变更必须走 ADR + 主版本升级（§5.6）
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: phira-api
+          baseline: main

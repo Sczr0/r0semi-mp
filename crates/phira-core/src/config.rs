@@ -44,6 +44,10 @@ pub enum ConfigError {
 impl Config {
     /// 加载配置：默认值 + 环境变量覆盖。
     ///
+    /// # Errors
+    ///
+    /// 环境变量值非法（如端口非数字）时返回 `ConfigError::InvalidEnv`。
+    ///
     /// TODO(阶段 5): 支持 server_config.yml（原版语义）+ 文件轮询热重载
     /// （`Bus::watch_config`，§4.9-8；机制 = `Bus::update_config`）。
     pub fn load() -> Result<Self, ConfigError> {
@@ -51,6 +55,10 @@ impl Config {
     }
 
     /// 从可注入的环境变量来源加载（测试可注入 fake 环境，§4.9-6 精神：可测性）。
+    ///
+    /// # Errors
+    ///
+    /// 环境变量值非法时返回 `ConfigError::InvalidEnv`。
     pub fn load_from<E>(env: E) -> Result<Self, ConfigError>
     where
         E: Fn(&str) -> Result<String, std::env::VarError>,

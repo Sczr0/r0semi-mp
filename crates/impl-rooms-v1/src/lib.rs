@@ -8,6 +8,7 @@
 //! - `UserDangleExpired` 执行驱逐（规则 21）
 //!
 //! 无锁：每房间一个 actor 实例，`&mut self` 独占状态（§4.9）。
+#![allow(clippy::needless_pass_by_value)] // ctx: CmdCtx 传值是分发模式的契约形状（§4.4），非误用
 
 use std::collections::{HashMap, HashSet};
 
@@ -155,19 +156,16 @@ impl RoomV1 {
                 .pick_index(self.user_order.len())
                 .and_then(|i| self.user_order.get(i).copied())
         };
-        match new_host {
-            Some(new_host) => {
-                self.host = Some(new_host);
-                vec![RoomEvent::NewHost {
-                    room_id: self.id.clone(),
-                    new_host,
-                    old_host,
-                }]
-            }
-            None => {
-                self.host = None;
-                Vec::new()
-            }
+        if let Some(new_host) = new_host {
+            self.host = Some(new_host);
+            vec![RoomEvent::NewHost {
+                room_id: self.id.clone(),
+                new_host,
+                old_host,
+            }]
+        } else {
+            self.host = None;
+            Vec::new()
         }
     }
 
@@ -242,7 +240,7 @@ impl RoomV1 {
                     Vec::new()
                 }
             }
-            _ => Vec::new(),
+            InternalState::SelectChart => Vec::new(),
         }
     }
 
@@ -751,6 +749,7 @@ pub struct RoomsV1 {
 
 impl RoomsV1 {
     /// 构造工厂。`deps` 中的 API/随机源由组合根注入（契约测试注入 fake）。
+    #[must_use]
     pub fn new(config: RoomConfig, deps: RoomDeps) -> Self {
         Self { config, deps }
     }

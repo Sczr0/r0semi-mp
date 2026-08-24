@@ -18,6 +18,10 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+# 全量 pedantic：宁可现在集中修，不让警告越堆越多（2026-08 决策）
+pedantic = { level = "warn", priority = -1 }
+# doc_markdown 是纯格式（缺反引号），对契约文档质量贡献低；missing_docs=deny 已保证存在性
+doc_markdown = "allow"
 
 # 红线：phira-api 只允许 thiserror/half 等轻量库，零 tokio（§4.3-1 / §4.8）
 [workspace.dependencies]

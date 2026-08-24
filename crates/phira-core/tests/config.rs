@@ -3,6 +3,8 @@
 //! 环境变量通过 `Config::load_from` 注入 fake 来源（不写真实 env——
 //! workspace 红线 `forbid(unsafe_code)` 禁止 unsafe，§5.1）。
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::HashMap;
 
 use phira_core::{Config, ConfigError};

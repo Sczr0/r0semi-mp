@@ -59,6 +59,10 @@ pub struct SeqRng {
 
 impl SeqRng {
     /// 追加一个脚本值。
+    ///
+    /// # Panics
+    ///
+    /// 测试替身：内部 Mutex 中毒时 panic（测试环境可接受）。
     pub fn push(&self, pick: usize) {
         self.picks.lock().unwrap().push_back(pick);
     }
@@ -78,6 +82,7 @@ impl RandomSource for SeqRng {
 // —— 套件辅助 ——
 
 /// 构造套件默认 deps（确定性 API + 确定性 RNG）。
+#[must_use]
 pub fn suite_deps() -> RoomDeps {
     RoomDeps {
         api: Arc::new(FakeApi),
@@ -447,6 +452,7 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
 }
 
 /// 断线重连（§6.5-5/12/20/21/22/23）
+#[allow(clippy::too_many_lines)] // 测试脚本流程长是场景需求
 async fn disconnect_reconnect<F: RoomFactory>(factory: &F) {
     // —— 窗口内重连：保留座位（§6.5-21）——
     let mut room = factory.create(rid());

@@ -13,6 +13,7 @@ pub struct SessionHandle {
 
 impl SessionHandle {
     /// 会话建立（鉴权通过后调用）。
+    #[must_use]
     pub fn new(user_id: i32) -> Self {
         Self { user_id }
     }

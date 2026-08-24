@@ -34,11 +34,11 @@ impl Server {
         let shutdown = shutdown_signal();
 
         tokio::select! {
-            _ = shutdown => {
+            () = shutdown => {
                 info!("shutdown signal received");
                 // TODO(阶段 2): 向所有房间广播"服务器维护中" + 宽限窗口（§11）
             }
-            _ = self.accept_loop() => {}
+            () = self.accept_loop() => {}
         }
         Ok(())
     }

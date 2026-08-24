@@ -7,6 +7,8 @@
 //! - 事件投递目标（领域事件恒 All / Relay 指令 Specific，§4.4）
 //! - 配置热更广播（§4.9-8）
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
@@ -73,7 +75,7 @@ impl RoomFactory for ScriptedFactory {
             .lock()
             .unwrap()
             .get_mut(&room_id)
-            .and_then(|q| q.pop_front())
+            .and_then(VecDeque::pop_front)
             .unwrap_or_default();
         Box::new(ScriptedActor {
             script,
@@ -116,6 +118,7 @@ fn business_err(code: RoomErrorCode) -> RoomError {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // 测试 helper：与 (resp, events) 元组形状对齐
 fn ok() -> Option<RoomResponse> {
     Some(RoomResponse::Ok)
 }

@@ -78,12 +78,14 @@ impl Metrics {
         result: &Result<RoomResponse, RoomError>,
         elapsed: Duration,
     ) {
-        let mut guard = self.inner.lock().unwrap();
+        // 中毒恢复（柜台不 panic）：持锁线程若 panic，取回 guard 继续（计数可能丢失，可接受）
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stats = guard.entry(name).or_default();
         stats.calls += 1;
-        stats.avg_latency_ms = (stats.avg_latency_ms * (stats.calls - 1) as f64
-            + elapsed.as_secs_f64() * 1000.0)
-            / stats.calls as f64;
+        stats.avg_latency_ms = moving_avg(stats.avg_latency_ms, stats.calls, elapsed);
         match result {
             Ok(RoomResponse::Failure(RoomError::Business { .. }))
             | Err(RoomError::Business { .. }) => stats.business += 1,
@@ -95,7 +97,10 @@ impl Metrics {
 
     /// 每命令类型快照（§11.1 健康检查数据源）。
     pub fn snapshot(&self) -> Vec<(&'static str, CommandStats)> {
-        let guard = self.inner.lock().unwrap();
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut v: Vec<_> = guard.iter().map(|(k, s)| (*k, *s)).collect();
         v.sort_by_key(|(k, _)| *k);
         v
@@ -105,11 +110,17 @@ impl Metrics {
     pub fn internal_errors(&self) -> u64 {
         self.inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .map(|s| s.internal)
             .sum()
     }
+}
+
+/// 统计场景的移动平均（calls 达 2^53 前 u64→f64 精度无影响——Metrics 不是协议精度，§3.2 错误率用）。
+#[allow(clippy::cast_precision_loss)]
+fn moving_avg(prev: f64, calls: u64, elapsed: Duration) -> f64 {
+    (prev * (calls - 1) as f64 + elapsed.as_secs_f64() * 1000.0) / calls as f64
 }
 
 struct BusInner {
@@ -148,10 +159,15 @@ impl Bus {
 
     /// 挂接事件投递目标（阶段 2：转换层 + session 写路径）。
     pub fn attach_sink(&self, sink: Arc<dyn EventSink>) {
-        *self.inner.sink.lock().unwrap() = Some(sink);
+        *self
+            .inner
+            .sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
     }
 
     /// 计数器访问（§3.2 / §11.1）。
+    #[must_use]
     pub fn metrics(&self) -> &Metrics {
         &self.inner.metrics
     }
@@ -162,6 +178,11 @@ impl Bus {
     }
 
     /// 派发客户端命令（session 收包解码后调用）。
+    ///
+    /// # Errors
+    ///
+    /// 路由层：`NotInRoom`（表 miss）/ `AlreadyInRoom`（重复入房，§6.5-27）/
+    /// `RoomIdOccupied` / `RoomNotFound`；队列满拒收（§4.9-9）/ 房间关闭时 `Internal`。
     pub async fn dispatch(&self, ctx: CmdCtx, cmd: RoomCommand) -> Result<RoomResponse, RoomError> {
         let name = command_name(&cmd);
         let started = Instant::now();
@@ -173,6 +194,10 @@ impl Bus {
     /// 派发系统命令（用户生命周期任务 / 定时器用，§4.6）。
     ///
     /// `room_id` 由调用方（生命周期任务查表后）填好；`GetClientState` 会返回响应（§4.4）。
+    ///
+    /// # Errors
+    ///
+    /// 房间不存在 / 关闭时 `Internal`。
     pub async fn dispatch_system(
         &self,
         room_id: RoomId,
@@ -214,6 +239,7 @@ impl Bus {
     }
 
     /// 路由解析 + 投递（§4.9-4 路由规则）。
+    #[allow(clippy::too_many_lines)] // 路由规则完整呈现优于拆碎（§4.9-4 单一决策点）
     async fn route(&self, ctx: CmdCtx, cmd: RoomCommand) -> Result<RoomResponse, RoomError> {
         let needs_response = command_needs_response(&cmd);
         let policy = queue_policy(&cmd);
@@ -515,7 +541,11 @@ async fn process_events(
     }
 
     // 4. 投递（阶段 2 由 EventSink 实现编码）
-    let sink = inner.sink.lock().unwrap().clone();
+    let sink = inner
+        .sink
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     if let Some(sink) = sink {
         for (user_id, ev) in deliveries {
             sink.deliver(user_id, &ev).await;
