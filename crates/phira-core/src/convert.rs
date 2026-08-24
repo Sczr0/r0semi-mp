@@ -48,6 +48,7 @@ pub fn client_to_room(cmd: ClientCommand) -> Option<RoomCommand> {
 /// 一个事件可产出多条命令（`NewHost` 的双向 `ChangeHost`、`ChangeState` 附加等）。
 /// `RoomClosed` 无协议输出（core 内部信号，§4.9-9）。
 #[must_use]
+#[allow(clippy::too_many_lines)] // 表 2 全事件完整呈现优于拆碎（§6.6 是单一权威表）
 pub fn event_to_server(event: RoomEvent) -> Vec<(Targets, ServerCommand)> {
     let mut out = Vec::new();
     match event {
@@ -180,10 +181,8 @@ pub fn event_to_server(event: RoomEvent) -> Vec<(Targets, ServerCommand)> {
             judges,
             ..
         } => out.push((targets, ServerCommand::Judges { player, judges })),
-        // RoomClosed：core 内部信号（拆任务、排空 channel），无协议输出
-        RoomEvent::RoomClosed { .. } => {}
-        // 契约 non_exhaustive 兜底（§5.6）：新事件默认无协议输出，转换层随 api 演进
-        _ => {}
+        // RoomClosed（core 内部信号，无协议输出）与契约 non_exhaustive 兜底（§5.6）均无输出
+        RoomEvent::RoomClosed { .. } | _ => {}
     }
     out
 }

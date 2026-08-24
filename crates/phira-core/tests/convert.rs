@@ -1,4 +1,5 @@
 //! 转换层测试（§6.6 表 1 / 表 2）。
+#![allow(clippy::unwrap_used)] // 测试断言失败=panic 是预期语义（柜台限制针对生产代码）
 //!
 //! 表 1：ClientCommand → RoomCommand 映射（Ping/Authenticate 归 core）
 //! 表 2：RoomEvent → (Targets, ServerCommand) 列表（含非机械映射断言）
