@@ -21,3 +21,4 @@ phira-api = { path = "../phira-api" }
 tokio.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+tracing.workspace = true

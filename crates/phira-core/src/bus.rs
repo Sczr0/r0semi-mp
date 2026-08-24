@@ -177,6 +177,13 @@ impl Bus {
         Arc::clone(&*self.inner.config.read().await)
     }
 
+    /// 路由表查询：用户当前所在房间（§4.9-4）。
+    ///
+    /// 生命周期任务用：断线/重连/窗口到期派发前查目标房间（§4.9-3）。
+    pub async fn room_of(&self, user_id: i32) -> Option<RoomId> {
+        self.inner.routes.read().await.get(&user_id).cloned()
+    }
+
     /// 派发客户端命令（session 收包解码后调用）。
     ///
     /// # Errors
