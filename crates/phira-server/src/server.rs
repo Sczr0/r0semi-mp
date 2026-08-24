@@ -5,7 +5,7 @@
 //! TODO(阶段 5): 向所有房间广播"服务器维护中" + 宽限窗口（§11）。
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 
@@ -23,7 +23,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn};
 
-use crate::stream::Stream;
+use crate::stream::{MAX_PACKET_SIZE, PRE_AUTH_MAX_PACKET, Stream};
 
 /// 服务器：持有监听器 + 柜台（组合根唯一接线点之外，本结构不认识具体货物）。
 pub struct Server {
@@ -172,6 +172,8 @@ struct ConnState {
     last_recv: Mutex<Instant>,
     /// 本连接发送通道（sink 注销比较用）。
     send_tx: Mutex<Option<Arc<mpsc::Sender<ServerCommand>>>>,
+    /// 当前帧上限（§10.4：鉴权前 ~4KiB，鉴权后 2MiB；与 Stream recv 任务共享）。
+    packet_limit: Arc<AtomicU32>,
 }
 
 impl ConnState {
@@ -184,6 +186,7 @@ impl ConnState {
             epoch: AtomicU64::new(0),
             last_recv: Mutex::new(Instant::now()),
             send_tx: Mutex::new(None),
+            packet_limit: Arc::new(AtomicU32::new(PRE_AUTH_MAX_PACKET)),
         }
     }
 }
@@ -212,7 +215,13 @@ pub async fn handle_connection(
         },
     );
 
-    let stream = Stream::<ServerCommand, ClientCommand>::new(None, stream, handler).await?;
+    let stream = Stream::<ServerCommand, ClientCommand>::new(
+        None,
+        stream,
+        handler,
+        Arc::clone(&state.packet_limit),
+    )
+    .await?;
 
     // 心跳监控（§6.1）：10s 无任何包 → 判断线 → 生命周期 Disconnected + 通知主流程断开。
     // 主流程用 `select!` 同时等待客户端断开与超时信号（避免共享 Stream 的 take 竞争）。
@@ -347,8 +356,14 @@ async fn handle_frame(
             room_cmd,
         )
         .await;
-    let server_cmd = response_to_server(&cmd, resp);
-    let _ = send_tx.send(server_cmd).await;
+    // 热路径（Touches/Judges）只转发给 monitor，不回答发者（§6.5-17）
+    let server_cmd = match &cmd {
+        ClientCommand::Touches { .. } | ClientCommand::Judges { .. } => None,
+        _ => Some(response_to_server(&cmd, resp)),
+    };
+    if let Some(sc) = server_cmd {
+        let _ = send_tx.send(sc).await;
+    }
 }
 
 /// 鉴权流程（§6.5-14/19/23）：回源 /me → 注册 epoch → 恢复房间状态 → 应答。
@@ -395,6 +410,8 @@ async fn authenticate_flow(
                 .send(ServerCommand::Authenticate(Ok((info, room_state))))
                 .await;
             state.authed.store(true, Ordering::SeqCst);
+            // 鉴权通过：帧上限放开到协议上限（§10.4：鉴权前 ~4KiB）
+            state.packet_limit.store(MAX_PACKET_SIZE, Ordering::SeqCst);
             info!("user={user_id} authenticated (epoch={epoch})");
         }
         Err(err) => {

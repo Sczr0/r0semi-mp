@@ -205,7 +205,12 @@ async fn server_initiated_push() {
             },
         );
         let stream = phira_server::stream::Stream::<ServerCommand, ClientCommand>::new(
-            None, stream, handler,
+            None,
+            stream,
+            handler,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                phira_server::stream::MAX_PACKET_SIZE,
+            )),
         )
         .await
         .unwrap();
@@ -228,7 +233,7 @@ async fn server_initiated_push() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
 }
 
-/// 恶意帧：帧长 > 2MiB → 服务端拒绝并断开（§6.1 包上限）。
+/// 恶意帧：帧长 > 2MiB → 服务端拒绝并断开（§6.1 协议上限）。
 #[tokio::test]
 async fn oversized_frame_rejected() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -248,6 +253,51 @@ async fn oversized_frame_rejected() {
     let mut buf = [0u8; 1];
     let r = sock.read(&mut buf).await;
     assert_eq!(r.unwrap(), 0, "服务端应拒绝超长帧并断开");
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
+}
+
+/// §10.4 红线：鉴权前帧上限收紧 ~4KiB——4KiB+1 的帧即断开（堵死未鉴权 2MiB 帧攻击）。
+#[tokio::test]
+async fn pre_auth_4k_frame_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_done = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = handle_connection(stream, addr, test_ctx()).await;
+    });
+
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(&[PROTOCOL_VERSION]).await.unwrap();
+
+    // 帧长 = 4KiB + 1 = 4097（ULEB128：0x81 0x20）
+    sock.write_all(&[0x81, 0x20]).await.unwrap();
+
+    let mut buf = [0u8; 1];
+    let r = sock.read(&mut buf).await;
+    assert_eq!(r.unwrap(), 0, "鉴权前 >4KiB 帧应被拒绝并断开");
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
+}
+
+/// 握手版本宽容（原版语义 + §6.1 只读不校验）：任意版本字节仍可通信。
+#[tokio::test]
+async fn handshake_any_version_accepted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_done = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = handle_connection(stream, addr, test_ctx()).await;
+    });
+
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(&[0x63]).await.unwrap(); // 任意版本字节（非 v1）
+
+    // 仍能 Ping → Pong（版本不校验，§6.1）
+    sock.write_all(&frame(&[0x00])).await.unwrap();
+    let payload = read_frame(&mut sock).await;
+    assert_eq!(payload, vec![0x00], "任意版本握手后 Ping 仍应答");
+    drop(sock);
     let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
 }
 

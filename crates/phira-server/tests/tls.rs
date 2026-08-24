@@ -148,3 +148,20 @@ async fn http_default_port_is_80() {
     let msg = format!("{err:?}");
     assert!(msg.contains("connect"), "http 默认端口 80 应被解析: {msg}");
 }
+
+/// §10.3 安全红线：生产配置（webpki-roots）拒绝自签证书——TLS 握手失败。
+/// AcceptAny 只用于传输测试；此测试证明默认路径不会静默信任不可信证书。
+#[tokio::test]
+async fn production_config_rejects_self_signed() {
+    let (_addr, port) = spawn_tls_server().await;
+    let base = format!("https://localhost:{port}");
+
+    let err = http_get_with_tls(&base, "/chart/1", None, None)
+        .await
+        .expect_err("webpki-roots 应拒绝自签证书（握手失败）");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("TLS handshake"),
+        "应报 TLS 握手失败（证书链验证拒绝）: {msg}"
+    );
+}

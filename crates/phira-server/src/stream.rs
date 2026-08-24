@@ -9,7 +9,14 @@
 //!
 //! 热路径（§6.5-17）：`send` 只入队；编码由发送任务统一做，一次编码共享缓冲。
 
-use std::{future::Future, marker::PhantomData, sync::Arc};
+use std::{
+    future::Future,
+    marker::PhantomData,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use anyhow::{Result, bail};
 use phira_api::{BinaryData, decode_packet, encode_packet};
@@ -24,8 +31,11 @@ use tracing::{error, trace, warn};
 /// 协议版本号（§6.1：客户端发 1 字节，当前 v1）。
 pub const PROTOCOL_VERSION: u8 = 1;
 
-/// 单包载荷上限（§6.1：协议上限 2 MiB）。
+/// 单包载荷上限（§6.1：协议上限 2 MiB；鉴权后放开到此值）。
 pub const MAX_PACKET_SIZE: u32 = 2 * 1024 * 1024;
+
+/// 鉴权前帧上限（§10.4 红线：握手 + token ≤32B 之外无合法大帧，堵死未鉴权 2MiB 帧攻击）。
+pub const PRE_AUTH_MAX_PACKET: u32 = 4 * 1024;
 
 /// 双向帧流：`S` = 发送载荷类型（服务端侧 = `ServerCommand`），`R` = 接收载荷类型。
 ///
@@ -55,6 +65,8 @@ where
     /// - `version: None` = **服务端模式**：读客户端发来的 1 字节版本；
     ///   `Some(v)` = **客户端模式**：写版本。
     /// - `handler` 每收到一帧调用一次（拿到发送端 + 载荷），异步处理。
+    /// - `packet_limit`：当前帧上限（§10.4：鉴权前 ~4KiB）；recv 任务每次读长度后
+    ///   取最新值——会话层鉴权通过后 `store(MAX_PACKET_SIZE)` 即放开。
     ///
     /// # Errors
     ///
@@ -67,6 +79,7 @@ where
         version: Option<u8>,
         stream: TcpStream,
         mut handler: Box<dyn FnMut(Arc<mpsc::Sender<S>>, R) -> F + Send + Sync>,
+        packet_limit: Arc<AtomicU32>,
     ) -> Result<Self>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -136,8 +149,11 @@ where
                             bail!("invalid length");
                         }
                     }
-                    if len > MAX_PACKET_SIZE {
-                        bail!("data packet too large");
+                    if len > packet_limit.load(Ordering::SeqCst) {
+                        bail!(
+                            "data packet too large (limit {})",
+                            packet_limit.load(Ordering::SeqCst)
+                        );
                     }
                     let len = len as usize;
 

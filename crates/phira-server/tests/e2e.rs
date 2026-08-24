@@ -63,14 +63,27 @@ async fn mock_api(addr: std::net::SocketAddr) {
 
 /// 真实组合（与 main.rs 同构，base = mock API）。
 fn setup_ctx(mock_addr: std::net::SocketAddr) -> Arc<ConnContext> {
+    setup_ctx_with_monitors(mock_addr, vec![])
+}
+
+/// 指定 monitor 白名单的测试上下文（§6.5-4：monitor 需权限）。
+fn setup_ctx_with_monitors(
+    mock_addr: std::net::SocketAddr,
+    monitors: Vec<i32>,
+) -> Arc<ConnContext> {
     let base = format!("http://{mock_addr}");
     let http = Arc::new(HttpApiClient::new(base.clone()));
     let deps = RoomDeps {
         api: Arc::clone(&http) as Arc<dyn phira_api::ApiClient>,
         rng: Arc::new(ThreadRngSource) as Arc<dyn phira_api::RandomSource>,
     };
-    let rooms = impl_rooms_v1::RoomsV1::new(RoomConfig { monitors: vec![] }, deps);
-    let config = Arc::new(RoomConfig { monitors: vec![] });
+    let rooms = impl_rooms_v1::RoomsV1::new(
+        RoomConfig {
+            monitors: monitors.clone(),
+        },
+        deps,
+    );
+    let config = Arc::new(RoomConfig { monitors });
     let bus = Bus::new(
         Arc::new(rooms) as Arc<dyn phira_api::RoomFactory>,
         Arc::clone(&config),
@@ -536,6 +549,315 @@ async fn game_flow_select_ready_start() {
             ServerCommand::ChangeState(phira_api::RoomState::Playing)
         ),
         "应 ChangeState(Playing): {c1_playing:?}"
+    );
+    drop(c1);
+    drop(c2);
+}
+
+/// §10.4 红线闭环：鉴权前 4KiB 收紧（frames.rs 测拒绝），鉴权后放开到 2MiB——
+/// 已鉴权连接发 >4KiB 帧应被接受（连接不断，心跳仍应答）。
+#[tokio::test]
+async fn authed_large_frame_accepted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx(mock_addr);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    // 鉴权成功
+    let mut c1 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c1,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok1".into()).unwrap(),
+        },
+    )
+    .await;
+    let auth = recv_cmd(&mut c1).await;
+    assert!(matches!(auth, ServerCommand::Authenticate(Ok(_))));
+
+    // 大帧：1000 个 TouchFrame（每个 ~5 字节 ≈ 5KiB > 4KiB 收紧线）
+    // 时间戳用 f32 表示（TouchFrame.time 协议字段）；i32→f32 精度损失对测试帧无意义
+    #[allow(clippy::cast_precision_loss)]
+    let frames = (0..1000)
+        .map(|i| phira_api::TouchFrame {
+            time: i as f32,
+            points: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    send_cmd(
+        &mut c1,
+        &ClientCommand::Touches {
+            frames: std::sync::Arc::new(frames),
+        },
+    )
+    .await;
+
+    // 连接未被断：心跳仍应答
+    send_cmd(&mut c1, &ClientCommand::Ping).await;
+    let pong = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(pong, ServerCommand::Pong),
+        "鉴权后大帧应被接受（连接存活，Ping→Pong）: {pong:?}"
+    );
+    drop(c1);
+}
+
+/// §6.5-4：观战者（monitor）加入——不占玩家名额、需白名单权限；
+/// 全员（玩家 + monitor）ready 才 StartPlaying（impl check_all_ready 语义）。
+#[allow(clippy::too_many_lines)] // 全流程脚本长是验收场景需求（同 game_flow）
+#[tokio::test]
+async fn monitor_join_and_game_flow() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx_with_monitors(mock_addr, vec![2]);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    let mut c1 = client_connect(server_addr).await;
+    let mut c2 = client_connect(server_addr).await;
+
+    // 双方鉴权
+    for (c, tok) in [(&mut c1, "tok1"), (&mut c2, "tok2")] {
+        send_cmd(
+            c,
+            &ClientCommand::Authenticate {
+                token: Varchar::new(tok.into()).unwrap(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_cmd(c).await,
+            ServerCommand::Authenticate(Ok(_))
+        ));
+    }
+
+    // 建房
+    send_cmd(
+        &mut c1,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::Message(phira_api::Message::CreateRoom { user: 1 })
+    ));
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::CreateRoom(Ok(()))
+    ));
+
+    // user2 以 monitor 身份加入（白名单 [2]，§6.5-4）
+    send_cmd(
+        &mut c2,
+        &ClientCommand::JoinRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+            monitor: true,
+        },
+    )
+    .await;
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c1).await; // c1: OnJoinRoom + Message(JoinRoom)
+    }
+    let f = recv_cmd(&mut c2).await;
+    assert!(
+        matches!(&f, ServerCommand::OnJoinRoom(ui) if ui.id == 2),
+        "c2 收 OnJoinRoom: {f:?}"
+    );
+    let f = recv_cmd(&mut c2).await;
+    assert!(
+        matches!(
+            &f,
+            ServerCommand::Message(phira_api::Message::JoinRoom { user: 2, .. })
+        ),
+        "c2 收 Message(JoinRoom): {f:?}"
+    );
+    assert!(matches!(
+        recv_cmd(&mut c2).await,
+        ServerCommand::JoinRoom(Ok(_))
+    ));
+
+    // 选图（host）
+    send_cmd(&mut c1, &ClientCommand::SelectChart { id: 1 }).await;
+    let _ = recv_cmd(&mut c1).await; // Message(SelectChart)
+    let _ = recv_cmd(&mut c1).await; // ChangeState
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::SelectChart(Ok(()))
+    ));
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c2).await; // c2: Message(SelectChart) + ChangeState
+    }
+
+    // RequestStart → WaitForReady（host 默认 ready）
+    send_cmd(&mut c1, &ClientCommand::RequestStart).await;
+    let _ = recv_cmd(&mut c1).await; // Message(GameStart)
+    let _ = recv_cmd(&mut c1).await; // ChangeState(WaitingForReady)
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::RequestStart(Ok(()))
+    ));
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c2).await; // c2: Message(GameStart) + ChangeState
+    }
+
+    // monitor ready → 全员（玩家 + monitor）→ StartPlaying
+    send_cmd(&mut c2, &ClientCommand::Ready).await;
+    let f = recv_cmd(&mut c2).await;
+    assert!(
+        matches!(
+            &f,
+            ServerCommand::Message(phira_api::Message::Ready { user: 2 })
+        ),
+        "c2 收自己的 Ready 广播: {f:?}"
+    );
+    let _ = recv_cmd(&mut c2).await; // Ready(Ok)
+    let f = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(
+            &f,
+            ServerCommand::Message(phira_api::Message::Ready { user: 2 })
+        ),
+        "c1 收 Ready 广播: {f:?}"
+    );
+    let f = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(&f, ServerCommand::Message(phira_api::Message::StartPlaying)),
+        "玩家 + monitor 全员 ready → StartPlaying: {f:?}"
+    );
+    drop(c1);
+    drop(c2);
+}
+
+/// §6.5-5：房主离开 → 房间顺延给下一位（NewHost + ChangeHost 单播）。
+#[tokio::test]
+async fn host_leave_transfers_ownership() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx(mock_addr);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    let mut c1 = client_connect(server_addr).await;
+    let mut c2 = client_connect(server_addr).await;
+
+    for (c, tok) in [(&mut c1, "tok1"), (&mut c2, "tok2")] {
+        send_cmd(
+            c,
+            &ClientCommand::Authenticate {
+                token: Varchar::new(tok.into()).unwrap(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_cmd(c).await,
+            ServerCommand::Authenticate(Ok(_))
+        ));
+    }
+
+    // user1 建房 + user2 加入（玩家）
+    send_cmd(
+        &mut c1,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c1).await;
+    let _ = recv_cmd(&mut c1).await;
+    send_cmd(
+        &mut c2,
+        &ClientCommand::JoinRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+            monitor: false,
+        },
+    )
+    .await;
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c1).await;
+    }
+    for _ in 0..3 {
+        let _ = recv_cmd(&mut c2).await;
+    }
+
+    // user1 离开 → user2 成为新 host
+    send_cmd(&mut c1, &ClientCommand::LeaveRoom).await;
+    // 离开者也被投递（§4.9-4 先解析后应用）：LeaveRoom 广播 + NewHost 广播 +
+    // ChangeHost(false)（单播旧 host）+ LeaveRoom(Ok) 响应
+    let mut c1_frames = Vec::new();
+    for _ in 0..4 {
+        c1_frames.push(recv_cmd(&mut c1).await);
+    }
+    assert!(
+        c1_frames
+            .iter()
+            .any(|f| matches!(f, ServerCommand::LeaveRoom(Ok(())))),
+        "c1 应收到 LeaveRoom(Ok): {c1_frames:?}"
+    );
+    assert!(
+        c1_frames
+            .iter()
+            .any(|f| matches!(f, ServerCommand::ChangeHost(false))),
+        "旧 host 收 ChangeHost(false): {c1_frames:?}"
+    );
+    let f = recv_cmd(&mut c2).await;
+    assert!(
+        matches!(
+            &f,
+            ServerCommand::Message(phira_api::Message::LeaveRoom { user: 1, .. })
+        ),
+        "c2 收 LeaveRoom 广播: {f:?}"
+    );
+    let f = recv_cmd(&mut c2).await;
+    assert!(
+        matches!(
+            &f,
+            ServerCommand::Message(phira_api::Message::NewHost { user: 2 })
+        ),
+        "c2 收 NewHost 广播: {f:?}"
+    );
+    let f = recv_cmd(&mut c2).await;
+    assert!(
+        matches!(f, ServerCommand::ChangeHost(true)),
+        "新 host 收 ChangeHost(true): {f:?}"
     );
     drop(c1);
     drop(c2);

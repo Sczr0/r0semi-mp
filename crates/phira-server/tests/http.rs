@@ -113,17 +113,6 @@ async fn authenticate_sends_bearer_and_parses_me() {
 }
 
 #[tokio::test]
-async fn https_base_rejected_clearly() {
-    // TLS 未实现：明确报错而不是静默失败（阶段 4 补 TLS）
-    let client = HttpApiClient::new("https://phira.5wyxi.com".into());
-    let err = client.fetch_chart(1).await.unwrap_err();
-    assert!(
-        matches!(err, phira_api::ApiError::Internal { .. }),
-        "https 应报 Internal: {err:?}"
-    );
-}
-
-#[tokio::test]
 async fn http_404_is_internal_error() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
