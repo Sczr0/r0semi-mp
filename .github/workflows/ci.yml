@@ -41,31 +41,27 @@ jobs:
           package: phira-api
           baseline: main
 
-  # 部署产物（§10 部署/迁移）：Linux release 二进制——机子上不装 Rust 工具链，
-  # 下载即跑（docs/deployment.md 迁移清单的构建源）。
+  # 部署产物（§部署）：musl 静态二进制 + nightly release——服务器匿名 curl 下载即跑，
+  # 机子上不装 Rust 工具链（docs/deployment.md 迁移清单的构建源）。
+  # 构建用 clux/muslrust 容器（自带 musl 工具链，ring 无系统依赖问题；tag 钉死 1.98.0）。
   release:
     runs-on: ubuntu-latest
     needs: check
     if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (pinned by rust-toolchain.toml) + musl target
-        uses: dtolnay/rust-toolchain@1.98.0
+      - name: Build release-dist (musl static, container toolchain)
+        run: |
+          docker run --rm -v "$PWD:/volume" -w /volume             clux/muslrust:1.98.0-stable             cargo build --profile release-dist --target x86_64-unknown-linux-musl
+
+      - name: Publish nightly release (服务器匿名下载)
+        uses: softprops/action-gh-release@v2
         with:
-          targets: x86_64-unknown-linux-musl
-
-      - name: Install musl cross toolchain (ring 构建需要 musl-gcc)
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release (musl static——任意 Linux 可跑，不挑 glibc 版本)
-        run: cargo build --release -p phira-server --target x86_64-unknown-linux-musl
-
-      - name: Upload binary as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: r0semi-mp-server-linux
-          path: target/x86_64-unknown-linux-musl/release/r0semi-mp-server
-          if-no-files-found: error
+          tag_name: nightly
+          name: nightly
+          prerelease: true
+          make_latest: true
+          files: target/x86_64-unknown-linux-musl/release-dist/r0semi-mp-server
