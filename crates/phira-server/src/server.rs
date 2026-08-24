@@ -5,7 +5,7 @@
 //! 优雅停机（§11）：SIGTERM/SIGINT → 广播"服务器维护中" → 宽限窗口 → 强制退出。
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 
@@ -123,6 +123,8 @@ pub struct ConnContext {
     pub fact_tx: mpsc::Sender<LifecycleEvent>,
     /// 事件投递（user → 会话写通道 + 转换层过滤，§6.6 表 2）。
     pub sink: Arc<SessionSink>,
+    /// 连接准入（§10.4：未鉴权连接上限 + 每 IP 限额）。
+    pub admission: Arc<ConnectionAdmission>,
 }
 
 /// 事件投递：`user_id → 会话发送通道`映射 + 转换层目标过滤。
@@ -190,6 +192,74 @@ impl EventSink for SessionSink {
     }
 }
 
+/// 未鉴权连接全局上限（§10.4：批量半开连接打满 accept 的闸门）。
+const MAX_PENDING_CONNECTIONS: usize = 100;
+
+/// 每 IP 未鉴权连接上限（§10.4：单 IP 打满资源的闸门）。
+const MAX_PENDING_PER_IP: usize = 5;
+
+/// 连接准入（§10.4）：未鉴权连接数 + 每 IP 限额——公网"被打"时的第一道闸。
+///
+/// 计数语义：连接建立时计入，鉴权成功后"转正"（release），连接结束时若仍在册则释放。
+#[derive(Default)]
+pub struct ConnectionAdmission {
+    /// 未鉴权连接总数。
+    pending: AtomicUsize,
+    /// 每 IP 未鉴权连接数。
+    per_ip: Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
+}
+
+impl ConnectionAdmission {
+    /// 尝试准入（accept 时调用）。超限 → false（调用方应断开连接）。
+    #[must_use]
+    pub fn try_acquire(&self, ip: std::net::IpAddr) -> bool {
+        // 先查每 IP 限额（lock 内检查 + 增加）
+        let mut map = self
+            .per_ip
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = map.entry(ip).or_default();
+        if *n >= MAX_PENDING_PER_IP {
+            return false;
+        }
+        *n += 1;
+        drop(map);
+        // 再查全局未鉴权数；超限回滚每 IP 计数
+        if self.pending.fetch_add(1, Ordering::SeqCst) + 1 > MAX_PENDING_CONNECTIONS {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            let mut map = self
+                .per_ip
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(v) = map.get_mut(&ip) {
+                if *v > 1 {
+                    *v -= 1;
+                } else {
+                    map.remove(&ip);
+                }
+            }
+            return false;
+        }
+        true
+    }
+
+    /// 释放一条未鉴权连接（鉴权转正 / 连接结束）。
+    pub fn release(&self, ip: std::net::IpAddr) {
+        self.pending.fetch_sub(1, Ordering::SeqCst);
+        let mut map = self
+            .per_ip
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(v) = map.get_mut(&ip) {
+            if *v > 1 {
+                *v -= 1;
+            } else {
+                map.remove(&ip);
+            }
+        }
+    }
+}
+
 /// 单连接状态（跨 handler 调用共享；原子标志 + 轻量 Mutex）。
 struct ConnState {
     /// 已鉴权（§6.5-13 之前只收 Ping/Authenticate）。
@@ -206,10 +276,14 @@ struct ConnState {
     send_tx: Mutex<Option<Arc<mpsc::Sender<ServerCommand>>>>,
     /// 当前帧上限（§10.4：鉴权前 ~4KiB，鉴权后 2MiB；与 Stream recv 任务共享）。
     packet_limit: Arc<AtomicU32>,
+    /// 本连接是否仍计入未鉴权准入（鉴权成功后转正释放，§10.4）。
+    admission_held: AtomicBool,
+    /// 对端 IP（准入释放用，§10.4）。
+    peer_ip: std::net::IpAddr,
 }
 
 impl ConnState {
-    fn new() -> Self {
+    fn new(peer_ip: std::net::IpAddr) -> Self {
         Self {
             authed: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
@@ -219,6 +293,8 @@ impl ConnState {
             last_recv: Mutex::new(Instant::now()),
             send_tx: Mutex::new(None),
             packet_limit: Arc::new(AtomicU32::new(PRE_AUTH_MAX_PACKET)),
+            admission_held: AtomicBool::new(false),
+            peer_ip,
         }
     }
 }
@@ -228,12 +304,19 @@ impl ConnState {
 /// # Errors
 ///
 /// 握手失败（版本读取失败）时返回；业务错误走 `warn` 日志（不中断 accept）。
+#[allow(clippy::too_many_lines)] // 连接全生命周期（准入/握手/监控/收尾）单一函数完整呈现
 pub async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
     ctx: Arc<ConnContext>,
 ) -> Result<()> {
-    let state = Arc::new(ConnState::new());
+    // 连接准入（§10.4）：未鉴权连接上限 + 每 IP 限额——超限直接断开
+    let peer_ip = addr.ip();
+    if !ctx.admission.try_acquire(peer_ip) {
+        return Ok(());
+    }
+    let state = Arc::new(ConnState::new(peer_ip));
+    state.admission_held.store(true, Ordering::SeqCst);
 
     let handler_ctx = Arc::clone(&ctx);
     let handler_state = Arc::clone(&state);
@@ -253,7 +336,17 @@ pub async fn handle_connection(
         handler,
         Arc::clone(&state.packet_limit),
     )
-    .await?;
+    .await;
+    let stream = match stream {
+        Ok(s) => s,
+        Err(e) => {
+            // 握手失败/超时/EOF：收尾代码不会执行——这里显式释放准入（§10.4 防泄漏）
+            if state.admission_held.swap(false, Ordering::SeqCst) {
+                ctx.admission.release(state.peer_ip);
+            }
+            return Err(e);
+        }
+    };
 
     // 心跳监控（§6.1）：10s 无任何包 → 判断线 → 生命周期 Disconnected + 通知主流程断开。
     // 主流程用 `select!` 同时等待客户端断开与超时信号（避免共享 Stream 的 take 竞争）。
@@ -313,6 +406,10 @@ pub async fn handle_connection(
                 .send(LifecycleEvent::Disconnected { user_id, epoch })
                 .await;
         }
+    }
+    // 释放准入（若仍未鉴权转正——鉴权成功已 release，这里幂等兜底）
+    if state.admission_held.swap(false, Ordering::SeqCst) {
+        ctx.admission.release(state.peer_ip);
     }
     // 注销会话（仅当仍是本连接；先取出发送端再 await，避免 MutexGuard 跨 await）
     let send_tx_opt = {
@@ -442,6 +539,10 @@ async fn authenticate_flow(
                 .send(ServerCommand::Authenticate(Ok((info, room_state))))
                 .await;
             state.authed.store(true, Ordering::SeqCst);
+            // 鉴权转正：释放未鉴权准入计数（§10.4）
+            if state.admission_held.swap(false, Ordering::SeqCst) {
+                ctx.admission.release(state.peer_ip);
+            }
             // 鉴权通过：帧上限放开到协议上限（§10.4：鉴权前 ~4KiB）
             state.packet_limit.store(MAX_PACKET_SIZE, Ordering::SeqCst);
             info!("user={user_id} authenticated (epoch={epoch})");

@@ -74,6 +74,8 @@ async fn main() -> Result<()> {
         registry,
         fact_tx,
         sink,
+        // 连接准入（§10.4）：未鉴权连接上限 + 每 IP 限额
+        admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
     };
     Server::new(
         config.listen,

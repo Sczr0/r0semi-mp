@@ -39,6 +39,7 @@ fn test_ctx() -> Arc<ConnContext> {
         registry,
         fact_tx,
         sink,
+        admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
     })
 }
 
@@ -382,4 +383,73 @@ async fn shutdown_signal_grace_zero_exits() {
     // grace=0 → run 快速返回（而非挂在宽限窗口）
     let r = tokio::time::timeout(Duration::from_secs(3), run).await;
     assert!(r.is_ok(), "SIGTERM 后 run 应返回（grace=0 立即退出）");
+}
+
+/// §10.4：半开连接防护——connect 后不发版本字节 → 5s 握手超时 → 服务器断开。
+#[tokio::test]
+async fn handshake_timeout_disconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_done = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = handle_connection(stream, addr, test_ctx()).await;
+    });
+
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    // 不发握手版本字节
+
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 1];
+    let r = tokio::time::timeout(Duration::from_secs(8), sock.read(&mut buf)).await;
+    assert_eq!(r.unwrap().unwrap(), 0, "5s 握手超时应被服务器断开（EOF）");
+    assert!(
+        start.elapsed() >= Duration::from_secs(4),
+        "断开应在 ~5s 后: {:?}",
+        start.elapsed()
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
+}
+
+/// §10.4：每 IP 未鉴权连接上限 5——第 6 个同 IP 连接被拒；释放后可再连。
+#[tokio::test]
+async fn per_ip_admission_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let ctx = test_ctx();
+    tokio::spawn(async move {
+        loop {
+            let (stream, a) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, a, ctx).await;
+            });
+        }
+    });
+
+    // 5 个同 IP 未鉴权连接（不发握手 → 计入 pending）
+    let mut socks: Vec<TcpStream> = Vec::new();
+    for _ in 0..5 {
+        socks.push(TcpStream::connect(addr).await.unwrap());
+    }
+
+    // 第 6 个：被服务器拒绝（try_acquire 失败 → drop → EOF）
+    let mut sixth = TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let r = tokio::time::timeout(Duration::from_secs(3), sixth.read(&mut buf)).await;
+    assert_eq!(r.unwrap().unwrap(), 0, "第 6 个同 IP 未鉴权连接应被拒绝");
+
+    // 释放一个连接（pending-1）→ 新连接可被接受
+    drop(socks.pop());
+    tokio::time::sleep(Duration::from_millis(200)).await; // 等服务端收尾
+    let mut seventh = TcpStream::connect(addr).await.unwrap();
+    let r = tokio::time::timeout(Duration::from_millis(400), seventh.read(&mut buf)).await;
+    assert!(
+        r.is_err() || r.unwrap().unwrap() != 0,
+        "释放后新连接应被接受（服务器在等握手而非立即断开）"
+    );
+
+    drop(socks);
+    drop(sixth);
+    drop(seventh);
 }

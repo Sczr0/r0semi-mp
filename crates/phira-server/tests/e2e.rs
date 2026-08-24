@@ -101,6 +101,7 @@ fn setup_ctx_with_monitors(
         registry,
         fact_tx,
         sink,
+        admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
     })
 }
 

@@ -16,6 +16,7 @@ use std::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Result, bail};
@@ -36,6 +37,9 @@ pub const MAX_PACKET_SIZE: u32 = 2 * 1024 * 1024;
 
 /// 鉴权前帧上限（§10.4 红线：握手 + token ≤32B 之外无合法大帧，堵死未鉴权 2MiB 帧攻击）。
 pub const PRE_AUTH_MAX_PACKET: u32 = 4 * 1024;
+
+/// 握手超时（§10.4：peek/读首字节 ≤5s——半开连接（connect 后不发版本）不占资源）。
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 双向帧流：`S` = 发送载荷类型（服务端侧 = `ServerCommand`），`R` = 接收载荷类型。
 ///
@@ -90,7 +94,10 @@ where
             write.write_u8(version).await?;
             version
         } else {
-            read.read_u8().await?
+            // §10.4：半开连接防护——等首字节最多 HANDSHAKE_TIMEOUT，超时即断开
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, read.read_u8())
+                .await
+                .map_err(|_| anyhow::anyhow!("handshake timeout"))??
         };
 
         let (send_tx, mut send_rx) = mpsc::channel(1024);
