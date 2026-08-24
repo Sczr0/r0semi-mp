@@ -17,6 +17,16 @@ pub struct Config {
     pub api_base: String,
     /// 房间配置（monitors 白名单等，§6.5-4）。
     pub rooms: RoomConfig,
+    /// 断线重连窗口（§6.5-21，默认 10s）。
+    pub reconnect_window: std::time::Duration,
+    /// 回源 HTTP 请求超时（§4.4，默认 5s）。
+    pub http_timeout: std::time::Duration,
+    /// 停机维护宽限窗口（§11，默认 10s）。
+    pub maintenance_grace: std::time::Duration,
+    /// 配置文件轮询间隔（§4.9-8，默认 2s）。
+    pub config_poll_interval: std::time::Duration,
+    /// 停机维护通知文案（§11 系统 Chat，默认中文提示）。
+    pub maintenance_notice: String,
 }
 
 impl Default for Config {
@@ -26,6 +36,11 @@ impl Default for Config {
             api_base: "https://phira.5wyxi.com".to_owned(),
             // 原版默认白名单（server.rs：monitors: vec![2]）
             rooms: RoomConfig { monitors: vec![2] },
+            reconnect_window: std::time::Duration::from_secs(10),
+            http_timeout: std::time::Duration::from_secs(5),
+            maintenance_grace: std::time::Duration::from_secs(10),
+            config_poll_interval: std::time::Duration::from_secs(2),
+            maintenance_notice: "服务器维护中，房间即将关闭，请稍后再来".to_owned(),
         }
     }
 }
@@ -149,6 +164,21 @@ impl Config {
         if let Some(monitors) = yaml.monitors {
             self.rooms.monitors = monitors;
         }
+        if let Some(secs) = yaml.reconnect_window {
+            self.reconnect_window = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = yaml.http_timeout {
+            self.http_timeout = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = yaml.maintenance_grace {
+            self.maintenance_grace = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = yaml.config_poll_interval {
+            self.config_poll_interval = std::time::Duration::from_secs(secs);
+        }
+        if let Some(notice) = yaml.maintenance_notice {
+            self.maintenance_notice = notice;
+        }
         Ok(())
     }
 }
@@ -167,4 +197,14 @@ struct YamlConfig {
     api_base: Option<String>,
     /// 观战者白名单（§6.5-4 / §4.6-4）。
     monitors: Option<Vec<i32>>,
+    /// 断线重连窗口（秒）。
+    reconnect_window: Option<u64>,
+    /// 回源 HTTP 请求超时（秒）。
+    http_timeout: Option<u64>,
+    /// 停机维护宽限窗口（秒）。
+    maintenance_grace: Option<u64>,
+    /// 配置文件轮询间隔（秒）。
+    config_poll_interval: Option<u64>,
+    /// 停机维护通知文案。
+    maintenance_notice: Option<String>,
 }

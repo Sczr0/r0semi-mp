@@ -41,17 +41,25 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// 手写 HTTP/1.1 GET（§10.1，约两百行，最贴合内存目标）。
 pub struct HttpApiClient {
     base: String,
+    /// 请求超时（yml `http_timeout`，默认 5s）。
+    timeout: Duration,
 }
 
 impl HttpApiClient {
-    /// 构造。`base` = 官方 API 基地址（Config::api_base）。
+    /// 构造（默认 5s 超时）。`base` = 官方 API 基地址（Config::api_base）。
     #[must_use]
     pub fn new(base: String) -> Self {
-        Self { base }
+        Self::new_with_timeout(base, HTTP_TIMEOUT)
+    }
+
+    /// 构造并指定请求超时（yml `http_timeout` 接线点）。
+    #[must_use]
+    pub fn new_with_timeout(base: String, timeout: Duration) -> Self {
+        Self { base, timeout }
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, ApiError> {
-        let bytes = http_get(&self.base, path, None).await?;
+        let bytes = http_get_with_timeout(&self.base, path, None, self.timeout).await?;
         serde_json::from_slice(&bytes).map_err(|e| ApiError::Internal {
             msg: format!("invalid JSON from {path}: {e}"),
         })
@@ -122,20 +130,28 @@ impl ApiClient for HttpApiClient {
 /// 鉴权处理器（§4.4 / §6.5-14）。
 pub struct HttpAuth {
     base: String,
+    /// 请求超时（yml `http_timeout`，默认 5s）。
+    timeout: Duration,
 }
 
 impl HttpAuth {
-    /// 构造。`base` = 官方 API 基地址。
+    /// 构造（默认 5s 超时）。`base` = 官方 API 基地址。
     #[must_use]
     pub fn new(base: String) -> Self {
-        Self { base }
+        Self::new_with_timeout(base, HTTP_TIMEOUT)
+    }
+
+    /// 构造并指定请求超时（yml `http_timeout` 接线点）。
+    #[must_use]
+    pub fn new_with_timeout(base: String, timeout: Duration) -> Self {
+        Self { base, timeout }
     }
 }
 
 #[async_trait::async_trait]
 impl AuthHandler for HttpAuth {
     async fn authenticate(&self, token: &str) -> Result<UserIdentity, AuthError> {
-        let bytes = http_get(&self.base, "/me", Some(token))
+        let bytes = http_get_with_timeout(&self.base, "/me", Some(token), self.timeout)
             .await
             .map_err(|e| match e {
                 ApiError::Internal { msg } => AuthError::Internal { msg },
@@ -201,11 +217,14 @@ fn parse_base(base: &str) -> Result<(Transport, String, u16), ApiError> {
     Ok((transport, host, port))
 }
 
-/// 手写 HTTP/1.1 GET（§10.1）：请求 + 读响应头 + Content-Length 读体。
-///
-/// 按基址 scheme 选择传输：明文 TCP 或 rustls TLS（§10.3）。
-async fn http_get(base: &str, path: &str, bearer: Option<&str>) -> Result<Vec<u8>, ApiError> {
-    http_get_with_tls(base, path, bearer, None).await
+/// 带自定义超时的请求（yml `http_timeout` 接线点）。
+async fn http_get_with_timeout(
+    base: &str,
+    path: &str,
+    bearer: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<u8>, ApiError> {
+    http_get_with_tls_timeout(base, path, bearer, None, timeout).await
 }
 
 /// 请求入口（测试可注入自定义 TLS 配置，`None` = 生产 webpki-roots 验证）。
@@ -217,6 +236,17 @@ pub async fn http_get_with_tls(
     path: &str,
     bearer: Option<&str>,
     tls: Option<Arc<rustls::ClientConfig>>,
+) -> Result<Vec<u8>, ApiError> {
+    http_get_with_tls_timeout(base, path, bearer, tls, HTTP_TIMEOUT).await
+}
+
+/// 内部实现（timeout 可注入）。
+async fn http_get_with_tls_timeout(
+    base: &str,
+    path: &str,
+    bearer: Option<&str>,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    timeout: Duration,
 ) -> Result<Vec<u8>, ApiError> {
     let (transport, host, port) = parse_base(base)?;
     // Never Trust the Client（2026-08）：token 是客户端可控数据（协议 Varchar 允许 CR/LF），
@@ -235,7 +265,7 @@ pub async fn http_get_with_tls(
     let _ = socket.set_nodelay(true);
 
     match transport {
-        Transport::Plain => http_exchange(socket, &host, path, bearer).await,
+        Transport::Plain => http_exchange(socket, &host, path, bearer, timeout).await,
         Transport::Tls => {
             // rustls 握手（SNI = host，证书链验证 = webpki-roots / 测试注入配置）
             let server_name =
@@ -250,7 +280,7 @@ pub async fn http_get_with_tls(
                     .map_err(|e| ApiError::Internal {
                         msg: format!("TLS handshake with {host}: {e}"),
                     })?;
-            http_exchange(tls_stream, &host, path, bearer).await
+            http_exchange(tls_stream, &host, path, bearer, timeout).await
         }
     }
 }
@@ -261,6 +291,7 @@ async fn http_exchange<S>(
     host: &str,
     path: &str,
     bearer: Option<&str>,
+    timeout: Duration,
 ) -> Result<Vec<u8>, ApiError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -279,7 +310,7 @@ where
     req.push_str("\r\n");
     debug!("http GET {path}");
 
-    let result = tokio::time::timeout(HTTP_TIMEOUT, async {
+    let result = tokio::time::timeout(timeout, async {
         write
             .write_all(req.as_bytes())
             .await
@@ -350,7 +381,7 @@ where
     match result {
         Ok(r) => r,
         Err(_) => Err(ApiError::Internal {
-            msg: format!("http timeout after {HTTP_TIMEOUT:?}: {path}"),
+            msg: format!("http timeout after {timeout:?}: {path}"),
         }),
     }
 }

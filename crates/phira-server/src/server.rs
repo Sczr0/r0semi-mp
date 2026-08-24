@@ -30,25 +30,30 @@ pub struct Server {
     listener: TcpListener,
     /// 连接处理上下文（bus/鉴权/生命周期/投递），accept 时克隆。
     ctx: Arc<ConnContext>,
+    /// 停机维护通知文案（§11 系统 Chat，yml `maintenance_notice`）。
+    maintenance_notice: String,
+    /// 停机宽限窗口（§11，yml `maintenance_grace`）。
+    maintenance_grace: std::time::Duration,
 }
 
-/// 停机维护通知（§11）：系统 Chat 消息（user=0），协议兼容（客户端显示为聊天）。
-const MAINTENANCE_NOTICE: &str = "服务器维护中，房间即将关闭，请稍后再来";
-
-/// 停机宽限窗口（§11：供玩家看到维护消息，之后强制退出）。
-const MAINTENANCE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
-
 impl Server {
-    /// 绑定端口（默认 12346，§3.5）。
+    /// 绑定端口（默认 12346，§3.5）并指定停机维护参数（yml 接线点）。
     ///
     /// # Errors
     ///
     /// 端口绑定失败（占用 / 权限）→ `std::io::Error`。
-    pub async fn new(addr: SocketAddr, ctx: ConnContext) -> Result<Self> {
+    pub async fn new(
+        addr: SocketAddr,
+        ctx: ConnContext,
+        maintenance_notice: String,
+        maintenance_grace: std::time::Duration,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,
             ctx: Arc::new(ctx),
+            maintenance_notice,
+            maintenance_grace,
         })
     }
 
@@ -64,6 +69,8 @@ impl Server {
         // 优雅停机（§11）：SIGTERM/SIGINT → 停止 accept
         let shutdown = shutdown_signal();
         let ctx = Arc::clone(&self.ctx);
+        let notice = self.maintenance_notice.clone();
+        let grace = self.maintenance_grace;
 
         tokio::select! {
             () = shutdown => {
@@ -73,11 +80,11 @@ impl Server {
                 ctx.sink
                     .broadcast(ServerCommand::Message(phira_api::Message::Chat {
                         user: 0,
-                        content: MAINTENANCE_NOTICE.to_owned(),
+                        content: notice,
                     }))
                     .await;
-                info!("maintenance grace window {MAINTENANCE_GRACE:?}");
-                tokio::time::sleep(MAINTENANCE_GRACE).await;
+                info!("maintenance grace window {grace:?}");
+                tokio::time::sleep(grace).await;
             }
             () = self.accept_loop() => {}
         }

@@ -138,3 +138,46 @@ fn yaml_unknown_fields_ignored() {
     .unwrap();
     assert_eq!(cfg.rooms.monitors, vec![1]);
 }
+
+// —— 运维参数配置化（2026-08：重连窗口/HTTP 超时/宽限窗口/轮询间隔/维护文案）——
+
+#[test]
+fn yaml_ops_params_full() {
+    let cfg = Config::load_from_yaml(
+        fake_env(&[]),
+        Some(
+            "reconnect_window: 30\nhttp_timeout: 8\nmaintenance_grace: 15\nconfig_poll_interval: 5\nmaintenance_notice: \"维护中，稍后回来\"\n",
+        ),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.reconnect_window, std::time::Duration::from_secs(30));
+    assert_eq!(cfg.http_timeout, std::time::Duration::from_secs(8));
+    assert_eq!(cfg.maintenance_grace, std::time::Duration::from_secs(15));
+    assert_eq!(cfg.config_poll_interval, std::time::Duration::from_secs(5));
+    assert_eq!(cfg.maintenance_notice, "维护中，稍后回来");
+}
+
+#[test]
+fn yaml_ops_params_absent_keep_defaults() {
+    // 缺失 → 默认（10s 重连 / 5s 超时 / 10s 宽限 / 2s 轮询 / 默认文案）
+    let cfg = Config::load_from_yaml(fake_env(&[]), Some("monitors: [1]\n"), None).unwrap();
+    assert_eq!(cfg.reconnect_window, std::time::Duration::from_secs(10));
+    assert_eq!(cfg.http_timeout, std::time::Duration::from_secs(5));
+    assert_eq!(cfg.maintenance_grace, std::time::Duration::from_secs(10));
+    assert_eq!(cfg.config_poll_interval, std::time::Duration::from_secs(2));
+    assert!(cfg.maintenance_notice.contains("维护"));
+}
+
+#[test]
+fn yaml_ops_zero_values_accepted() {
+    // 0 秒合法（不报错；语义由调用方解释——如 0 宽限 = 立即退出）
+    let cfg = Config::load_from_yaml(
+        fake_env(&[]),
+        Some("maintenance_grace: 0\nconfig_poll_interval: 0\n"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.maintenance_grace, std::time::Duration::ZERO);
+    assert_eq!(cfg.config_poll_interval, std::time::Duration::ZERO);
+}

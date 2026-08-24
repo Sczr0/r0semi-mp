@@ -5,7 +5,6 @@
 //! 换实现 = 组合根换工厂（§3.2：灰度已降级为运维选项，项目内零灰度代码）。
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use phira_api::{ApiClient, RandomSource, RoomConfig, RoomDeps, RoomFactory};
@@ -26,8 +25,9 @@ async fn main() -> Result<()> {
 
     // 老板接线：决定谁上架 + 注入外部依赖（§4.9-6）
     // 单一 HTTP 实例，auth 与 chart/record 共享（评审 §8 五-1）
-    let http = Arc::new(phira_server::http::HttpApiClient::new(
+    let http = Arc::new(phira_server::http::HttpApiClient::new_with_timeout(
         config.api_base.clone(),
+        config.http_timeout,
     ));
 
     let deps = RoomDeps {
@@ -44,9 +44,9 @@ async fn main() -> Result<()> {
         Arc::new(config.rooms.clone()) as Arc<RoomConfig>,
     );
 
-    // 用户生命周期（§4.9-3）：单一生产者任务 + 注册表（10s 重连窗口，§6.5-21）
+    // 用户生命周期（§4.9-3）：单一生产者任务 + 注册表（重连窗口 = yml `reconnect_window`，§6.5-21）
     let (lifecycle_task, registry, fact_tx) =
-        LifecycleTask::new(bus.clone(), Duration::from_secs(10));
+        LifecycleTask::new(bus.clone(), config.reconnect_window);
     tokio::spawn(lifecycle_task.run());
 
     // 事件投递（§6.6 表 2）：user → 会话写通道
@@ -55,14 +55,17 @@ async fn main() -> Result<()> {
 
     // 鉴权（回源 /me，§6.5-14）
     let auth: Arc<dyn phira_api::AuthHandler> =
-        Arc::new(phira_server::http::HttpAuth::new(config.api_base.clone()));
+        Arc::new(phira_server::http::HttpAuth::new_with_timeout(
+            config.api_base.clone(),
+            config.http_timeout,
+        ));
 
     // 配置热重载（§4.9-8）：文件轮询 → update_config；路径 = R0SEMI_MP_CONFIG 或默认
     let config_path = std::env::var("R0SEMI_MP_CONFIG")
         .unwrap_or_else(|_| phira_core::DEFAULT_CONFIG_PATH.to_owned());
     bus.watch_config(
         std::path::PathBuf::from(config_path),
-        Duration::from_secs(2),
+        config.config_poll_interval,
     );
 
     let ctx = ConnContext {
@@ -72,6 +75,14 @@ async fn main() -> Result<()> {
         fact_tx,
         sink,
     };
-    Server::new(config.listen, ctx).await?.run().await?;
+    Server::new(
+        config.listen,
+        ctx,
+        config.maintenance_notice.clone(),
+        config.maintenance_grace,
+    )
+    .await?
+    .run()
+    .await?;
     Ok(())
 }
