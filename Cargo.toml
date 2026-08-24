@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/phira-api",
+    "crates/phira-contract",
+    "crates/phira-core",
+    "crates/impl-rooms-v1",
+    "crates/phira-server",
+]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.98"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# 红线：phira-api 只允许 thiserror/half 等轻量库，零 tokio（§4.3-1 / §4.8）
+[workspace.dependencies]
+thiserror = "2"
+half = "2"
+async-trait = "0.1"
+rand = "0.9"
+anyhow = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros", "signal"] }

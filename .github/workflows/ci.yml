@@ -1,0 +1,35 @@
+# CI 五道闸门（§5.4）：格式 / lint / 依赖方向 / 测试（含契约测试）/ 许可
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 1. Format
+        run: cargo fmt --all -- --check
+
+      - name: 2. Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 3. Dependency direction
+        run: python3 tools/check-deps.py
+
+      - name: 4. Tests (including contract tests)
+        run: cargo test --workspace --all-targets
+
+      - name: 5. Third-party licenses
+        uses: EmbarkStudios/cargo-deny-action@v2

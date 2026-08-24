@@ -1,0 +1,19 @@
+[package]
+name = "phira-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# 契约 crate 单独加严：继承全局 forbid(unsafe_code) + 追加 missing_docs（§5.1）
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+thiserror.workspace = true
+half.workspace = true
+async-trait.workspace = true
