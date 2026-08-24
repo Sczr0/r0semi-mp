@@ -1,15 +1,12 @@
 //! HTTP 回源客户端测试（§10.1 手写 HTTP/1.1 + 本地 mock API，§9 Oracle 环境）。
 
-use std::net::SocketAddr;
-
 use phira_api::{ApiClient, AuthHandler};
 use phira_server::http::{HttpApiClient, HttpAuth};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// 简易 mock API：每次连接读请求头（验证 path/Bearer），按预设响应写回。
-async fn mock_server(addr: SocketAddr, responses: Vec<(String, String, String)>) {
-    let listener = TcpListener::bind(addr).await.unwrap();
+async fn mock_server(listener: TcpListener, responses: Vec<(String, String, String)>) {
     for (path, body, bearer) in responses {
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut head = Vec::new();
@@ -48,10 +45,9 @@ async fn mock_server(addr: SocketAddr, responses: Vec<(String, String, String)>)
 async fn fetch_chart_parses_json() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let mock = tokio::spawn(mock_server(
-        addr,
+        listener,
         vec![(
             "/chart/7".into(),
             r#"{"id": 7, "name": "Test Chart"}"#.into(),
@@ -70,13 +66,12 @@ async fn fetch_chart_parses_json() {
 async fn fetch_record_parses_all_fields() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let body = r#"{"id": 1, "player": 42, "score": 980000, "perfect": 100,
         "good": 2, "bad": 1, "miss": 0, "max_combo": 150,
         "accuracy": 0.995, "full_combo": true, "std": 0.1, "std_score": 90.5}"#;
     let mock = tokio::spawn(mock_server(
-        addr,
+        listener,
         vec![("/record/1".into(), body.to_owned(), String::new())],
     ));
 
@@ -93,10 +88,9 @@ async fn fetch_record_parses_all_fields() {
 async fn authenticate_sends_bearer_and_parses_me() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let mock = tokio::spawn(mock_server(
-        addr,
+        listener,
         vec![(
             "/me".into(),
             r#"{"id": 99, "name": "p99", "language": "en"}"#.into(),
@@ -116,11 +110,9 @@ async fn authenticate_sends_bearer_and_parses_me() {
 async fn http_404_is_internal_error() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     // 响应 404（覆盖 mock_server 的 200 假设——单独实现）
     let mock = tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await.unwrap();
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 1024];
         let _ = sock.read(&mut buf).await.unwrap();
@@ -171,11 +163,9 @@ async fn auth_token_with_lf_rejected() {
 async fn huge_content_length_times_out_without_oom() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     // 服务器：响应头声明 10GB Content-Length，但只发 1KB 后挂住
     let mock = tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await.unwrap();
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 1024];
         let _ = sock.read(&mut buf).await.unwrap();
@@ -204,11 +194,9 @@ async fn huge_content_length_times_out_without_oom() {
 async fn custom_http_timeout_applies() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     // mock：收到请求后 sleep 3s 再响应（客户端 1s 超时应先触发）
     let mock = tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await.unwrap();
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 1024];
         let _ = sock.read(&mut buf).await.unwrap();
@@ -241,10 +229,8 @@ async fn custom_http_timeout_applies() {
 async fn custom_auth_timeout_applies() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let mock = tokio::spawn(async move {
-        let listener = TcpListener::bind(addr).await.unwrap();
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 1024];
         let _ = sock.read(&mut buf).await.unwrap();
@@ -269,10 +255,9 @@ async fn custom_auth_timeout_applies() {
 async fn short_timeout_still_succeeds_on_fast_path() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let mock = tokio::spawn(mock_server(
-        addr,
+        listener,
         vec![(
             "/chart/3".into(),
             r#"{"id": 3, "name": "Fast Chart"}"#.into(),
