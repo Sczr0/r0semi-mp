@@ -40,3 +40,27 @@ jobs:
         with:
           package: phira-api
           baseline: main
+
+  # 部署产物（§10 部署/迁移）：Linux release 二进制——机子上不装 Rust 工具链，
+  # 下载即跑（docs/deployment.md 迁移清单的构建源）。
+  release:
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release -p phira-server
+
+      - name: Upload binary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: r0semi-mp-server-linux
+          path: target/release/r0semi-mp-server
+          if-no-files-found: error
