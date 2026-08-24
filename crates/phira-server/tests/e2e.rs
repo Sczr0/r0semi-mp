@@ -926,3 +926,95 @@ async fn maintenance_broadcast_reaches_all() {
     drop(c1);
     drop(c2);
 }
+
+/// Never Trust the Client：非 host 越权全链路（socket → 会话层 → bus → actor）→ OnlyHost 拒绝。
+/// 契约测试在 actor 直驱层已断言；本测试验证全链路无旁路（用户 id 来自鉴权，不可伪造）。
+#[tokio::test]
+async fn non_host_privilege_escalation_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx(mock_addr);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    let mut c1 = client_connect(server_addr).await;
+    let mut c2 = client_connect(server_addr).await;
+    for (c, tok) in [(&mut c1, "tok1"), (&mut c2, "tok2")] {
+        send_cmd(
+            c,
+            &ClientCommand::Authenticate {
+                token: Varchar::new(tok.into()).unwrap(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_cmd(c).await,
+            ServerCommand::Authenticate(Ok(_))
+        ));
+    }
+
+    // user1 建房 + user2 加入（普通玩家）
+    send_cmd(
+        &mut c1,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c1).await;
+    let _ = recv_cmd(&mut c1).await;
+    send_cmd(
+        &mut c2,
+        &ClientCommand::JoinRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+            monitor: false,
+        },
+    )
+    .await;
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c1).await;
+    }
+    for _ in 0..3 {
+        let _ = recv_cmd(&mut c2).await;
+    }
+
+    // user2（非 host）越权：LockRoom / CycleRoom / SelectChart / RequestStart
+    for cmd in [
+        ClientCommand::LockRoom { lock: true },
+        ClientCommand::CycleRoom { cycle: true },
+        ClientCommand::SelectChart { id: 1 },
+        ClientCommand::RequestStart,
+    ] {
+        send_cmd(&mut c2, &cmd).await;
+        let f = recv_cmd(&mut c2).await;
+        let err_text = match &cmd {
+            ClientCommand::LockRoom { .. } => "LockRoom",
+            ClientCommand::CycleRoom { .. } => "CycleRoom",
+            ClientCommand::SelectChart { .. } => "SelectChart",
+            ClientCommand::RequestStart => "RequestStart",
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(&f, ServerCommand::LockRoom(Err(m)) | ServerCommand::CycleRoom(Err(m))
+                | ServerCommand::SelectChart(Err(m)) | ServerCommand::RequestStart(Err(m))
+                if m == "only host can do this"),
+            "{err_text} 非 host 应被拒 OnlyHost: {f:?}"
+        );
+    }
+
+    // user2 伪造 user1 身份不可能（user_id 来自鉴权 state）——已鉴权命令不携带用户 id
+    drop(c1);
+    drop(c2);
+}

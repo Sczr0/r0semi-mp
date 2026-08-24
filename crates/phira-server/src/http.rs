@@ -219,6 +219,13 @@ pub async fn http_get_with_tls(
     tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<Vec<u8>, ApiError> {
     let (transport, host, port) = parse_base(base)?;
+    // Never Trust the Client（2026-08）：token 是客户端可控数据（协议 Varchar 允许 CR/LF），
+    // 直接拼进请求头可注入任意头——拒绝而非转义（fail closed）。
+    if bearer.is_some_and(|t| t.contains(['\r', '\n'])) {
+        return Err(ApiError::Internal {
+            msg: "invalid bearer token (CR/LF)".to_owned(),
+        });
+    }
     let addr = format!("{host}:{port}");
     let socket = TcpStream::connect(&addr)
         .await

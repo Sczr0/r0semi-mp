@@ -449,6 +449,17 @@ fn err_unknown_tag() {
 }
 
 #[test]
+fn err_chat_message_too_long() {
+    // Chat 的 message 是 Varchar<200>（§6.2）；喂 201 字节 → StringTooLong
+    let mut bytes = vec![0x02, 0xC9, 0x01]; // tag=2, uleb(201)
+    bytes.extend(std::iter::repeat_n(b'a', 201));
+    assert_eq!(
+        decode_packet::<ClientCommand>(&bytes),
+        Err(DecodeError::StringTooLong { max: 200, len: 201 })
+    );
+}
+
+#[test]
 fn err_varchar_too_long() {
     // Authenticate 的 token 是 Varchar<32>；喂 33 字节
     let mut bytes = vec![0x01, 0x21]; // tag=1, uleb(33)
