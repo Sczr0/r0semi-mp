@@ -193,7 +193,7 @@ where
 
     /// 协商后的协议版本。
     #[must_use]
-    pub fn version(&self) -> u8 {
+    pub const fn version(&self) -> u8 {
         self.version
     }
 

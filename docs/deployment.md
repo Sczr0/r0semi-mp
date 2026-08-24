@@ -38,6 +38,7 @@ Description=r0semi-mp server
 After=network-online.target
 
 [Service]
+Type=notify                  # sd-notify 就绪通知（bind 成功才认为启动完成）
 WorkingDirectory=/opt/r0semi-mp
 ExecStart=/opt/r0semi-mp/r0semi-mp-server
 Restart=on-failure

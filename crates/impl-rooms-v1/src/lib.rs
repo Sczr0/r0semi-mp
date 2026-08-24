@@ -41,7 +41,7 @@ enum InternalState {
 }
 
 impl InternalState {
-    fn to_client(&self, chart: Option<i32>) -> RoomState {
+    const fn to_client(&self, chart: Option<i32>) -> RoomState {
         match self {
             Self::SelectChart => RoomState::SelectChart(chart),
             Self::WaitForReady { .. } => RoomState::WaitingForReady,
@@ -770,7 +770,7 @@ pub struct RoomsV1 {
 impl RoomsV1 {
     /// 构造工厂。`deps` 中的 API/随机源由组合根注入（契约测试注入 fake）。
     #[must_use]
-    pub fn new(config: RoomConfig, deps: RoomDeps) -> Self {
+    pub const fn new(config: RoomConfig, deps: RoomDeps) -> Self {
         Self { config, deps }
     }
 }

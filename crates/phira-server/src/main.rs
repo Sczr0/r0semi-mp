@@ -77,14 +77,20 @@ async fn main() -> Result<()> {
         // 连接准入（§10.4）：未鉴权连接上限 + 每 IP 限额
         admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
     };
-    Server::new(
+    let server = Server::new(
         config.listen,
         ctx,
         config.maintenance_notice.clone(),
         config.maintenance_grace,
     )
-    .await?
-    .run()
     .await?;
+    // systemd 就绪通知（§部署）：bind 成功即"准备好接受连接"（配合 Type=notify）
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = sd_notify::notify(true) {
+            tracing::warn!("sd_notify failed: {e}");
+        }
+    }
+    server.run().await?;
     Ok(())
 }

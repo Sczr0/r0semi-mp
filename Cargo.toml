@@ -22,6 +22,8 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # doc_markdown 是纯格式（缺反引号），对契约文档质量贡献低；missing_docs=deny 已保证存在性
 doc_markdown = "allow"
+# 能 const 的函数就 const（借鉴 Next-Phi-Backend）：编译期求值，利于优化
+missing_const_for_fn = "warn"
 
 # 红线：phira-api 只允许 thiserror/half 等轻量库，零 tokio（§4.3-1 / §4.8）
 [workspace.dependencies]

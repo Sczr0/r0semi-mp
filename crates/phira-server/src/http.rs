@@ -48,13 +48,13 @@ pub struct HttpApiClient {
 impl HttpApiClient {
     /// 构造（默认 5s 超时）。`base` = 官方 API 基地址（Config::api_base）。
     #[must_use]
-    pub fn new(base: String) -> Self {
+    pub const fn new(base: String) -> Self {
         Self::new_with_timeout(base, HTTP_TIMEOUT)
     }
 
     /// 构造并指定请求超时（yml `http_timeout` 接线点）。
     #[must_use]
-    pub fn new_with_timeout(base: String, timeout: Duration) -> Self {
+    pub const fn new_with_timeout(base: String, timeout: Duration) -> Self {
         Self { base, timeout }
     }
 
@@ -137,13 +137,13 @@ pub struct HttpAuth {
 impl HttpAuth {
     /// 构造（默认 5s 超时）。`base` = 官方 API 基地址。
     #[must_use]
-    pub fn new(base: String) -> Self {
+    pub const fn new(base: String) -> Self {
         Self::new_with_timeout(base, HTTP_TIMEOUT)
     }
 
     /// 构造并指定请求超时（yml `http_timeout` 接线点）。
     #[must_use]
-    pub fn new_with_timeout(base: String, timeout: Duration) -> Self {
+    pub const fn new_with_timeout(base: String, timeout: Duration) -> Self {
         Self { base, timeout }
     }
 }
