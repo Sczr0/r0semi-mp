@@ -11,6 +11,8 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "MPL-2.0",
+    # webpki-roots 1.x：Mozilla 根证书数据许可（§10.3 TLS 单栈）
+    "CDLA-Permissive-2.0",
 ]
 # phira-api 只依赖 thiserror/half，许可面必须保持窄小
 

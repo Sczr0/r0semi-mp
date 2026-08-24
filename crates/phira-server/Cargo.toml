@@ -25,3 +25,12 @@ async-trait.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# TLS 回源（§10.3 红线：rustls 单栈可接受；ring provider 纯 Rust 最小内存）
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0"
+
+[dev-dependencies]
+# 测试专用：本地 TLS 服务器自签证书生成（§10.3 测试覆盖 TLS 握手路径）
+rcgen = "0.13"
+rustls-pemfile = "2" 
