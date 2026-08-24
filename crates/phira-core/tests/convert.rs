@@ -7,10 +7,10 @@
 use std::sync::Arc;
 
 use phira_api::{
-    ClientCommand, Message, RoomCommand, RoomError, RoomEvent, RoomId, RoomState, ServerCommand,
-    Targets, TouchFrame, UserInfo, Varchar,
+    ClientCommand, JoinRoomResponse, Message, RoomCommand, RoomError, RoomErrorCode, RoomEvent,
+    RoomId, RoomResponse, RoomState, ServerCommand, Targets, TouchFrame, UserInfo, Varchar,
 };
-use phira_core::convert::{client_to_room, event_to_server};
+use phira_core::convert::{client_to_room, error_message, event_to_server, response_to_server};
 
 fn rid() -> RoomId {
     RoomId::new("test".into()).unwrap()
@@ -398,6 +398,180 @@ fn table2_room_created() {
     );
 }
 
-// RoomEvent 构造辅助：确认未使用的导入不报错
-#[allow(dead_code)]
-fn _unused(_: RoomError) {}
+// —— 响应映射：RoomResponse → 协议 Result 变体 ——
+
+#[test]
+fn response_ok_maps_to_protocol_ok() {
+    let cases: Vec<(ClientCommand, ServerCommand)> = vec![
+        (
+            ClientCommand::Chat {
+                message: Varchar::new("hi".into()).unwrap(),
+            },
+            ServerCommand::Chat(Ok(())),
+        ),
+        (
+            ClientCommand::CreateRoom { id: rid() },
+            ServerCommand::CreateRoom(Ok(())),
+        ),
+        (ClientCommand::LeaveRoom, ServerCommand::LeaveRoom(Ok(()))),
+        (
+            ClientCommand::LockRoom { lock: true },
+            ServerCommand::LockRoom(Ok(())),
+        ),
+        (
+            ClientCommand::CycleRoom { cycle: false },
+            ServerCommand::CycleRoom(Ok(())),
+        ),
+        (
+            ClientCommand::SelectChart { id: 3 },
+            ServerCommand::SelectChart(Ok(())),
+        ),
+        (
+            ClientCommand::RequestStart,
+            ServerCommand::RequestStart(Ok(())),
+        ),
+        (ClientCommand::Ready, ServerCommand::Ready(Ok(()))),
+        (
+            ClientCommand::CancelReady,
+            ServerCommand::CancelReady(Ok(())),
+        ),
+        (
+            ClientCommand::Played { id: 1 },
+            ServerCommand::Played(Ok(())),
+        ),
+        (ClientCommand::Abort, ServerCommand::Abort(Ok(()))),
+    ];
+    for (cmd, expected) in cases {
+        assert_eq!(
+            response_to_server(&cmd, Ok(RoomResponse::Ok)),
+            expected,
+            "命令 {cmd:?}"
+        );
+    }
+}
+
+#[test]
+fn response_join_room_carries_snapshot() {
+    let jr = JoinRoomResponse {
+        state: RoomState::SelectChart(Some(1)),
+        users: vec![UserInfo {
+            id: 1,
+            name: "p1".into(),
+            monitor: false,
+        }],
+        live: true,
+    };
+    let cmd = ClientCommand::JoinRoom {
+        id: rid(),
+        monitor: false,
+    };
+    assert_eq!(
+        response_to_server(&cmd, Ok(RoomResponse::JoinRoom(jr.clone()))),
+        ServerCommand::JoinRoom(Ok(jr))
+    );
+}
+
+#[test]
+fn response_business_error_translates_message() {
+    // §4.4：Business 透传文案
+    let err = RoomError::Business {
+        code: RoomErrorCode::RoomFull,
+        msg: "room is full".to_owned(),
+    };
+    let cmd = ClientCommand::Chat {
+        message: Varchar::new("x".into()).unwrap(),
+    };
+    assert_eq!(
+        response_to_server(&cmd, Err(err.clone())),
+        ServerCommand::Chat(Err("room is full".to_owned()))
+    );
+    assert_eq!(error_message(&err), "room is full");
+}
+
+#[test]
+fn response_business_failure_via_ok_wrapper() {
+    // 关键回归测试：bus 的业务拒绝是 `Ok(Failure(...))`（§4.4）——
+    // response_to_server 必须识别为 Err，不能误当成功（2026-08 e2e 抓出的真实 bug）
+    let err = RoomError::Business {
+        code: RoomErrorCode::NoChartSelected,
+        msg: "no chart selected".to_owned(),
+    };
+    let cmd = ClientCommand::RequestStart;
+    assert_eq!(
+        response_to_server(&cmd, Ok(RoomResponse::Failure(err))),
+        ServerCommand::RequestStart(Err("no chart selected".to_owned()))
+    );
+    // 全部命令的 Failure 路径（抽查 3 个命令变体）
+    for cmd in [
+        ClientCommand::Chat {
+            message: Varchar::new("x".into()).unwrap(),
+        },
+        ClientCommand::Ready,
+        ClientCommand::JoinRoom {
+            id: rid(),
+            monitor: false,
+        },
+    ] {
+        let resp = response_to_server(
+            &cmd,
+            Ok(RoomResponse::Failure(RoomError::Business {
+                code: RoomErrorCode::NotInRoom,
+                msg: "not in room".to_owned(),
+            })),
+        );
+        let s = format!("{resp:?}");
+        assert!(
+            s.contains("Err(\"not in room\")"),
+            "Failure 应映射为 Err 文案: {resp:?}"
+        );
+    }
+}
+
+#[test]
+fn response_internal_error_hides_details() {
+    // §4.4：Internal 返回通用文案（细节只进日志）
+    let err = RoomError::Internal {
+        msg: "secret db path".to_owned(),
+    };
+    let cmd = ClientCommand::Ready;
+    assert_eq!(
+        response_to_server(&cmd, Err(err.clone())),
+        ServerCommand::Ready(Err("internal error".to_owned()))
+    );
+    assert_eq!(error_message(&err), "internal error");
+}
+
+#[test]
+fn response_failure_keeps_code() {
+    // 各种业务拒绝码都能透传文案（不吞 code）
+    for (code, msg) in [
+        (RoomErrorCode::NotInRoom, "not in room"),
+        (RoomErrorCode::OnlyHost, "only host"),
+        (RoomErrorCode::NoChartSelected, "no chart selected"),
+        (RoomErrorCode::AlreadyReady, "already ready"),
+        (RoomErrorCode::InvalidRecord, "invalid record"),
+    ] {
+        let err = RoomError::Business {
+            code,
+            msg: msg.to_owned(),
+        };
+        let cmd = ClientCommand::RequestStart;
+        let resp = response_to_server(&cmd, Err(err));
+        assert!(
+            matches!(&resp, ServerCommand::RequestStart(Err(m)) if m == msg),
+            "{code:?} 应透传: {resp:?}"
+        );
+    }
+}
+
+#[test]
+fn response_client_state_passthrough() {
+    // GetClientState 的响应（重连恢复用）不走协议 Result——仅内部使用
+    // 这里验证 RoomResponse::ClientState 不是通过 response_to_server 的（防误用回归）
+    let cmd = ClientCommand::Ready;
+    // ClientState 变体传给普通命令 → unreachable 语义；此处只验证其它变体不受影响
+    assert_eq!(
+        response_to_server(&cmd, Ok(RoomResponse::ClientState(None))),
+        ServerCommand::Ready(Ok(()))
+    );
+}

@@ -213,12 +213,12 @@ pub async fn handle_connection(
     );
 
     let stream = Stream::<ServerCommand, ClientCommand>::new(None, stream, handler).await?;
-    let stream = Arc::new(tokio::sync::Mutex::new(Some(stream)));
 
-    // 心跳监控（§6.1）：10s 无任何包 → 判断线 → 生命周期 Disconnected + 断开连接
+    // 心跳监控（§6.1）：10s 无任何包 → 判断线 → 生命周期 Disconnected + 通知主流程断开。
+    // 主流程用 `select!` 同时等待客户端断开与超时信号（避免共享 Stream 的 take 竞争）。
     let monitor_state = Arc::clone(&state);
     let monitor_ctx = Arc::clone(&ctx);
-    let monitor_stream = Arc::clone(&stream);
+    let (abort_tx, mut abort_rx) = mpsc::channel::<()>(1);
     let monitor = tokio::spawn(async move {
         loop {
             let recv = *monitor_state
@@ -235,7 +235,7 @@ pub async fn handle_connection(
             {
                 continue;
             }
-            // 超时：标记断开 + 通知生命周期 + 断开连接
+            // 超时：标记收尾（CAS 防重复）+ 通知生命周期 + 通知主流程断开
             if monitor_state.closed.swap(true, Ordering::SeqCst) {
                 return; // 已收尾（客户端已断）
             }
@@ -248,26 +248,21 @@ pub async fn handle_connection(
                     .send(LifecycleEvent::Disconnected { user_id, epoch })
                     .await;
             }
-            // 断开连接（drop Stream → abort 收发任务）
-            let mut guard = monitor_stream.lock().await;
-            if let Some(s) = guard.take() {
-                drop(s);
-            }
-            drop(guard);
+            let _ = abort_tx.send(()).await;
             return;
         }
     });
 
-    // 等待连接关闭（客户端断开 / 监控超时 drop）
-    {
-        let mut guard = stream.lock().await;
-        if let Some(s) = guard.take() {
-            drop(guard);
-            s.await_closed().await;
-        }
+    // 等待连接关闭（客户端断开 / 监控超时）。
+    // select：客户端断开 → await_closed 返回；超时 → abort 分支触发，await_closed future 被
+    // drop（stream drop → abort 收发任务 → 连接断开）。
+    tokio::select! {
+        // await_closed move stream：客户端断开 → 正常返回；超时 → future drop → stream drop
+        () = stream.await_closed() => {}
+        () = async { abort_rx.recv().await; } => {}
     }
 
-    // 收尾（幂等：监控超时可能已做）
+    // 收尾（幂等：监控超时可能已发 Disconnected）
     if !state.closed.swap(true, Ordering::SeqCst) {
         let user_id = state.user_id.load(Ordering::SeqCst);
         let epoch = state.epoch.load(Ordering::SeqCst);

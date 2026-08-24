@@ -271,3 +271,30 @@ async fn invalid_packet_disconnects() {
     assert_eq!(r.unwrap(), 0, "未知命令应导致断开");
     let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
 }
+
+/// §6.5-20 / §6.1：10s 无任何包 → 心跳判定断线 → 服务器主动断开。
+#[tokio::test]
+async fn heartbeat_timeout_disconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_done = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = handle_connection(stream, addr, test_ctx()).await;
+    });
+
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(&[PROTOCOL_VERSION]).await.unwrap(); // 握手
+    // 之后不发任何包
+
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 1];
+    let r = tokio::time::timeout(Duration::from_secs(12), sock.read(&mut buf)).await;
+    assert_eq!(r.unwrap().unwrap(), 0, "10s 无包应被服务器主动断开（EOF）");
+    assert!(
+        start.elapsed() >= Duration::from_secs(9),
+        "断开应在心跳超时（~10s）之后: {:?}",
+        start.elapsed()
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
+}

@@ -325,3 +325,50 @@ async fn registry_epoch_sequence() {
     assert_eq!(registry.register(2, "u2".to_owned()), 1, "不同用户独立计数");
     assert_eq!(registry.register(1, "u1".to_owned()), 3);
 }
+
+#[tokio::test]
+async fn explicit_reconnected_fact() {
+    // LifecycleEvent::Reconnected 显式事实（§4.9-3 预留语义）→ 恢复座位
+    let (_bus, registry, fact_tx, received) = setup(Duration::from_secs(10)).await;
+    let e1 = registry.register(1, "u1".to_owned());
+    fact_tx
+        .send(LifecycleEvent::Connected {
+            user_id: 1,
+            epoch: e1,
+        })
+        .await
+        .unwrap();
+    fact_tx
+        .send(LifecycleEvent::Reconnected {
+            user_id: 1,
+            epoch: e1,
+        })
+        .await
+        .unwrap();
+    assert!(
+        wait_received(&received, |c| matches!(
+            c,
+            RoomCommand::UserReconnected {
+                user_id: 1,
+                epoch: 1,
+                ..
+            }
+        ))
+        .await,
+        "显式 Reconnected 应恢复座位: {:?}",
+        *received.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn register_keeps_name() {
+    let registry = phira_core::lifecycle::SessionRegistry::new();
+    let e1 = registry.register(1, "alice".to_owned());
+    assert_eq!(e1, 1);
+    assert_eq!(registry.name_of(1).as_deref(), Some("alice"));
+    // 重连替换名字（epoch+1）
+    let e2 = registry.register(1, "alice2".to_owned());
+    assert_eq!(e2, 2);
+    assert_eq!(registry.name_of(1).as_deref(), Some("alice2"));
+    assert_eq!(registry.name_of(99), None);
+}

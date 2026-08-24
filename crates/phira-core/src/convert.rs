@@ -66,35 +66,37 @@ pub fn error_message(err: &RoomError) -> String {
 ///
 /// 每命令的 Ok 载荷形态不同（`JoinRoom` 带房间快照，其余 `()`）；
 /// `Failure` 按 [`error_message`] 生成 `Err(String)`。
+///
+/// **注意**：bus 的业务拒绝是 `Ok(RoomResponse::Failure)`（不是 `Err`，§4.4）——
+/// 此处必须先归一化为 `Err(String)`，否则失败路径被误当成功（2026-08 修复，
+/// e2e 游戏流程抓出）。
 #[must_use]
 pub fn response_to_server(
     cmd: &ClientCommand,
     resp: Result<RoomResponse, RoomError>,
 ) -> ServerCommand {
-    let err = |e: RoomError| -> String { error_message(&e) };
+    // 归一化：成功载荷 或 Err 文案（业务 Failure 与内部 Err 殊途同归）
+    let result: Result<RoomResponse, String> = match resp {
+        // 业务 Failure 与内部 Err 都转 Err 文案（错误分类只影响日志，§4.4）
+        Ok(RoomResponse::Failure(err)) | Err(err) => Err(error_message(&err)),
+        Ok(other) => Ok(other),
+    };
     match cmd {
-        ClientCommand::Chat { .. } => ServerCommand::Chat(resp.map(|_| ()).map_err(&err)),
-        ClientCommand::CreateRoom { .. } => {
-            ServerCommand::CreateRoom(resp.map(|_| ()).map_err(&err))
-        }
-        ClientCommand::JoinRoom { .. } => ServerCommand::JoinRoom(
-            resp.map(|r| match r {
-                RoomResponse::JoinRoom(jr) => jr,
-                _ => unreachable!("JoinRoom 命令的响应恒为 JoinRoom 变体（bus 契约）"),
-            })
-            .map_err(&err),
-        ),
-        ClientCommand::LeaveRoom => ServerCommand::LeaveRoom(resp.map(|_| ()).map_err(&err)),
-        ClientCommand::LockRoom { .. } => ServerCommand::LockRoom(resp.map(|_| ()).map_err(&err)),
-        ClientCommand::CycleRoom { .. } => ServerCommand::CycleRoom(resp.map(|_| ()).map_err(&err)),
-        ClientCommand::SelectChart { .. } => {
-            ServerCommand::SelectChart(resp.map(|_| ()).map_err(&err))
-        }
-        ClientCommand::RequestStart => ServerCommand::RequestStart(resp.map(|_| ()).map_err(&err)),
-        ClientCommand::Ready => ServerCommand::Ready(resp.map(|_| ()).map_err(&err)),
-        ClientCommand::CancelReady => ServerCommand::CancelReady(resp.map(|_| ()).map_err(&err)),
-        ClientCommand::Played { .. } => ServerCommand::Played(resp.map(|_| ()).map_err(&err)),
-        ClientCommand::Abort => ServerCommand::Abort(resp.map(|_| ()).map_err(&err)),
+        ClientCommand::Chat { .. } => ServerCommand::Chat(result.map(|_| ())),
+        ClientCommand::CreateRoom { .. } => ServerCommand::CreateRoom(result.map(|_| ())),
+        ClientCommand::JoinRoom { .. } => ServerCommand::JoinRoom(result.map(|r| match r {
+            RoomResponse::JoinRoom(jr) => jr,
+            _ => unreachable!("JoinRoom 命令的响应恒为 JoinRoom 变体（bus 契约）"),
+        })),
+        ClientCommand::LeaveRoom => ServerCommand::LeaveRoom(result.map(|_| ())),
+        ClientCommand::LockRoom { .. } => ServerCommand::LockRoom(result.map(|_| ())),
+        ClientCommand::CycleRoom { .. } => ServerCommand::CycleRoom(result.map(|_| ())),
+        ClientCommand::SelectChart { .. } => ServerCommand::SelectChart(result.map(|_| ())),
+        ClientCommand::RequestStart => ServerCommand::RequestStart(result.map(|_| ())),
+        ClientCommand::Ready => ServerCommand::Ready(result.map(|_| ())),
+        ClientCommand::CancelReady => ServerCommand::CancelReady(result.map(|_| ())),
+        ClientCommand::Played { .. } => ServerCommand::Played(result.map(|_| ())),
+        ClientCommand::Abort => ServerCommand::Abort(result.map(|_| ())),
         // 热路径无响应（§6.5-17：只转发给 monitor，不回答发者）；心跳/鉴权不走房间派发
         ClientCommand::Touches { .. } | ClientCommand::Judges { .. } => {
             unreachable!("Touches/Judges 无响应（热路径只转发）")

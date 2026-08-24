@@ -46,6 +46,8 @@ async fn mock_api(addr: std::net::SocketAddr) {
                 r#"{"id": 1, "name": "p1", "language": "zh"}"#
             } else if text.contains("Bearer tok2") {
                 r#"{"id": 2, "name": "p2", "language": "zh"}"#
+            } else if text.contains("GET /chart/1 ") {
+                r#"{"id": 1, "name": "Test Chart"}"#
             } else {
                 r#"{"error": "invalid token"}"#
             };
@@ -117,21 +119,25 @@ async fn send_cmd(sock: &mut TcpStream, cmd: &ClientCommand) {
     sock.write_all(&frame).await.unwrap();
 }
 
-/// 接收一帧并解码（带超时）。
+/// 接收一帧并解码（2s 超时防挂）。
 async fn recv_cmd(sock: &mut TcpStream) -> ServerCommand {
-    let mut len = 0u64;
-    let mut pos = 0;
-    loop {
-        let byte = sock.read_u8().await.unwrap();
-        len |= u64::from(byte & 0x7f) << pos;
-        pos += 7;
-        if byte & 0x80 == 0 {
-            break;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut len = 0u64;
+        let mut pos = 0;
+        loop {
+            let byte = sock.read_u8().await.unwrap();
+            len |= u64::from(byte & 0x7f) << pos;
+            pos += 7;
+            if byte & 0x80 == 0 {
+                break;
+            }
         }
-    }
-    let mut payload = vec![0u8; usize::try_from(len).unwrap()];
-    sock.read_exact(&mut payload).await.unwrap();
-    phira_api::decode_packet(&payload).unwrap()
+        let mut payload = vec![0u8; usize::try_from(len).unwrap()];
+        sock.read_exact(&mut payload).await.unwrap();
+        phira_api::decode_packet(&payload).unwrap()
+    })
+    .await
+    .expect("recv_cmd timeout: 帧流错位或服务器无响应")
 }
 
 #[allow(clippy::too_many_lines)] // 端到端全流程脚本：步骤长是验收场景需求
@@ -354,3 +360,183 @@ async fn duplicate_join_rejected() {
 
 #[allow(dead_code)]
 fn _unused(_: RoomResponse, _: UserInfo, _: mpsc::Receiver<()>) {}
+
+/// 游戏流程：SelectChart（回源 /chart）→ RequestStart → Ready → 全员 Ready → StartPlaying。
+#[allow(clippy::too_many_lines)] // 游戏全流程脚本长是验收场景需求
+#[tokio::test]
+async fn game_flow_select_ready_start() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx(mock_addr);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    // 用户 1 鉴权 + 建房
+    let mut c1 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c1,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok1".into()).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::Authenticate(Ok(_))
+    ));
+    send_cmd(
+        &mut c1,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("g1".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c1).await; // CreateRoom 广播
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::CreateRoom(Ok(()))
+    ));
+
+    // 未选图 RequestStart → 拒绝（§6.5-7）
+    send_cmd(&mut c1, &ClientCommand::RequestStart).await;
+    let resp = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(&resp, ServerCommand::RequestStart(Err(msg)) if msg.contains("no chart")),
+        "未选图请求开始应拒绝: {resp:?}"
+    );
+
+    // 选图（回源 mock /chart/1）
+    send_cmd(&mut c1, &ClientCommand::SelectChart { id: 1 }).await;
+    let broadcast = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(
+            &broadcast,
+            ServerCommand::Message(phira_api::Message::SelectChart { id: 1, name, .. }) if name == "Test Chart"
+        ),
+        "选图广播应含谱面名: {broadcast:?}"
+    );
+    let state = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(
+            &state,
+            ServerCommand::ChangeState(phira_api::RoomState::SelectChart(Some(1)))
+        ),
+        "选图后 ChangeState(SelectChart(Some(1))): {state:?}"
+    );
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::SelectChart(Ok(()))
+    ));
+
+    // 用户 2 加入 + Ready
+    let mut c2 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c2,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok2".into()).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_cmd(&mut c2).await,
+        ServerCommand::Authenticate(Ok(_))
+    ));
+    send_cmd(
+        &mut c2,
+        &ClientCommand::JoinRoom {
+            id: phira_api::RoomId::new("g1".into()).unwrap(),
+            monitor: false,
+        },
+    )
+    .await;
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c1).await; // c1: OnJoinRoom + Message(JoinRoom)
+    }
+    for _ in 0..3 {
+        let _ = recv_cmd(&mut c2).await; // c2: OnJoinRoom + Message(JoinRoom) + JoinRoom 响应
+    }
+
+    // 用户 1 RequestStart（进入 WaitForReady，host 默认 ready，§6.5-7）
+    send_cmd(&mut c1, &ClientCommand::RequestStart).await;
+    let gs = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(
+            &gs,
+            ServerCommand::Message(phira_api::Message::GameStart { user: 1 })
+        ),
+        "RequestStart 应 GameStart 广播: {gs:?}"
+    );
+    let wfr = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(
+            &wfr,
+            ServerCommand::ChangeState(phira_api::RoomState::WaitingForReady)
+        ),
+        "应 ChangeState(WaitingForReady): {wfr:?}"
+    );
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::RequestStart(Ok(()))
+    ));
+    // c2 也收到 RequestStart 的 All 广播（GameStart + ChangeState）
+    let _ = recv_cmd(&mut c2).await;
+    let _ = recv_cmd(&mut c2).await;
+
+    // 用户 2 Ready（WaitForReady 状态有效）
+    send_cmd(&mut c2, &ClientCommand::Ready).await;
+    let c2_ready_bcast = recv_cmd(&mut c2).await;
+    assert!(
+        matches!(
+            &c2_ready_bcast,
+            ServerCommand::Message(phira_api::Message::Ready { user: 2 })
+        ),
+        "c2 应收到自己的 Ready 广播: {c2_ready_bcast:?}"
+    );
+    // 全员 ready（host 默认 + user2）→ StartPlaying + ChangeState(Playing)
+    let c1_ready = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(
+            &c1_ready,
+            ServerCommand::Message(phira_api::Message::Ready { user: 2 })
+        ),
+        "c1 应收到 Ready 广播: {c1_ready:?}"
+    );
+    let c2_start = recv_cmd(&mut c2).await;
+    assert!(
+        matches!(
+            &c2_start,
+            ServerCommand::Message(phira_api::Message::StartPlaying)
+        ),
+        "c2 应收到 StartPlaying: {c2_start:?}"
+    );
+    let c1_start = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(
+            &c1_start,
+            ServerCommand::Message(phira_api::Message::StartPlaying)
+        ),
+        "c1 应收到 StartPlaying: {c1_start:?}"
+    );
+    let c1_playing = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(
+            &c1_playing,
+            ServerCommand::ChangeState(phira_api::RoomState::Playing)
+        ),
+        "应 ChangeState(Playing): {c1_playing:?}"
+    );
+    drop(c1);
+    drop(c2);
+}
