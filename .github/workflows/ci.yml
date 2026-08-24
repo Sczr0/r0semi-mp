@@ -55,6 +55,9 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
+      - name: Install musl cross toolchain (ring 构建需要 musl-gcc)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release (musl static——任意 Linux 可跑，不挑 glibc 版本)
