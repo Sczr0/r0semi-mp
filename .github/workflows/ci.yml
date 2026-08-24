@@ -54,11 +54,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build release-dist (musl static, container toolchain)
-        # muslrust 容器默认工具链即 x86_64-unknown-linux-musl——不带 --target，
-        # 显式指定反而触发容器缺 rust-std（2026-08 CI 实测）
-        run: |
-          docker run --rm -v "$PWD:/volume" -w /volume             clux/muslrust:1.98.0-stable             cargo build --profile release-dist
+      - name: Install Rust toolchain (pinned) + musl target
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl cross toolchain (ring 构建需要 musl-gcc)
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release-dist (musl static)
+        # runner 直接构建：dtolnay 显式装 target（rust-std 完整），apt musl-tools 提供
+        # musl-gcc 供 ring——钉死 1.98.0 不受容器内工具链覆盖影响（2026-08 CI 实测）
+        run: cargo build --profile release-dist --target x86_64-unknown-linux-musl
 
       - name: Publish nightly release (服务器匿名下载)
         uses: softprops/action-gh-release@v2
@@ -67,4 +76,4 @@ jobs:
           name: nightly
           prerelease: true
           make_latest: true
-          files: target/release-dist/r0semi-mp-server
+          files: target/x86_64-unknown-linux-musl/release-dist/r0semi-mp-server
