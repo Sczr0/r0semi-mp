@@ -13,6 +13,10 @@ workspace = true
 name = "r0semi-mp-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "flooder"
+path = "src/bin/flooder.rs"
+
 [dependencies]
 phira-api = { path = "../phira-api" }
 phira-core = { path = "../phira-core" }

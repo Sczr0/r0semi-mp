@@ -89,8 +89,13 @@ impl Server {
         let listener = self.listener;
         let http_listener = self.http_listener;
 
+        // ISSUE-0008 修复：accept 循环放后台任务，**shutdown 是唯一退出路径**——
+        // 修复前 select 任一分支完成即退出：http_port 未配置时 http_accept_loop 立即返回
+        // → 默认配置下服务器启动即退出（ISSUE-0008）。
+        let accept = tokio::spawn(accept_loop(listener, Arc::clone(&ctx)));
+        let http_accept = tokio::spawn(http_accept_loop(http_listener, Arc::clone(&ctx)));
+
         tokio::select! {
-            () = http_accept_loop(http_listener, Arc::clone(&ctx)) => {}
             () = shutdown => {
                 info!("shutdown signal received, broadcasting maintenance notice");
                 // §11：广播"服务器维护中"（系统 Chat，user=0）+ 宽限窗口供玩家看到。
@@ -104,8 +109,11 @@ impl Server {
                 info!("maintenance grace window {grace:?}");
                 tokio::time::sleep(grace).await;
             }
-            () = accept_loop(listener, Arc::clone(&ctx)) => {}
         }
+
+        // 停止接受新连接（accept 循环中止；已建立的连接由各自任务自然结束）
+        accept.abort();
+        http_accept.abort();
         Ok(())
     }
 }

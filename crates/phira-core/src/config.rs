@@ -3,7 +3,7 @@
 //! 配置是热重载的，不是构造期快照——`Bus::update_config` 广播 `UpdateConfig`（§4.9-8）。
 //! 加载优先级：默认值 → `server_config.yml` → 环境变量（部署环境覆盖文件，§4.5）。
 
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 
 use phira_api::RoomConfig;
 use serde::Deserialize;
@@ -38,7 +38,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen: SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 12346),
+            // ISSUE-0008 修复：默认 0.0.0.0（IPv4）——Windows 上 [::] 是 V6ONLY（只收 IPv6），
+            // 玩家（IPv4 客户端）连不上；双栈需 socket2 V6ONLY=false，v1 用 IPv4 足够
+            listen: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 12346),
             api_base: "https://phira.5wyxi.com".to_owned(),
             // 原版默认白名单（server.rs：monitors: vec![2]）
             rooms: RoomConfig { monitors: vec![2] },

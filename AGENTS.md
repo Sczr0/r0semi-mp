@@ -52,6 +52,7 @@ Phira 联机房间服务器 `phira-mp`（Rust）的重写：**内存最小（目
 
 ```bash
 cargo build --workspace            # 编译
+cargo run -p phira-server --bin flooder -- --mode proto --target 127.0.0.1:12346  # 压测（random/proto/reconnect/mixed）
 cargo test --workspace             # 全量测试（含契约测试）
 cargo clippy --workspace --all-targets -- -D warnings   # lint（CI 第 2 闸门）
 python3 tools/check-deps.py        # 依赖方向（CI 第 3 闸门；Windows 本地需 python）

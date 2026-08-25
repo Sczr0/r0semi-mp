@@ -52,10 +52,11 @@ fn invalid_port_env_errors() {
 }
 
 #[test]
-fn listen_addr_is_unspecified_ipv6() {
+fn listen_addr_is_unspecified() {
     let cfg = Config::load_from(fake_env(&[])).unwrap();
-    // 原版 main.rs：Ipv6Addr::UNSPECIFIED（双栈）
+    // ISSUE-0008 修复：默认 0.0.0.0（IPv4）——Windows [::] 是 V6ONLY 玩家连不上
     assert!(cfg.listen.ip().is_unspecified());
+    assert_eq!(cfg.listen.port(), 12346);
 }
 
 #[test]
