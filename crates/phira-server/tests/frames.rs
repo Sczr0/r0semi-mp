@@ -369,6 +369,7 @@ async fn shutdown_signal_grace_zero_exits() {
         (*test_ctx()).clone(),
         "test maintenance notice".to_owned(),
         Duration::ZERO,
+        None, // http_port：测试不开管理端口
     )
     .await
     .unwrap();

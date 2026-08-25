@@ -101,7 +101,8 @@ async fn main() -> Result<()> {
     // systemd 就绪通知（§部署）：bind 成功即"准备好接受连接"（配合 Type=notify）
     #[cfg(target_os = "linux")]
     {
-        if let Err(e) = sd_notify::notify(true) {
+        // sd-notify 0.4.5 API：notify(unset_env, &[NotifyState])
+        if let Err(e) = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]) {
             tracing::warn!("sd_notify failed: {e}");
         }
     }
