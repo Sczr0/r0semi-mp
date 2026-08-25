@@ -3,6 +3,26 @@
 //! 阶段 2 接线完成：`handle_connection` 驱动协议全流程（§6.6 表 1/表 2 + §4.9-3 生命周期）。
 //!
 //! 优雅停机（§11）：SIGTERM/SIGINT → 广播"服务器维护中" → 宽限窗口 → 强制退出。
+//!
+//! # 前置层（Front Gate）——连接建立瞬间的"第一线"
+//!
+//! 借鉴 Blade 网关思想（Solar Network）：把连接建立时的横切职责集中成一条链，
+//! 未来新增准入规则/分流时改动集中在此，不散落进会话逻辑：
+//!
+//! ```text
+//! accept → [PROXY protocol（反代真实 IP，config 开关）] → 连接准入（未鉴权上限 + 每 IP）
+//!        → 握手/鉴权前帧上限（4KiB）→ 心跳监控（10s 无包判死）
+//!        → 发送积压踢出（乌龟客户端）→ 命令限速（ADR-0008）→ 内存守卫（ADR-0010）
+//! ```
+//!
+//! 各环节职责与代码位置：
+//! - PROXY 解析：`crate::proxy`（本文件 `handle_connection` 开头，准入前——按真实 IP 计数）
+//! - 连接准入：`ConnectionAdmission`（`try_acquire`/`release`，§10.4）
+//! - 握手/帧分级：`Stream::new` + `PRE_AUTH_MAX_PACKET`（§10.4 鉴权前 4KiB）
+//! - 心跳：本文件 monitor 任务（§6.1 10s）
+//! - 积压踢出：本文件 kicker 任务（ISSUE-0004）
+//! - 命令限速：`CommandLimiter`（ADR-0008）
+//! - 内存守卫：`IN_FLIGHT_BYTES`/`queue_bytes`（ADR-0010）
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -25,6 +45,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn};
 
+use crate::proxy;
 use crate::stream::{MAX_PACKET_SIZE, Outbound, PRE_AUTH_MAX_PACKET, Stream};
 
 /// 服务器：持有监听器 + 柜台（组合根唯一接线点之外，本结构不认识具体货物）。
@@ -324,6 +345,8 @@ pub struct ConnContext {
     pub welcome_message: Option<String>,
     /// 房间列表快照（§运营 `/rooms`；HTTP 分流端点读取）。
     pub room_list: Arc<RoomListSink>,
+    /// PROXY protocol 开关（§前置层：反代后真实 IP；yml `proxy_protocol`）。
+    pub proxy_protocol: bool,
 }
 
 /// 事件投递：`user_id → 会话发送通道`映射 + 转换层目标过滤。
@@ -827,21 +850,42 @@ impl ConnState {
     }
 }
 
+/// PROXY 头读取超时（§前置层：半开连接防护，与握手超时同级）。
+const PROXY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 单连接处理（§4.5）：握手 → 心跳 → 鉴权 → 命令派发 → 事件投递 → 断开收尾。
+///
+/// 前置层顺序（§前置层）：PROXY protocol（反代真实 IP）→ 连接准入 → 版本握手 → …。
+/// PROXY 头在准入**之前**解析——准入按真实 IP 计数（反代后每 IP 限额才有效）。
 ///
 /// # Errors
 ///
-/// 握手失败（版本读取失败）时返回；业务错误走 `warn` 日志（不中断 accept）。
+/// 握手失败（版本读取失败）/ PROXY 头非法时返回；业务错误走 `warn` 日志（不中断 accept）。
 #[allow(clippy::too_many_lines)] // 连接全生命周期（准入/握手/监控/收尾）单一函数完整呈现
 pub async fn handle_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     addr: SocketAddr,
     ctx: Arc<ConnContext>,
 ) -> Result<()> {
+    // 前置层 1：PROXY protocol（§前置层，config 开关）——反代后透传真实 IP。
+    // 解析失败（直连客户端/头非法/超时）→ 断开（协议错乱比误放行安全）。
+    let mut peer_ip = addr.ip();
+    if ctx.proxy_protocol {
+        let read = proxy::read_proxy_header(&mut stream);
+        match tokio::time::timeout(PROXY_HEADER_TIMEOUT, read).await {
+            Ok(Ok(Some(hdr))) => peer_ip = hdr.src_ip,
+            Ok(Ok(None)) => {} // v2 LOCAL / v1 UNKNOWN：用 socket 地址
+            Ok(Err(e)) => {
+                warn!("proxy header rejected from {addr}: {e}");
+                return Err(e.into());
+            }
+            Err(_) => return Err(anyhow::anyhow!("proxy header timeout from {addr}")),
+        }
+    }
+
     // 连接准入（§10.4）：未鉴权连接上限 + 每 IP 限额——超限直接断开
     // 注：HTTP 管理端点走独立端口（`http_port`），不混入 MP 入口（peek 分流在
     // Windows/current_thread 下不稳定，2026-08 实测 5s 延迟 + 后续卡死）
-    let peer_ip = addr.ip();
     if !ctx.admission.try_acquire(peer_ip) {
         return Ok(());
     }
@@ -1131,6 +1175,15 @@ async fn handle_frame(
 
     // —— 已鉴权命令 ——
     let user_id = state.user_id.load(Ordering::SeqCst);
+    // ISSUE-0009 修复（§4.9-3 旧连接失效）：替换后旧 TCP 到达的命令以 epoch 校验拒绝——
+    // 重连/顶替后旧连接仍活着，其命令以同一 user_id 混进房间 channel 会破坏顺序语义
+    // （同 id 双活 + AlreadyInRoom check-then-act 竞态）。epoch 不匹配 → 拒绝该命令并
+    // force_close：借 kicker（1s 轮询）拆掉旧连接、释放其已鉴权名额（与内存守卫踢出同机制）。
+    if ctx.registry.current_epoch(user_id) != Some(state.epoch.load(Ordering::SeqCst)) {
+        warn!("stale connection rejected, user={user_id} (epoch mismatch)");
+        state.backpressure.force_close();
+        return;
+    }
     // 滥用控制"快端"（ISSUE-0006 修复）：每连接限速只限"贵"命令（资源成本驱动）；
     // 超限回 TooManyRequests Business 错误（客户端可见），不触发队列 Reject 断连
     if let Some((key, interval)) = rate_limit(&cmd)

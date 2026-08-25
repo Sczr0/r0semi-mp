@@ -33,6 +33,11 @@ pub struct Config {
     pub hidden_room_prefixes: Vec<String>,
     /// 管理 HTTP 端口（§运营：`/rooms` 房间列表；None = 不开启）。
     pub http_port: Option<u16>,
+    /// PROXY protocol（§前置层：反代后真实 IP，每 IP 限额才有效）。
+    ///
+    /// true = 所有连接必须先发 PROXY 头（HAProxy `send-proxy` / nginx `proxy_protocol on`），
+    /// 头缺失/非法 → 断开；false = 直连（默认）。
+    pub proxy_protocol: bool,
 }
 
 impl Default for Config {
@@ -52,6 +57,7 @@ impl Default for Config {
             welcome_message: None,
             hidden_room_prefixes: Vec::new(),
             http_port: None,
+            proxy_protocol: false,
         }
     }
 }
@@ -199,6 +205,9 @@ impl Config {
         if let Some(port) = yaml.http_port {
             self.http_port = Some(port);
         }
+        if let Some(proxy) = yaml.proxy_protocol {
+            self.proxy_protocol = proxy;
+        }
         Ok(())
     }
 }
@@ -233,4 +242,6 @@ struct YamlConfig {
     hidden_room_prefixes: Option<Vec<String>>,
     /// 管理 HTTP 端口（None = 不开启）。
     http_port: Option<u16>,
+    /// PROXY protocol（反代真实 IP）。
+    proxy_protocol: Option<bool>,
 }

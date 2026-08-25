@@ -124,6 +124,7 @@ fn setup_ctx_custom(
         admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
         welcome_message: welcome.map(str::to_owned),
         room_list,
+        proxy_protocol: false,
     })
 }
 

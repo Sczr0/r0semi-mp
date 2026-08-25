@@ -101,6 +101,7 @@ fn test_ctx() -> Arc<ConnContext> {
         admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
         welcome_message: None,
         room_list: Arc::new(phira_server::server::RoomListSink::new(Vec::new())),
+        proxy_protocol: false,
     })
 }
 
@@ -199,15 +200,16 @@ async fn per_conn_memory_over_limit_kicks_client() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // 投递 ~11MiB（> PER_CONN_MEM_LIMIT=8MiB）——客户端只写不读，队列积压
-    for i in 0..11 {
+    // 投递 ~20MiB（> PER_CONN_MEM_LIMIT=8MiB）——客户端只写不读，队列积压。
+    // 20 帧留消费余量：即使写任务消费一半仍超 8MiB 阈值（防并行负载下 flaky）。
+    for i in 0..20 {
         client
             .write_all(&client_frame(&ClientCommand::Chat {
                 message: Varchar::new(format!("flood-{i}")).unwrap(),
             }))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let charged = in_flight_bytes();
     assert!(

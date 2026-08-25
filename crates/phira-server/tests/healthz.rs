@@ -69,6 +69,7 @@ fn test_ctx() -> Arc<ConnContext> {
         admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
         welcome_message: None,
         room_list: Arc::new(phira_server::server::RoomListSink::new(Vec::new())),
+        proxy_protocol: false,
     })
 }
 

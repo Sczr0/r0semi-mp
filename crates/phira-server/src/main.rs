@@ -83,6 +83,8 @@ async fn main() -> Result<()> {
         sink,
         // 连接准入（§10.4）：未鉴权连接上限 + 每 IP 限额
         admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
+        // PROXY protocol（§前置层：反代后真实 IP；yml `proxy_protocol`，默认关）
+        proxy_protocol: config.proxy_protocol,
         // 进服欢迎语（yml welcome_message，None = 不发）
         welcome_message: config.welcome_message.clone(),
         room_list,

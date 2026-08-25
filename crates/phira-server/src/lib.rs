@@ -6,6 +6,7 @@
 //! `http`（生产 HTTP/鉴权实现）也在此——唯一认识所有内部 crate 的地方。
 
 pub mod http;
+pub mod proxy;
 
 // 测试专用入口（http.rs 内 doc(hidden)，此处仅 re-export 供集成测试）
 pub use http::http_get_with_tls;

@@ -207,4 +207,16 @@ fn yaml_welcome_absent_means_none() {
     assert_eq!(cfg.welcome_message, None);
     assert!(cfg.hidden_room_prefixes.is_empty());
     assert_eq!(cfg.http_port, None);
+    // proxy_protocol 缺省 → false（直连）
+    assert!(!cfg.proxy_protocol);
+}
+
+#[test]
+fn yaml_proxy_protocol_parsed() {
+    // proxy_protocol: true → 反代部署开关生效
+    let cfg = Config::load_from_yaml(fake_env(&[]), Some("proxy_protocol: true\n"), None).unwrap();
+    assert!(cfg.proxy_protocol);
+    // 显式 false
+    let cfg = Config::load_from_yaml(fake_env(&[]), Some("proxy_protocol: false\n"), None).unwrap();
+    assert!(!cfg.proxy_protocol);
 }
