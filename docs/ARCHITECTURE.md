@@ -484,7 +484,7 @@ pub trait RoomActor: Send {
 
 1. **f16 用 `half` crate**：`phira-api` 依赖 `half`（纯数学转换、no_std、零运行时依赖），处理协议要求的半精度坐标 `CompactPos`（§6.2）。符合 api 的"零 tokio、轻依赖"红线。
 2. **共享广播缓冲用 `bytes::Bytes`**：观战转播的零拷贝广播（§6.5-17）统一用 `bytes::Bytes`——O(1) 切片 + 引用计数克隆，与 tokio 写路径天然契合。比 `Arc<[u8]>` 更优（后者切片无法零拷贝）。**core 的传输层（session 写路径）签名用 `Bytes`** 而不是裸 `Vec<u8>`（Bytes 属 core 依赖，不进 api——评审 §8 六：ForwardRaw 删除后 api 无 Bytes 消费点）
-3. **HTTP 嗅探用 `socket.peek`**：测活（§11.1 方案 B）在 accept 后 peek 前几字节分流——`0x01` 走 MP 协议，`b"GET "`/`b"HEAD"` 走 HTTP 分支；peek 不消费数据、不污染 MP 状态机；循环等到 ≥1 字节再判（首字节即可区分协议）。
+3. **HTTP 嗅探（已放弃 peek，改独立端口 `http_port`）**：原设计在 accept 后 peek 前几字节分流（`0x01` 走 MP 协议，`b"GET "`/`b"HEAD"` 走 HTTP 分支，peek 不消费数据）——**2026-08 实测放弃**：peek 在 Windows/current_thread 下不稳定（5s 延迟 + 后续卡死，ISSUE-0005）。实际实现 = 独立监听端口 `http_port`（§运营：`/rooms` 房间列表 + `/healthz` 健康检查）——MP 入口与 HTTP 管理端点端口隔离，状态机零污染由端口隔离保证。
 
 ### 4.9 并发模型与外部依赖注入（编码前必须定死，评审 §1/§5）
 
@@ -718,7 +718,7 @@ Playing ──全员 Played/Abort──► SelectChart（cycle 则顺延换房�
 
 **观战转播（性能热点）**
 16. live 模式下收到 `Touches`/`Judges` → **只转发给 monitor**（不广播给玩家）
-17. 转发实现必须是"序列化一次 + 共享缓冲"（零拷贝），禁止逐接收者克隆；共享缓冲用 `bytes::Bytes`（O(1) 切片，见 §4.8）；**慢消费策略：monitor 队列满则丢最旧帧（丢旧保新），绝不阻塞房间、绝不无限积压**（§10.4，评审 §7）；**热路径机制（方案 A：结构化转发，编解码归 core）**：core 解码一次（校验）→ 命令侧 `Touches{frames}`/`Judges{judges}`（§4.4）→ actor 查 live、计算 `targets = Specific(monitor_ids)` → 返回结构化事件 `RelayTouches`/`RelayJudges`（§4.4）→ **core 用它的编码器把 ServerCommand 编码一次**为 `Bytes` → 共享给所有 monitor。总编解码：**每命令 1 解 + 1 编，每接收者 0 次**；impl 永不碰协议编码（§4.3-3 成立，评审 §8 一-1）
+17. 转发实现必须是"序列化一次 + 共享缓冲"（零拷贝），禁止逐接收者克隆；共享缓冲用 `bytes::Bytes`（O(1) 切片，见 §4.8）；**慢消费策略：monitor 队列满则丢最旧帧（丢旧保新），绝不阻塞房间、绝不无限积压**（§10.4，评审 §7）；**热路径机制（方案 A：结构化转发，编解码归 core）**：core 解码一次（校验）→ 命令侧 `Touches{frames}`/`Judges{judges}`（§4.4）→ actor 查 live、计算 `targets = Specific(monitor_ids)` → 返回结构化事件 `RelayTouches`/`RelayJudges`（§4.4）→ **core 用它的编码器把 ServerCommand 编码一次**为 `Bytes` → 共享给所有 monitor。总编解码：**每命令 1 解 + 1 编，每接收者 0 次**；impl 永不碰协议编码（§4.3-3 成立，评审 §8 一-1）。**兑现注记（2026-08，ADR-0009）**：热路径编码一次已兑现（方案 2）——`EncodeCache` 按帧 Arc 指针缓存编码载荷（`Outbound::Encoded` 直写共享），同一帧 N 个 monitor 只编码一次；非热路径仍每接收者编码（低频可接受）；泛化触发条件 = 第二个大扇出广播场景（原则 5）
 
 **时间驱动逻辑（§4.6）**
 18. 掉线超时/倒计时等时间逻辑由柜台 `Tick`/`UserDisconnected` 驱动；**impl 内禁止后台任务直接广播**
@@ -849,7 +849,7 @@ pub trait Moderator: Send + Sync {
 | 层 | 测什么 | 手段 |
 |---|---|---|
 | **单元** | 编解码 roundtrip、RoomId 校验、状态机纯函数 | 普通 `#[test]` |
-| **模糊** | 解码器吃随机/畸形字节不 panic、不超限 | `proptest` / `arbitrary`（CI 固定种子跑） |
+| **模糊** | 解码器吃随机/畸形字节不 panic、不超限 | **已实现（2026-08）**：`proptest`（固定种子可复现）+ 截断穷举 + 结构感知变异 + 真实 TCP 垃圾流（`fuzz.rs`/`fuzz_frames.rs`）+ **高压灌流压力测试**（`pressure.rs`，`#[ignore]` 手动：本地回环 ~1.5-2.3Gbps、数千连接风暴、0 panic、0 内存膨胀） |
 | **契约** | 任何 impl 的完整行为（见 §5.3、§6.5 清单） | 泛型契约套件，每个 impl 复用 |
 | **Oracle** | 与原版 phira-mp 的**字节级一致性** | golden files：抓原版字节流，断言本实现解码/编码逐字节一致；或双实现互连互通测试。**录制方法学（评审 §8）**：原版回源是外部单点——录制时把原版连到**本地 mock API**（/me、/chart、/record 响应预先录好回放），或直接抓"真客户端 ↔ 原版服务器"字节流存 golden files；录制环境必须可控，禁止录制中途依赖线上官方 API |
 
@@ -889,10 +889,10 @@ pub trait Moderator: Send + Sync {
 
 | 攻击面 | 对策 |
 |---|---|
-| **大帧并发** | 协议 2MiB 是上限不是常态：服务端配置更紧帧上限（默认 ~1MiB）；**每连接解码缓冲记账** + 全局在途字节上限（如 64MiB），超限即断连 |
+| **大帧并发** | 协议 2MiB 是上限不是常态：服务端配置更紧帧上限（默认 ~1MiB）；**每连接解码缓冲记账** + 全局在途字节上限（如 64MiB），超限即断连——**已兑现（2026-08，ADR-0010 安全锁 A）**：`IN_FLIGHT_BYTES` 全局 64MiB + 每连接 8MiB，超限丢新 + 断最重连接，`MemoryReleaser` 保证账目平衡无泄漏 |
 | **鉴权前大帧** | **鉴权前帧上限收紧到 ~4KiB**（握手 + token ≤32B 之外无合法大帧）——直接堵死"未鉴权 2MiB 帧"攻击 |
 | **慢消费者（观战）** | live 路径（Touches/Judges→monitor）用**丢旧保新**策略：每 monitor 有界环形缓冲，满则丢最旧帧，**绝不阻塞房间 actor、绝不无限积压**（评审 §7）；房间命令队列：有界（1024），满时按消息类处理——**热路径满则丢新、Tick 可丢、生命周期事实等待、其它客户端命令丢弃断连**（§4.9-9，评审 §8 五-2） |
-| **半开连接** | 握手超时（peek 等首字节 ≤5s）+ 鉴权超时（≤10s）+ 未鉴权连接数上限 + 每 IP 限额（§11） |
+| **半开连接** | 握手超时（读首字节 ≤5s）+ 鉴权超时（≤10s）+ 未鉴权连接数上限 + 每 IP 限额（§11） |
 
 ---
 
@@ -906,7 +906,7 @@ pub trait Moderator: Send + Sync {
 | 传输安全 | 明文 TCP 是协议特性；TLS 前置仅适用于自建端/受信网络——**落地前需验证 Phira 客户端是否支持 TLS（大概率不支持，与 P1 真客户端直连目标冲突，评审 §8）** |
 | 鉴权前包 | 未鉴权时忽略非 Ping/Auth 包（§6.5-13） |
 | 滥用防护（可选观察者） | 登录失败限速、聊天频率限制——做成 Observer，不塞进核心 |
-| 连接准入 | 总连接数上限、**未鉴权连接数上限**（全局小额度）、每 IP 限额、握手/鉴权超时（评审 §7） |
+| 连接准入 | 总连接数上限、**未鉴权连接数上限**（全局小额度）、每 IP 限额、握手/鉴权超时（评审 §7）——**已鉴权连接上限已兑现（2026-08，ADR-0010 安全锁 B）**：全局 1000，超限拒绝鉴权 |
 | 内存 DoS | 帧大小分级上限（鉴权前 ~4KiB）+ 每连接记账 + 全局在途字节上限（§10.4） |
 | 供应链 | `cargo deny` 许可审查 + 依赖白名单；impl 是编译进二进制的**受信代码**（无沙箱需求，信任模型简单） |
 | 优雅停机 | SIGTERM → 停止接受新连接 → **向所有房间广播"服务器维护中"** → 宽限窗口（如 10s，供玩家看到消息）→ 强制退出。**无持久化下不存在"排空"语义**——停机即丢房，降低损失靠广播消息 + 快速重启（评审 §8） |
@@ -929,12 +929,11 @@ pub trait Moderator: Send + Sync {
 | B. 同端口 HTTP 嗅探 `/healthz` | ~50-100 行（config 开关） | K8s probe / 监控大盘 |
 | C. 独立健康端口 | ~20 行 | 最简外部监控 |
 
-**方案 B 设计（推荐实现）**：
+**方案 B（已实现为独立端口，peek 实测放弃）**：
 
-- 端口复用：accept 后 `socket.peek(&mut buf).await` 窥探前几个字节（peek 不消费数据）——首字节 `0x01` 走 MP 协议；`b"GET "` / `b"HEAD"` 走 HTTP 分支，**完全不污染核心 MP 状态机**
-- 健壮性：peek 可能一次读不满 4 字节，循环等到 ≥1 字节再判断（MP 首字节 `0x01` vs HTTP 首字节是 ASCII 字母，实际只需 1 字节即可区分）；**peek 等待带超时（≤5s）**，防半开连接无限挂起（评审 §7）
-- 返回 JSON：`{"status":"ok","version":"0.1.0","uptime_s":1234,"connections":57,"rooms":12}`
-- 数据源来自 Metrics（§3.2），深度健康信息白送：**测活（liveness）+ 测健康（readiness）一步到位**
+- 端口复用（accept 后 peek 分流）——**2026-08 实测放弃**：peek 在 Windows/current_thread 下不稳定（5s 延迟 + 后续卡死，ISSUE-0005）。实际实现 = **独立监听端口 `http_port`**（`Server::new` 的 `http_port` 参数），MP 入口与 HTTP 管理端点端口隔离，状态机零污染由端口隔离保证（不依赖 Metrics 或 impl）
+- 端点：`GET /rooms`（房间列表，§运营）+ `GET /healthz`（健康检查）
+- `/healthz` 返回 JSON：`{"status":"ok","version":...,"uptime_s":...,"connections":...,"rooms":...}`——数据源 = 柜台（SessionSink 连接数 / 房间列表），**不依赖官方 API**（官方 API 挂掉不影响测活，验收标准成立）
 - 安全：不返回用户名/房间内容等敏感信息；公开部署建议限速或仅内网可访问
 
 **验收标准**：无 token、无官方 API 依赖，3s 内判定存活；官方 API 挂掉不影响测活结果。
