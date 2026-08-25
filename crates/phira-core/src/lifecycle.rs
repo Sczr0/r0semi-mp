@@ -78,6 +78,18 @@ impl SessionRegistry {
         epoch
     }
 
+    /// 用户当前纪元（客户端命令 epoch 校验读入口，ISSUE-0009：旧连接命令拒绝）。
+    ///
+    /// `None` = 从未注册（理论不可达——活着且已鉴权的连接必然已 `register`）。
+    #[must_use]
+    pub fn current_epoch(&self, user_id: i32) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&user_id)
+            .map(|(e, _)| *e)
+    }
+
     /// 用户当前昵称（CreateRoom/JoinRoom 派发填充，§6.6 表 2）。
     pub fn name_of(&self, user_id: i32) -> Option<String> {
         self.inner
