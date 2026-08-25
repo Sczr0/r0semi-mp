@@ -309,6 +309,8 @@ pub enum RoomErrorCode {
     AlreadyUploaded,
     /// 已 abort 重复上报（§6.5）。
     AlreadyAborted,
+    /// 命令频率超限（每连接限速，ISSUE-0006：滥用控制"快端"防线）。
+    TooManyRequests,
 }
 
 /// 内部错误：Business（业务拒绝）与 Internal（内部故障）分开（§4.4）。

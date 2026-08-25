@@ -22,11 +22,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use phira_api::{CmdCtx, Origin, RoomCommand};
+use phira_api::{CmdCtx, Origin, RoomCommand, RoomId};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::bus::Bus;
+
+/// 路由表 miss 重放参数（ISSUE-0001 修复，§4.9-3 第四竞态·幽灵座位）。
+///
+/// 入房时序：actor 返回 UserJoined → bus 应用路由增量 → 发响应；客户端入房后立即断线
+/// （RST 即时可见）时，生命周期任务查表可能撞上"增量未应用"窗口（bus 忙时拉大）——
+/// 立即丢事实会留下幽灵座位（无 dangle 窗口、无人驱逐、占坑）。
+/// 挂起重放：短暂延迟后重查（process_events 的 await 点远小于 20ms），仍 miss 才放弃。
+/// 正常路径（用户确实不在房间）代价 = 最多 2×20ms 一次性延迟（后台任务，可接受）。
+const ROUTE_REPLAY_ATTEMPTS: usize = 3;
+const ROUTE_REPLAY_DELAY: Duration = Duration::from_millis(20);
 
 /// 会话注册表：`user_id → (当前会话纪元, 昵称)`（§4.9-3）。
 ///
@@ -190,10 +200,10 @@ impl LifecycleTask {
         }
     }
 
-    /// 向用户所在房间派发系统命令；房间不存在（不在房/已关）→ 忽略。
+    /// 向用户所在房间派发系统命令；重放后仍 miss（不在房/已关）→ 忽略。
     async fn dispatch(&self, user_id: i32, cmd: RoomCommand) {
-        let Some(room_id) = self.bus.room_of(user_id).await else {
-            debug!("user={user_id} not in any room, skipping lifecycle dispatch");
+        let Some(room_id) = self.lookup_room_with_replay(user_id).await else {
+            debug!("user={user_id} not in any room after replay, dropping lifecycle fact");
             return;
         };
         let ctx = CmdCtx {
@@ -203,5 +213,20 @@ impl LifecycleTask {
         if let Err(err) = self.bus.dispatch_system(ctx.room_id, cmd).await {
             warn!("lifecycle dispatch failed for user={user_id}: {err:?}");
         }
+    }
+
+    /// 路由表查询 + 幽灵座位重放（ISSUE-0001 修复，§4.9-3 第四竞态）：
+    /// 表 miss 时挂起重放（短暂延迟重查），覆盖"join 增量未应用"窗口；
+    /// 仍 miss 才放弃（用户确实不在房间）。
+    async fn lookup_room_with_replay(&self, user_id: i32) -> Option<RoomId> {
+        for attempt in 0..ROUTE_REPLAY_ATTEMPTS {
+            if let Some(rid) = self.bus.room_of(user_id).await {
+                return Some(rid);
+            }
+            if attempt + 1 < ROUTE_REPLAY_ATTEMPTS {
+                tokio::time::sleep(ROUTE_REPLAY_DELAY).await;
+            }
+        }
+        None
     }
 }

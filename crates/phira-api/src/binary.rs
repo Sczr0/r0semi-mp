@@ -187,6 +187,17 @@ impl<'a> BinaryWriter<'a> {
         v.write_binary(self)
     }
 
+    /// 写入原始字节（不经 BinaryData 编码；ISSUE-0003 方案 2：`Outbound::Encoded`
+    /// 共享编码载荷直写——一次编码、多接收者复用）。
+    ///
+    /// # Errors
+    ///
+    /// 内存写入失败（理论上不发生）。
+    pub fn write_raw(&mut self, bytes: &[u8]) -> ProtoResult<()> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
     /// 写入 ULEB128 变长整数（§6.2）。
     ///
     /// # Errors

@@ -7,12 +7,14 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::time::Instant;
 
 use anyhow::Result;
 use phira_api::{
     AuthError, AuthHandler, ClientCommand, CmdCtx, HEARTBEAT_DISCONNECT_TIMEOUT, Origin,
-    RoomCommand, RoomEvent, RoomId, RoomResponse, ServerCommand, UserInfo,
+    RoomCommand, RoomError, RoomErrorCode, RoomEvent, RoomId, RoomResponse, ServerCommand,
+    UserInfo, encode_packet,
 };
 use phira_core::{
     Bus, EventSink,
@@ -23,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn};
 
-use crate::stream::{MAX_PACKET_SIZE, PRE_AUTH_MAX_PACKET, Stream};
+use crate::stream::{MAX_PACKET_SIZE, Outbound, PRE_AUTH_MAX_PACKET, Stream};
 
 /// 服务器：持有监听器 + 柜台（组合根唯一接线点之外，本结构不认识具体货物）。
 pub struct Server {
@@ -320,14 +322,244 @@ pub struct ConnContext {
 ///
 /// bus 按事件 targets 投递 `deliver(user_id, event)`（领域=All/Relay=Specific）；
 /// 本实现再按转换层产出的**命令级 targets** 过滤（如 NewHost 的 ChangeHost 只给新旧房主）。
+/// 发送积压标记（ISSUE-0004 修复：踢"乌龟"客户端）。
+///
+/// 每连接发送队列（1024 帧）持续满超过 [`SLOW_CONSUMER_KICK_AFTER`] → 判定慢消费者 → 断连。
+/// 正常波动自愈：下一次 `try_send` 成功即清除标记（§10.4 哲学：绝不阻塞房间 actor）。
+pub struct Backpressure {
+    since: Mutex<Option<Instant>>,
+    /// 内存守卫强制踢出（安全锁 A：每连接/全局超限——不等积压超时，立即踢）。
+    force_close: AtomicBool,
+}
+
+impl Backpressure {
+    /// 新标记（未积压）。
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            since: Mutex::new(None),
+            force_close: AtomicBool::new(false),
+        }
+    }
+
+    /// 内存守卫强制踢出（安全锁 A）。
+    pub fn force_close(&self) {
+        self.force_close.store(true, Ordering::SeqCst);
+    }
+
+    /// 是否被强制踢出。
+    #[must_use]
+    pub fn is_forced(&self) -> bool {
+        self.force_close.load(Ordering::SeqCst)
+    }
+
+    /// 标记积压开始（仅首次失败时设置，幂等）。
+    pub fn mark(&self) {
+        let mut s = self
+            .since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.is_none() {
+            *s = Some(Instant::now());
+        }
+    }
+
+    /// 队列恢复有空间：清除积压标记。
+    pub fn clear(&self) {
+        let mut s = self
+            .since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *s = None;
+    }
+
+    /// 积压持续时长（未积压 = None）。
+    #[must_use]
+    pub fn elapsed(&self) -> Option<Duration> {
+        let s = self
+            .since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.map(|t| t.elapsed())
+    }
+}
+
+impl Default for Backpressure {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 慢消费者判定阈值：发送队列持续满的时长（ISSUE-0004 验收）。
+///
+/// 60Hz 触摸流下 5s ≈ 300 帧——队列持续满 5s 即确认写任务被 socket 阻塞（客户端不收包）。
+/// 可参数化（后续进 config；当前常量满足 v1）。
+const SLOW_CONSUMER_KICK_AFTER: Duration = Duration::from_secs(5);
+/// 安全锁 A：全局在途字节上限（§10.4 承诺兑现）。
+///
+/// 威胁模型：海量已鉴权连接 × 大帧（Touches/Judges 热路径，帧上限 2MiB）——
+/// 每连接 send 队列 1024 × 2MiB = 2GB。全局记账 + 超限丢新 + 断最重连接，
+/// 内存**硬上限**（攻击下绝不膨胀）。
+const MEMORY_GUARD_LIMIT: usize = 64 * 1024 * 1024;
+
+/// 每连接 send 队列字节上限（超限 → 该连接被踢）。
+const PER_CONN_MEM_LIMIT: usize = 8 * 1024 * 1024;
+
+/// 安全锁 B：已鉴权连接总数上限（§11"总连接数上限"兑现）。
+///
+/// 未鉴权上限（100）已存在；鉴权后无上限 = 攻击者用真实 token 建海量连接的内存/CPU 向量。
+const MAX_AUTHED_CONNECTIONS: usize = 1000;
+
+/// 全局在途字节（安全锁 A；进程单例——一个进程一个内存守卫）。
+static IN_FLIGHT_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// 已鉴权连接数（安全锁 B；进程单例）。
+static AUTHED_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// 全局记账：返回 false = 超限（调用方丢新）。
+pub(crate) fn charge_memory(bytes: usize) -> bool {
+    IN_FLIGHT_BYTES.fetch_add(bytes, Ordering::SeqCst) + bytes <= MEMORY_GUARD_LIMIT
+}
+
+/// 全局记账：写任务消费后释放。
+pub(crate) fn release_memory(bytes: usize) {
+    IN_FLIGHT_BYTES.fetch_sub(bytes, Ordering::SeqCst);
+}
+
+/// 当前在途字节（安全锁 A 观测：测试断言记账平衡；/healthz 可显示）。
+#[must_use]
+pub fn in_flight_bytes() -> usize {
+    IN_FLIGHT_BYTES.load(Ordering::SeqCst)
+}
+/// 每连接命令限速器（ISSUE-0006 修复：滥用控制"快端"防线）。
+///
+/// 令牌桶简化版：每个受限命令类别记录"上次允许时刻"，距上次 ≥ interval 才放行。
+/// 超限 → 回 `TooManyRequests` Business 错误（客户端可见），不触发队列 Reject 断连
+/// （§4.9-9："滥用控制优先用每连接限速，不让队列压力触发断连"）。
+pub struct CommandLimiter {
+    last: Mutex<std::collections::HashMap<&'static str, Instant>>,
+}
+
+impl CommandLimiter {
+    /// 新限速器（空表）。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            last: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 尝试放行：距上次允许 ≥ `interval` 才允许并更新时间戳；否则拒绝。
+    pub fn allow(&self, cmd: &'static str, interval: Duration) -> bool {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        if last
+            .get(cmd)
+            .is_some_and(|t| now.duration_since(*t) < interval)
+        {
+            return false;
+        }
+        last.insert(cmd, now);
+        true
+    }
+}
+
+impl Default for CommandLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 热路径编码缓存（ISSUE-0003 方案 2：编码一次共享）。
+///
+/// 独立组件（非 SessionSink 内嵌逻辑）——未来需要泛化（所有事件共享编码）时
+/// 可整体提升到 bus 层（ADR-0009：泛化触发条件 = 第二个大扇出广播场景）。
+/// 缓存键 = 帧 `Arc` 指针地址（同一帧的多个 monitor 投递命中同一缓存），
+/// 值 = 编码后的载荷（不含 ULEB128 长度前缀，写任务统一加）。
+pub struct EncodeCache {
+    inner: Mutex<std::collections::HashMap<usize, Arc<Vec<u8>>>>,
+    capacity: usize,
+}
+
+impl EncodeCache {
+    /// 新缓存（`capacity` = 最大缓存条目；满则整体清空——每帧最多命中一次，
+    /// 清空后下一帧重新编码一次，可接受）。
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(std::collections::HashMap::new()),
+            capacity,
+        }
+    }
+
+    /// 取或编码：命中返回共享 `Arc<Vec<u8>>`；miss 则调用 `encode` 一次并缓存。
+    pub fn get_or_encode(&self, key: usize, encode: impl FnOnce() -> Vec<u8>) -> Arc<Vec<u8>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(v) = inner.get(&key) {
+            return Arc::clone(v);
+        }
+        let v = Arc::new(encode());
+        if inner.len() >= self.capacity {
+            inner.clear(); // 满则清（简单淘汰：旧帧指针不复用，留着只会是死条目）
+        }
+        inner.insert(key, Arc::clone(&v));
+        v
+    }
+}
+
+impl Default for EncodeCache {
+    fn default() -> Self {
+        Self::new(64)
+    }
+}
+
+/// 受限命令的限速键 + 最小间隔（ISSUE-0006：只限"贵"命令，资源成本驱动）。
+///
+/// - `CreateRoom`：spawn actor + channel（最贵）→ 1/s
+/// - `JoinRoom`：入房流程 + 广播 → 5/s
+/// - `SelectChart`/`Played`：回源官方 API（配额宝贵）→ 5/s
+/// - 热路径（Touches/Judges）不限（靠 DropIfFull + 帧上限）；低频命令（Chat/Ready/...）不限
+///
+/// 注：间隔/白名单是 v1 常量（可参数化进 config）；热路径滥用靠队列 DropIfFull + 帧上限兜底。
+const fn rate_limit(cmd: &ClientCommand) -> Option<(&'static str, Duration)> {
+    match cmd {
+        ClientCommand::CreateRoom { .. } => Some(("create_room", Duration::from_millis(1000))),
+        ClientCommand::JoinRoom { .. } => Some(("join_room", Duration::from_millis(200))),
+        ClientCommand::SelectChart { .. } => Some(("select_chart", Duration::from_millis(200))),
+        ClientCommand::Played { .. } => Some(("played", Duration::from_millis(200))),
+        _ => None,
+    }
+}
+
+/// 积压检查间隔（kicker 轮询粒度）：远小于阈值，保证踢出延迟 ≈ 阈值 + 1 拍（≤6s），
+/// 而不是阈值 + 整拍（最坏 2× 阈值）——"绝不无限积压"的判定也应快速。
+const BACKPRESSURE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 发送槽位（SessionSink 投递表）：发送通道 + 积压标记 + send 队列字节记账。
+struct SendSlot {
+    tx: Arc<mpsc::Sender<Outbound>>,
+    backpressure: Arc<Backpressure>,
+    /// 本连接 send 队列在途字节（安全锁 A：写任务消费时经同一 Arc 递减）。
+    queue_bytes: Arc<AtomicUsize>,
+}
+
 pub struct SessionSink {
-    sessions: RwLock<std::collections::HashMap<i32, Arc<mpsc::Sender<ServerCommand>>>>,
+    sessions: RwLock<std::collections::HashMap<i32, Arc<SendSlot>>>,
+    /// 热路径编码缓存（ISSUE-0003 方案 2）：同一帧的多 monitor 共享编码结果。
+    encode_cache: EncodeCache,
 }
 
 impl Default for SessionSink {
     fn default() -> Self {
         Self {
             sessions: RwLock::new(std::collections::HashMap::new()),
+            encode_cache: EncodeCache::default(),
         }
     }
 }
@@ -340,27 +572,55 @@ impl SessionSink {
     }
 
     /// 注册会话（鉴权成功）：替换旧连接（重连语义，§6.5-19）。
-    pub async fn register(&self, user_id: i32, tx: Arc<mpsc::Sender<ServerCommand>>) {
-        self.sessions.write().await.insert(user_id, tx);
+    pub async fn register(
+        &self,
+        user_id: i32,
+        tx: Arc<mpsc::Sender<Outbound>>,
+        backpressure: Arc<Backpressure>,
+        queue_bytes: Arc<AtomicUsize>,
+    ) {
+        self.sessions.write().await.insert(
+            user_id,
+            Arc::new(SendSlot {
+                tx,
+                backpressure,
+                queue_bytes,
+            }),
+        );
+    }
+
+    /// 找出 send 队列在途字节最大的会话（安全锁 A：全局超限时断最重）。
+    fn heaviest(&self) -> Option<(i32, Arc<Backpressure>)> {
+        let Ok(s) = self.sessions.try_read() else {
+            return None;
+        };
+        s.iter()
+            .max_by_key(|(_, slot)| slot.queue_bytes.load(Ordering::SeqCst))
+            .map(|(id, slot)| (*id, Arc::clone(&slot.backpressure)))
     }
 
     /// 注销会话：仅当当前映射仍是本连接（重连后旧连接断开不误删新连接，§4.9-3）。
-    pub async fn unregister(&self, user_id: i32, tx: &Arc<mpsc::Sender<ServerCommand>>) {
+    pub async fn unregister(&self, user_id: i32, tx: &Arc<mpsc::Sender<Outbound>>) {
         let mut sessions = self.sessions.write().await;
         if sessions
             .get(&user_id)
-            .is_some_and(|cur| Arc::ptr_eq(cur, tx))
+            .is_some_and(|slot| Arc::ptr_eq(&slot.tx, tx))
         {
             sessions.remove(&user_id);
         }
     }
 
-    /// 向所有在线会话广播一帧（§11 停机维护通知；队列满/已断连则丢弃）。
+    /// 向所有在线会话广播一帧（§11 停机维护通知；队列满/已断连则丢弃，ISSUE-0004 同款 try_send）。
     pub async fn broadcast(&self, cmd: ServerCommand) {
         let sessions = self.sessions.read().await;
-        for tx in sessions.values() {
-            let _ = tx.send(cmd.clone()).await;
+        for slot in sessions.values() {
+            let _ = slot.tx.try_send(Outbound::Command(cmd.clone()));
         }
+    }
+
+    /// 在线会话数（§11.1 /healthz 数据源；不含未鉴权连接）。
+    pub async fn conn_count(&self) -> usize {
+        self.sessions.read().await.len()
     }
 }
 
@@ -373,9 +633,71 @@ impl EventSink for SessionSink {
                 phira_api::Targets::All => true,
                 phira_api::Targets::Specific(ids) => ids.contains(&user_id),
             };
-            if should_send && let Some(tx) = self.sessions.read().await.get(&user_id) {
-                // 队列满/连接断开 → 丢弃（send 任务已退出）；热路径可丢（§4.9-9）
-                let _ = tx.send(cmd).await;
+            if should_send && let Some(slot) = self.sessions.read().await.get(&user_id) {
+                // ISSUE-0003 方案 2：热路径（Touches/Judges）按帧 Arc 指针编码一次共享
+                // （同一帧的多个 monitor 命中同一缓存）；其余命令写任务各自编码（低频）。
+                let out = match &cmd {
+                    ServerCommand::Touches { frames, .. } => {
+                        let key = Arc::as_ptr(frames) as usize;
+                        Outbound::Encoded(self.encode_cache.get_or_encode(key, || {
+                            let mut buf = Vec::new();
+                            encode_packet(&cmd, &mut buf);
+                            buf
+                        }))
+                    }
+                    ServerCommand::Judges { judges, .. } => {
+                        let key = Arc::as_ptr(judges) as usize;
+                        Outbound::Encoded(self.encode_cache.get_or_encode(key, || {
+                            let mut buf = Vec::new();
+                            encode_packet(&cmd, &mut buf);
+                            buf
+                        }))
+                    }
+                    _ => Outbound::Command(cmd),
+                };
+                // 安全锁 A：send 队列字节记账（Encoded 热路径大帧——Command 是小帧不记）。
+                // 每连接超限 → 踢本连接；全局超限 → 丢新 + 断最重连接。
+                if let Outbound::Encoded(bytes) = &out {
+                    let len = bytes.len();
+                    let conn = slot.queue_bytes.fetch_add(len, Ordering::SeqCst) + len;
+                    if conn > PER_CONN_MEM_LIMIT {
+                        slot.backpressure.force_close();
+                    }
+                    if !charge_memory(len) {
+                        // 全局超限：丢新（不投递）+ 断最重连接（回收内存）
+                        slot.queue_bytes.fetch_sub(len, Ordering::SeqCst);
+                        release_memory(len);
+                        if let Some((_, bp)) = self.heaviest() {
+                            bp.force_close();
+                        }
+                        continue;
+                    }
+                }
+                // ISSUE-0004 修复：try_send 满则丢新（不阻塞房间投递，§10.4"绝不阻塞房间 actor"）；
+                // 满时标记积压，供连接监控任务判定"乌龟"客户端并断连（Backpressure）。
+                // 热路径可丢（§4.9-9）：触摸流每帧独立、下一帧自愈；丢新与"同通道保序"相容。
+                let encoded_len = match &out {
+                    Outbound::Encoded(bytes) => Some(bytes.len()),
+                    Outbound::Command(_) => None,
+                };
+                match slot.tx.try_send(out) {
+                    Ok(()) => slot.backpressure.clear(),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // 队列满未入队：回滚记账
+                        if let Some(len) = encoded_len {
+                            slot.queue_bytes.fetch_sub(len, Ordering::SeqCst);
+                            release_memory(len);
+                        }
+                        slot.backpressure.mark();
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // 连接已断（写任务退出）：回滚记账
+                        if let Some(len) = encoded_len {
+                            slot.queue_bytes.fetch_sub(len, Ordering::SeqCst);
+                            release_memory(len);
+                        }
+                    }
+                }
             }
         }
     }
@@ -462,13 +784,19 @@ struct ConnState {
     /// 最近收包时刻（心跳监控，§6.1 10s 无包判定断线）。
     last_recv: Mutex<Instant>,
     /// 本连接发送通道（sink 注销比较用）。
-    send_tx: Mutex<Option<Arc<mpsc::Sender<ServerCommand>>>>,
+    send_tx: Mutex<Option<Arc<mpsc::Sender<Outbound>>>>,
     /// 当前帧上限（§10.4：鉴权前 ~4KiB，鉴权后 2MiB；与 Stream recv 任务共享）。
     packet_limit: Arc<AtomicU32>,
     /// 本连接是否仍计入未鉴权准入（鉴权成功后转正释放，§10.4）。
     admission_held: AtomicBool,
     /// 对端 IP（准入释放用，§10.4）。
     peer_ip: std::net::IpAddr,
+    /// 发送积压标记（ISSUE-0004：踢乌龟客户端；与 SessionSink 共享）。
+    backpressure: Arc<Backpressure>,
+    /// 命令限速器（ISSUE-0006：每连接滥用控制"快端"防线）。
+    limiter: CommandLimiter,
+    /// send 队列字节记账（安全锁 A：与 SessionSink/SendSlot 共享同一 Arc）。
+    queue_bytes: Arc<AtomicUsize>,
 }
 
 impl ConnState {
@@ -484,6 +812,9 @@ impl ConnState {
             packet_limit: Arc::new(AtomicU32::new(PRE_AUTH_MAX_PACKET)),
             admission_held: AtomicBool::new(false),
             peer_ip,
+            backpressure: Arc::new(Backpressure::new()),
+            limiter: CommandLimiter::new(),
+            queue_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -512,7 +843,7 @@ pub async fn handle_connection(
     let handler_ctx = Arc::clone(&ctx);
     let handler_state = Arc::clone(&state);
     let handler = Box::new(
-        move |send_tx: Arc<mpsc::Sender<ServerCommand>>, cmd: ClientCommand| {
+        move |send_tx: Arc<mpsc::Sender<Outbound>>, cmd: ClientCommand| {
             let ctx = Arc::clone(&handler_ctx);
             let state = Arc::clone(&handler_state);
             async move {
@@ -521,11 +852,12 @@ pub async fn handle_connection(
         },
     );
 
-    let stream = Stream::<ServerCommand, ClientCommand>::new(
+    let stream = Stream::<ClientCommand>::new(
         None,
         stream,
         handler,
         Arc::clone(&state.packet_limit),
+        Arc::clone(&state.queue_bytes), // 安全锁 A：写任务消费时经此释放记账
     )
     .await;
     let stream = match stream {
@@ -578,13 +910,67 @@ pub async fn handle_connection(
         }
     });
 
-    // 等待连接关闭（客户端断开 / 监控超时）。
-    // select：客户端断开 → await_closed 返回；超时 → abort 分支触发，await_closed future 被
-    // drop（stream drop → abort 收发任务 → 连接断开）。
+    // 发送积压监控（ISSUE-0004 修复）：队列持续满超阈值 → 判定"乌龟"客户端 → 断开。
+    // 与心跳监控独立：心跳只看收包（乌龟持续发 Ping 不触发），积压看"发包被卡"。
+    // 标记由 SessionSink::deliver 维护（try_send 满则 mark / 成功则 clear）。
+    let kick_state = Arc::clone(&state);
+    let kick_ctx = Arc::clone(&ctx);
+    let (kick_tx, mut kick_rx) = mpsc::channel::<()>(1);
+    let kicker = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(BACKPRESSURE_CHECK_INTERVAL).await;
+            if kick_state.closed.load(Ordering::SeqCst) {
+                return; // 已收尾
+            }
+            // 安全锁 A：内存守卫强制踢出（每连接超限/全局超限断最重）——不等积压超时
+            if kick_state.backpressure.is_forced() {
+                if kick_state.closed.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let user_id = kick_state.user_id.load(Ordering::SeqCst);
+                let epoch = kick_state.epoch.load(Ordering::SeqCst);
+                if kick_state.authed.load(Ordering::SeqCst) {
+                    warn!("memory guard kicked, user={user_id}");
+                    let _ = kick_ctx
+                        .fact_tx
+                        .send(LifecycleEvent::Disconnected { user_id, epoch })
+                        .await;
+                }
+                let _ = kick_tx.send(()).await;
+                return;
+            }
+            let Some(elapsed) = kick_state.backpressure.elapsed() else {
+                continue; // 当前未积压（正常波动已自愈）
+            };
+            if elapsed < SLOW_CONSUMER_KICK_AFTER {
+                continue; // 积压未满阈值
+            }
+            // 积压持续超阈值：收尾（CAS 防重复）→ 通知生命周期 → 通知主流程断开
+            if kick_state.closed.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let user_id = kick_state.user_id.load(Ordering::SeqCst);
+            let epoch = kick_state.epoch.load(Ordering::SeqCst);
+            if kick_state.authed.load(Ordering::SeqCst) {
+                warn!("slow consumer kicked, user={user_id} (send queue full for {elapsed:?})");
+                let _ = kick_ctx
+                    .fact_tx
+                    .send(LifecycleEvent::Disconnected { user_id, epoch })
+                    .await;
+            }
+            let _ = kick_tx.send(()).await;
+            return;
+        }
+    });
+
+    // 等待连接关闭（客户端断开 / 心跳超时 / 慢消费者踢出）。
+    // select：客户端断开 → await_closed 返回；超时/踢出 → abort/kick 分支触发，
+    // await_closed future 被 drop（stream drop → abort 收发任务 → 连接断开）。
     tokio::select! {
         // await_closed move stream：客户端断开 → 正常返回；超时 → future drop → stream drop
         () = stream.await_closed() => {}
         () = async { abort_rx.recv().await; } => {}
+        () = async { kick_rx.recv().await; } => {}
     }
 
     // 收尾（幂等：监控超时可能已发 Disconnected）
@@ -592,6 +978,8 @@ pub async fn handle_connection(
         let user_id = state.user_id.load(Ordering::SeqCst);
         let epoch = state.epoch.load(Ordering::SeqCst);
         if state.authed.load(Ordering::SeqCst) {
+            // 安全锁 B：已鉴权连接计数释放（与 authenticate_flow 的 fetch_add 配对）
+            AUTHED_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
             let _ = ctx
                 .fact_tx
                 .send(LifecycleEvent::Disconnected { user_id, epoch })
@@ -616,11 +1004,21 @@ pub async fn handle_connection(
             .await;
     }
     monitor.abort();
+    kicker.abort();
     info!("connection from {addr} closed");
     Ok(())
 }
 
-/// 管理 HTTP 端点（§运营，独立端口 `http_port`）：房间列表 `/rooms`。
+/// 进程启动时刻（/healthz uptime 数据源，§11.1；OnceLock 惰性初始化）。
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// 进程已运行秒数（§11.1 /healthz）。
+fn uptime_s() -> u64 {
+    let start = PROCESS_START.get_or_init(std::time::Instant::now);
+    start.elapsed().as_secs()
+}
+
+/// 管理 HTTP 端点（§运营，独立端口 `http_port`）：`/rooms` 房间列表 + `/healthz` 健康检查。
 ///
 /// 极简 HTTP/1.1 响应（手写，与回源客户端对称）；仅读请求头（≤4KiB 防滥用）。
 ///
@@ -661,9 +1059,21 @@ pub async fn http_serve(
             let body = serde_json::to_string(&rooms).unwrap_or_else(|_| "[]".to_owned());
             ("200 OK", body, "application/json; charset=utf-8")
         }
+        "/healthz" => {
+            // §11.1 方案 B：测活 + 测健康一步到位；不依赖官方 API（官方挂掉不影响测活）
+            let body = serde_json::json!({
+                "status": "ok",
+                "version": env!("CARGO_PKG_VERSION"),
+                "uptime_s": uptime_s(),
+                "connections": ctx.sink.conn_count().await,
+                "rooms": ctx.room_list.snapshot().await.len(),
+            })
+            .to_string();
+            ("200 OK", body, "application/json; charset=utf-8")
+        }
         "/" => (
             "200 OK",
-            r#"{"service":"r0semi-mp","endpoints":["/rooms"]}"#.to_owned(),
+            r#"{"service":"r0semi-mp","endpoints":["/rooms","/healthz"]}"#.to_owned(),
             "application/json; charset=utf-8",
         ),
         _ => ("404 Not Found", "not found".to_owned(), "text/plain"),
@@ -683,7 +1093,7 @@ pub async fn http_serve(
 async fn handle_frame(
     ctx: &ConnContext,
     state: &ConnState,
-    send_tx: &Arc<mpsc::Sender<ServerCommand>>,
+    send_tx: &Arc<mpsc::Sender<Outbound>>,
     cmd: ClientCommand,
 ) {
     *state
@@ -696,7 +1106,8 @@ async fn handle_frame(
     }
 
     if matches!(cmd, ClientCommand::Ping) {
-        let _ = send_tx.send(ServerCommand::Pong).await;
+        // ISSUE-0004：Pong 走 try_send（满则丢——客户端心跳自会失败断开；不阻塞 recv 任务）
+        let _ = send_tx.try_send(Outbound::Command(ServerCommand::Pong));
         return;
     }
 
@@ -712,6 +1123,21 @@ async fn handle_frame(
 
     // —— 已鉴权命令 ——
     let user_id = state.user_id.load(Ordering::SeqCst);
+    // 滥用控制"快端"（ISSUE-0006 修复）：每连接限速只限"贵"命令（资源成本驱动）；
+    // 超限回 TooManyRequests Business 错误（客户端可见），不触发队列 Reject 断连
+    if let Some((key, interval)) = rate_limit(&cmd)
+        && !state.limiter.allow(key, interval)
+    {
+        let sc = response_to_server(
+            &cmd,
+            Ok(RoomResponse::Failure(RoomError::Business {
+                code: RoomErrorCode::TooManyRequests,
+                msg: "too many requests".to_owned(),
+            })),
+        );
+        let _ = send_tx.try_send(Outbound::Command(sc));
+        return;
+    }
     // 心跳/鉴权归 core；其余转房间命令（§6.6 表 1；CreateRoom/JoinRoom 需要昵称）
     let name = ctx.registry.name_of(user_id).unwrap_or_default();
     let Some(room_cmd) = client_to_room(cmd.clone(), name) else {
@@ -741,7 +1167,13 @@ async fn handle_frame(
         _ => Some(response_to_server(&cmd, resp)),
     };
     if let Some(sc) = server_cmd {
-        let _ = send_tx.send(sc).await;
+        // ISSUE-0004：命令响应走 try_send——满则丢 + 标记积压（不阻塞本连接 recv 任务；
+        // 队列持续满由 kicker 踢出——乌龟不享受无限等待）
+        match send_tx.try_send(Outbound::Command(sc)) {
+            Ok(()) => state.backpressure.clear(),
+            Err(mpsc::error::TrySendError::Full(_)) => state.backpressure.mark(),
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 }
 
@@ -749,12 +1181,24 @@ async fn handle_frame(
 async fn authenticate_flow(
     ctx: &ConnContext,
     state: &ConnState,
-    send_tx: &Arc<mpsc::Sender<ServerCommand>>,
+    send_tx: &Arc<mpsc::Sender<Outbound>>,
     token: &str,
 ) {
     match ctx.auth.authenticate(token).await {
         Ok(identity) => {
             let user_id = identity.user_id;
+            // 安全锁 B：已鉴权连接总数上限（§11 兑现）——超限拒绝鉴权 + 等断开
+            if AUTHED_CONNECTIONS.fetch_add(1, Ordering::SeqCst) + 1 > MAX_AUTHED_CONNECTIONS {
+                AUTHED_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+                warn!("too many authed connections, rejecting user={user_id}");
+                let _ = send_tx
+                    .send(Outbound::Command(ServerCommand::Authenticate(Err(
+                        "server full".to_owned(),
+                    ))))
+                    .await;
+                state.panicked.store(true, Ordering::SeqCst);
+                return;
+            }
             let epoch = ctx.registry.register(user_id, identity.name.clone());
             state.user_id.store(user_id, Ordering::SeqCst);
             state.epoch.store(epoch, Ordering::SeqCst);
@@ -762,7 +1206,14 @@ async fn authenticate_flow(
                 .send_tx
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(send_tx));
-            ctx.sink.register(user_id, Arc::clone(send_tx)).await;
+            ctx.sink
+                .register(
+                    user_id,
+                    Arc::clone(send_tx),
+                    Arc::clone(&state.backpressure),
+                    Arc::clone(&state.queue_bytes),
+                )
+                .await;
             let _ = ctx
                 .fact_tx
                 .send(LifecycleEvent::Connected { user_id, epoch })
@@ -786,15 +1237,19 @@ async fn authenticate_flow(
                 monitor: false,
             };
             let _ = send_tx
-                .send(ServerCommand::Authenticate(Ok((info, room_state))))
+                .send(Outbound::Command(ServerCommand::Authenticate(Ok((
+                    info, room_state,
+                )))))
                 .await;
             // 进服欢迎语（§运营）：鉴权成功后发给本人（user=0 系统消息，协议兼容）
             if let Some(welcome) = &ctx.welcome_message {
                 let _ = send_tx
-                    .send(ServerCommand::Message(phira_api::Message::Chat {
-                        user: 0,
-                        content: welcome.clone(),
-                    }))
+                    .send(Outbound::Command(ServerCommand::Message(
+                        phira_api::Message::Chat {
+                            user: 0,
+                            content: welcome.clone(),
+                        },
+                    )))
                     .await;
             }
             state.authed.store(true, Ordering::SeqCst);
@@ -814,7 +1269,9 @@ async fn authenticate_flow(
                     "internal error".to_owned()
                 }
             };
-            let _ = send_tx.send(ServerCommand::Authenticate(Err(msg))).await;
+            let _ = send_tx
+                .send(Outbound::Command(ServerCommand::Authenticate(Err(msg))))
+                .await;
             // 鉴权失败：忽略后续帧，等客户端断开（原版语义：立即断开）
             state.panicked.store(true, Ordering::SeqCst);
         }

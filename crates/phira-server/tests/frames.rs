@@ -197,23 +197,29 @@ async fn server_initiated_push() {
     let server_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let handler = Box::new(
-            move |tx: Arc<tokio::sync::mpsc::Sender<ServerCommand>>, cmd: ClientCommand| async move {
+            move |tx: Arc<tokio::sync::mpsc::Sender<phira_server::stream::Outbound>>,
+                  cmd: ClientCommand| async move {
                 if let ClientCommand::Ping = cmd {
                     // 主动推送 + 心跳应答（顺序 = 发送顺序）
-                    tx.send(ServerCommand::Chat(Err("stage-2-not-wired".to_owned())))
+                    tx.send(phira_server::stream::Outbound::Command(
+                        ServerCommand::Chat(Err("stage-2-not-wired".to_owned())),
+                    ))
+                    .await
+                    .unwrap();
+                    tx.send(phira_server::stream::Outbound::Command(ServerCommand::Pong))
                         .await
                         .unwrap();
-                    tx.send(ServerCommand::Pong).await.unwrap();
                 }
             },
         );
-        let stream = phira_server::stream::Stream::<ServerCommand, ClientCommand>::new(
+        let stream = phira_server::stream::Stream::<ClientCommand>::new(
             None,
             stream,
             handler,
             std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
                 phira_server::stream::MAX_PACKET_SIZE,
             )),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)), // 记账 dummy（客户端模式）
         )
         .await
         .unwrap();

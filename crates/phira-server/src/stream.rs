@@ -7,20 +7,26 @@
 //! - 有界发送队列（1024）+ 后台发送任务（写失败仅记录，不阻塞业务）
 //! - 接收任务逐帧解码并交给 handler；解码失败断开（原版语义）
 //!
-//! 热路径（§6.5-17）：`send` 只入队；编码由发送任务统一做，一次编码共享缓冲。
+//! 热路径（§6.5-17）：`send` 只入队；编码由发送任务统一做。热路径（Touches/Judges）
+//! 经 `Outbound::Encoded` 共享编码结果（ISSUE-0003 方案 2：SessionSink 的 EncodeCache
+//! 编码一次、多 monitor 复用）；`Outbound` 实现 `BinaryData`——Encoded 分支直写缓存字节，
+//! Stream 的通用编码路径不变。
 
 use std::{
     future::Future,
     marker::PhantomData,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use anyhow::{Result, bail};
-use phira_api::{BinaryData, decode_packet, encode_packet};
+use phira_api::{
+    BinaryData, BinaryReader, BinaryWriter, ProtoResult, ServerCommand, decode_packet,
+    encode_packet,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -28,6 +34,44 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{error, trace, warn};
+
+/// 记账释放守卫（安全锁 A）：写任务**任何结束路径**（自然结束 / abort / panic）都释放
+/// 剩余 send 队列记账——`abort` 取消 future 时闭包局部变量 drop，guard 生效。
+/// 与写任务的实时 `fetch_sub` 幂等（剩余 = 未消费部分，swap 后为 0）。
+struct MemoryReleaser(Arc<AtomicUsize>);
+
+impl Drop for MemoryReleaser {
+    fn drop(&mut self) {
+        let remaining = self.0.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if remaining > 0 {
+            crate::server::release_memory(remaining);
+        }
+    }
+}
+
+/// 出站消息（ISSUE-0003 方案 2：热路径编码一次共享）。
+#[derive(Debug)]
+pub enum Outbound {
+    /// 未编码命令：写任务负责编码（低频 / 每连接独立：响应、心跳、鉴权、领域事件）。
+    Command(ServerCommand),
+    /// 已编码载荷（**不含** ULEB128 长度前缀）：热路径共享编码结果，写任务直写。
+    Encoded(Arc<Vec<u8>>),
+}
+
+impl BinaryData for Outbound {
+    fn write_binary(&self, w: &mut BinaryWriter<'_>) -> ProtoResult<()> {
+        match self {
+            // 普通命令：走 ServerCommand 的标准协议编码
+            Outbound::Command(cmd) => cmd.write_binary(w),
+            // 热路径已编码载荷：直写缓存字节（一次编码、多接收者复用，零序列化）
+            Outbound::Encoded(bytes) => w.write_raw(bytes),
+        }
+    }
+
+    fn read_binary(_r: &mut BinaryReader<'_>) -> ProtoResult<Self> {
+        unreachable!("Outbound 仅服务端发送（服务端模式），不接收")
+    }
+}
 
 /// 协议版本号（§6.1：客户端发 1 字节，当前 v1）。
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -41,27 +85,27 @@ pub const PRE_AUTH_MAX_PACKET: u32 = 4 * 1024;
 /// 握手超时（§10.4：peek/读首字节 ≤5s——半开连接（connect 后不发版本）不占资源）。
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 双向帧流：`S` = 发送载荷类型（服务端侧 = `ServerCommand`），`R` = 接收载荷类型。
+/// 双向帧流：发送载荷固定为 [`Outbound`]（服务端侧——命令或共享编码帧），
+/// `R` = 接收载荷类型（`ClientCommand`）。
 ///
 /// `new` 建立握手 + 启动 send/recv 两个后台任务；`drop` 中止两者（原版语义：
 /// 会话结束即断开）。
-pub struct Stream<S, R> {
+pub struct Stream<R> {
     /// 协商后的版本号（服务端模式 = 客户端发来的版本）。
     version: u8,
 
     /// 发送队列发送端（clone 到 handler，供其主动回包）。
-    send_tx: Arc<mpsc::Sender<S>>,
+    send_tx: Arc<mpsc::Sender<Outbound>>,
 
     /// `Option`：`await_closed` 取出后置空；Drop 时 abort 仍在的 handle。
     send_task_handle: Option<JoinHandle<()>>,
     recv_task_handle: Option<JoinHandle<Result<()>>>,
 
-    _marker: PhantomData<(S, R)>,
+    _marker: PhantomData<R>,
 }
 
-impl<S, R> Stream<S, R>
+impl<R> Stream<R>
 where
-    S: BinaryData + std::fmt::Debug + Send + Sync + 'static,
     R: BinaryData + std::fmt::Debug + Send + 'static,
 {
     /// 建立帧流。
@@ -79,11 +123,13 @@ where
     /// # Panics
     ///
     /// 编码载荷超过 2 MiB（`u32::try_from` 失败，理论上不发生——帧上限在接收侧）。
+    #[allow(clippy::too_many_lines)] // 帧流全生命周期（握手/收发任务/记账守卫）单一函数完整呈现
     pub async fn new<F>(
         version: Option<u8>,
         stream: TcpStream,
-        mut handler: Box<dyn FnMut(Arc<mpsc::Sender<S>>, R) -> F + Send + Sync>,
+        mut handler: Box<dyn FnMut(Arc<mpsc::Sender<Outbound>>, R) -> F + Send + Sync>,
         packet_limit: Arc<AtomicU32>,
+        queue_bytes: Arc<AtomicUsize>, // 安全锁 A：本连接 send 队列记账（写任务消费后释放）
     ) -> Result<Self>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -104,12 +150,25 @@ where
         let send_tx = Arc::new(send_tx);
         let send_task_handle = tokio::spawn({
             async move {
+                // 安全锁 A：Drop guard——任务结束（含 abort）释放剩余记账（无泄漏）
+                let _releaser = MemoryReleaser(Arc::clone(&queue_bytes));
                 let mut buffer = Vec::new();
                 let mut len_buf = [0u8; 5];
                 while let Some(payload) = send_rx.recv().await {
                     buffer.clear();
-                    encode_packet(&payload, &mut buffer);
-                    trace!("sending {} bytes ({payload:?}): {buffer:?}", buffer.len());
+                    match payload {
+                        Outbound::Command(cmd) => {
+                            encode_packet(&cmd, &mut buffer);
+                            trace!("sending {} bytes ({cmd:?}): {buffer:?}", buffer.len());
+                        }
+                        // 热路径共享编码帧（ISSUE-0003 方案 2）：直写缓存字节，零序列化
+                        Outbound::Encoded(bytes) => {
+                            // 安全锁 A：消费后释放记账（queue_bytes 减 + 全局在途字节减）
+                            queue_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
+                            crate::server::release_memory(bytes.len());
+                            buffer.extend_from_slice(&bytes);
+                        }
+                    }
 
                     // ULEB128 长度前缀（§6.1）：载荷 ≤ 2 MiB → 最多 3 字节，缓冲 5 够用
                     let mut x = u32::try_from(buffer.len()).expect("payload ≤ 2MiB fits u32");
@@ -133,6 +192,12 @@ where
                     {
                         error!("failed to send: {err:?}");
                     }
+                }
+                // 安全锁 A：写任务结束（send_rx 关闭 = 连接收尾）——释放剩余记账，
+                // 保证"投递 charge 总数 == 释放总数"，连接关闭账目必然平衡（无泄漏）
+                let remaining = queue_bytes.swap(0, Ordering::SeqCst);
+                if remaining > 0 {
+                    crate::server::release_memory(remaining);
                 }
             }
         });
@@ -203,7 +268,7 @@ where
     ///
     /// 对端已断开 / 发送任务已退出 → `mpsc` 发送失败。
     #[allow(dead_code)] // 阶段 2 会话层（事件编码投递 §6.6 表 2）接入后使用
-    pub async fn send(&self, payload: S) -> Result<()> {
+    pub async fn send(&self, payload: Outbound) -> Result<()> {
         self.send_tx.send(payload).await?;
         Ok(())
     }
@@ -214,7 +279,7 @@ where
     ///
     /// 对端已断开 → `mpsc` 发送失败。
     #[allow(dead_code)] // 阶段 2 会话层接入后使用
-    pub fn blocking_send(&self, payload: S) -> Result<()> {
+    pub fn blocking_send(&self, payload: Outbound) -> Result<()> {
         self.send_tx.blocking_send(payload)?;
         Ok(())
     }
@@ -229,7 +294,7 @@ where
     }
 }
 
-impl<S, R> Drop for Stream<S, R> {
+impl<R> Drop for Stream<R> {
     fn drop(&mut self) {
         if let Some(handle) = self.send_task_handle.take() {
             handle.abort();

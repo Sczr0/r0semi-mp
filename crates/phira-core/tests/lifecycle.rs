@@ -372,3 +372,161 @@ async fn register_keeps_name() {
     assert_eq!(registry.name_of(1).as_deref(), Some("alice2"));
     assert_eq!(registry.name_of(99), None);
 }
+
+// —— ISSUE-0001 修复：幽灵座位重放（§4.9-3 第四竞态）——
+
+/// 慢入房 actor：JoinRoom 处理时 sleep，拉大"增量未应用"窗口（幽灵座位竞态模拟）。
+struct SlowJoinActor {
+    received: Arc<Mutex<Vec<RoomCommand>>>,
+}
+
+#[async_trait::async_trait]
+impl phira_api::RoomActor for SlowJoinActor {
+    async fn handle(
+        &mut self,
+        _ctx: CmdCtx,
+        cmd: RoomCommand,
+    ) -> (Option<RoomResponse>, Vec<RoomEvent>) {
+        self.received.lock().unwrap().push(cmd.clone());
+        match cmd {
+            RoomCommand::CreateRoom { .. } => (
+                Some(RoomResponse::Ok),
+                vec![RoomEvent::RoomCreated {
+                    room_id: rid(),
+                    host: 1,
+                }],
+            ),
+            RoomCommand::JoinRoom { .. } => {
+                // 拉大窗口：bus 忙（actor 处理慢）→ 增量应用前让出 30ms
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                (
+                    Some(RoomResponse::JoinRoom(phira_api::JoinRoomResponse {
+                        state: phira_api::RoomState::SelectChart(None),
+                        users: vec![],
+                        live: false,
+                    })),
+                    vec![RoomEvent::UserJoined {
+                        room_id: rid(),
+                        user: phira_api::UserInfo {
+                            id: 2,
+                            name: "u2".to_owned(),
+                            monitor: false,
+                        },
+                    }],
+                )
+            }
+            _ => (None, Vec::new()),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SlowJoinFactory {
+    received: Arc<Mutex<Vec<RoomCommand>>>,
+}
+
+impl SlowJoinFactory {
+    fn received(&self) -> Arc<Mutex<Vec<RoomCommand>>> {
+        Arc::clone(&self.received)
+    }
+}
+
+impl RoomFactory for SlowJoinFactory {
+    fn create(&self, _room_id: RoomId) -> Box<dyn phira_api::RoomActor> {
+        Box::new(SlowJoinActor {
+            received: Arc::clone(&self.received),
+        })
+    }
+}
+
+/// 幽灵座位竞态：客户端入房（JoinRoom 处理中，增量未应用）即断线，
+/// 生命周期任务查表 miss → 挂起重放命中 → UserDisconnected 最终派发。
+/// 修复前：事实被丢 → 座位留在房间无人驱逐（ISSUE-0001）。
+#[tokio::test]
+async fn ghost_seat_replay_recovers_missed_route() {
+    let factory = Arc::new(SlowJoinFactory::default());
+    let received = factory.received();
+    let bus = Bus::new(
+        factory as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig { monitors: vec![] }),
+    );
+    let (task, registry, fact_tx) = LifecycleTask::new(bus.clone(), Duration::from_secs(10));
+    tokio::spawn(task.run());
+
+    // 用户 1 建房（路由注册 host=1）
+    bus.dispatch(
+        ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "u1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    // 用户 2 注册（epoch=1）
+    let e2 = registry.register(2, "u2".to_owned());
+
+    // 并发：JoinRoom（actor 慢 30ms，增量未应用窗口）+ 主流程立即发断线事实
+    let bus2 = bus.clone();
+    let jh = tokio::spawn(async move {
+        bus2.dispatch(
+            ctx(2),
+            RoomCommand::JoinRoom {
+                id: rid(),
+                monitor: false,
+                name: "u2".to_owned(),
+            },
+        )
+        .await
+    });
+    fact_tx
+        .send(LifecycleEvent::Disconnected {
+            user_id: 2,
+            epoch: e2,
+        })
+        .await
+        .unwrap();
+    jh.await.unwrap().unwrap();
+
+    // 断言：UserDisconnected 最终派发（重放兜底；修复前 = 事实被丢 → 幽灵座位）
+    assert!(
+        wait_received(&received, |c| matches!(
+            c,
+            RoomCommand::UserDisconnected { user_id: 2, .. }
+        ))
+        .await,
+        "幽灵座位场景：Disconnected 应经重放派发，不得丢失"
+    );
+}
+
+/// 正常路径：用户从未入房 → 重放耗尽仍 miss → 事实丢弃（不误派发、不误报）。
+#[tokio::test]
+async fn replay_gives_up_when_user_never_in_room() {
+    let factory = Arc::new(ScriptedFactory::default());
+    let received = factory.received();
+    let bus = Bus::new(
+        factory as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig { monitors: vec![] }),
+    );
+    let (task, registry, fact_tx) = LifecycleTask::new(bus.clone(), Duration::from_secs(10));
+    tokio::spawn(task.run());
+
+    let e3 = registry.register(3, "u3".to_owned());
+    fact_tx
+        .send(LifecycleEvent::Disconnected {
+            user_id: 3,
+            epoch: e3,
+        })
+        .await
+        .unwrap();
+    // 等重放耗尽（3×20ms）+ 余量
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c, RoomCommand::UserDisconnected { user_id: 3, .. })),
+        "用户从未入房：重放后应放弃，不得误派发"
+    );
+}

@@ -376,6 +376,9 @@ async fn duplicate_join_rejected() {
     ));
 
     // 已在房 A，再建房 B → AlreadyInRoom
+    // （等限速窗口：ISSUE-0006 限速 CreateRoom 1s 间隔——否则先撞 TooManyRequests，
+    //   本测试验证的是 §6.5-27 重复入房语义，限速语义由 rate_limit 测试单独覆盖）
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     send_cmd(
         &mut c1,
         &ClientCommand::CreateRoom {

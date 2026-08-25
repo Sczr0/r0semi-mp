@@ -132,6 +132,7 @@ fn room_error_code_exhaustive_values() {
         RoomErrorCode::InvalidRecord,
         RoomErrorCode::AlreadyUploaded,
         RoomErrorCode::AlreadyAborted,
+        RoomErrorCode::TooManyRequests,
     ];
     let mut seen = std::collections::HashSet::new();
     for c in codes {

@@ -33,7 +33,7 @@ async-trait = "0.1"
 rand = "0.9"
 anyhow = "1"
 tracing = "0.1"
-tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros", "signal", "fs"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal", "fs"] }
 
 # 发布构建（§部署）：CI 用 musl 静态构建 + strip 减小体积
 # （借鉴 Next-Phi-Backend 的 release-dist；strip 削弱 backtrace 但部署产物更小）

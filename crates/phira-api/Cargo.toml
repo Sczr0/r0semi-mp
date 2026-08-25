@@ -17,3 +17,8 @@ all = { level = "warn", priority = -1 }
 thiserror.workspace = true
 half.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+# 模糊测试（§9 模糊层）：解码器吃随机/畸形字节不 panic（dev 依赖不进运行时，
+# 不违反 api 零 tokio/轻依赖红线；固定种子可复现）
+proptest = "1"
