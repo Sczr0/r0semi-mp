@@ -46,6 +46,8 @@ async fn mock_api(addr: std::net::SocketAddr) {
                 r#"{"id": 1, "name": "p1", "language": "zh"}"#
             } else if text.contains("Bearer tok2") {
                 r#"{"id": 2, "name": "p2", "language": "zh"}"#
+            } else if text.contains("Bearer tok3") {
+                r#"{"id": 3, "name": "p3", "language": "zh"}"#
             } else if text.contains("GET /chart/1 ") {
                 r#"{"id": 1, "name": "Test Chart"}"#
             } else {
@@ -1289,4 +1291,133 @@ async fn welcome_message_sent_after_auth() {
         "鉴权后应收到欢迎语: {f:?}"
     );
     drop(c1);
+}
+
+/// §6.5 规则 3：对局中（Playing）加入 → 客户端收到 GameOngoing 提示（全链路）。
+#[allow(clippy::too_many_lines)] // 全流程脚本长是验收场景需求（同 game_flow）
+#[tokio::test]
+async fn join_during_game_rejected_with_hint() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx(mock_addr);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    let mut c1 = client_connect(server_addr).await;
+    let mut c2 = client_connect(server_addr).await;
+    for (c, tok) in [(&mut c1, "tok1"), (&mut c2, "tok2")] {
+        send_cmd(
+            c,
+            &ClientCommand::Authenticate {
+                token: Varchar::new(tok.into()).unwrap(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_cmd(c).await,
+            ServerCommand::Authenticate(Ok(_))
+        ));
+    }
+
+    // user1 建房 + user2 加入
+    send_cmd(
+        &mut c1,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c1).await;
+    let _ = recv_cmd(&mut c1).await;
+    send_cmd(
+        &mut c2,
+        &ClientCommand::JoinRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+            monitor: false,
+        },
+    )
+    .await;
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c1).await;
+    }
+    for _ in 0..3 {
+        let _ = recv_cmd(&mut c2).await;
+    }
+
+    // 开局：选图 + RequestStart + user2 Ready → StartPlaying
+    send_cmd(&mut c1, &ClientCommand::SelectChart { id: 1 }).await;
+    let _ = recv_cmd(&mut c1).await;
+    let _ = recv_cmd(&mut c1).await;
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::SelectChart(Ok(()))
+    ));
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c2).await;
+    }
+    send_cmd(&mut c1, &ClientCommand::RequestStart).await;
+    let _ = recv_cmd(&mut c1).await;
+    let _ = recv_cmd(&mut c1).await;
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::RequestStart(Ok(()))
+    ));
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c2).await;
+    }
+    send_cmd(&mut c2, &ClientCommand::Ready).await;
+    assert!(matches!(
+        recv_cmd(&mut c2).await,
+        ServerCommand::Message(phira_api::Message::Ready { user: 2 })
+    ));
+    let _ = recv_cmd(&mut c2).await; // Ready(Ok)
+    // 全员 ready → StartPlaying（双端）
+    let _ = recv_cmd(&mut c1).await;
+    let _ = recv_cmd(&mut c1).await;
+    let _ = recv_cmd(&mut c2).await;
+
+    // user3 加入对局中房间 → 收到 GameOngoing 提示
+    let mut c3 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c3,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok3".into()).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_cmd(&mut c3).await,
+        ServerCommand::Authenticate(Ok(_))
+    ));
+    send_cmd(
+        &mut c3,
+        &ClientCommand::JoinRoom {
+            id: phira_api::RoomId::new("r1".into()).unwrap(),
+            monitor: false,
+        },
+    )
+    .await;
+    let f = recv_cmd(&mut c3).await;
+    assert!(
+        matches!(
+            &f,
+            ServerCommand::JoinRoom(Err(msg)) if msg.contains("ongoing")
+        ),
+        "对局中加入应收到 GameOngoing 提示: {f:?}"
+    );
+    drop(c1);
+    drop(c2);
+    drop(c3);
 }

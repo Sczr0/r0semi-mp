@@ -181,6 +181,7 @@ pub async fn room_contract_suite<F: RoomFactory>(factory: &F) {
     monitor_capacity_and_config_hotswap(factory).await;
     host_leave_migrates(factory).await;
     playing_leave_triggers_settle(factory).await;
+    join_during_game_rejected(factory).await;
 }
 
 /// 建房/入房/容量（§6.5-1/3/4/6/27）
@@ -1063,4 +1064,52 @@ async fn playing_leave_triggers_settle<F: RoomFactory>(factory: &F) {
             .any(|e| matches!(e, RoomEvent::GameEnd { room_id, .. } if room_id == &rid())),
         "剩余玩家完成应结算: {events:?}"
     );
+}
+
+/// §6.5 规则 3：仅 SelectChart 状态可加入——对局中 / 等待就绪加入 → GameOngoing 拒绝（有提示）。
+async fn join_during_game_rejected<F: RoomFactory>(factory: &F) {
+    // —— Playing 中加入 ——
+    let mut room = factory.create(rid());
+    setup_playing(&mut room).await; // 3 人开局 → Playing
+    let (resp, events) = room
+        .handle(
+            ctx(4),
+            RoomCommand::JoinRoom {
+                id: rid(),
+                monitor: false,
+                name: "user4".to_owned(),
+            },
+        )
+        .await;
+    assert!(events.is_empty(), "拒绝加入不应有事件");
+    let resp = resp.expect("应有响应");
+    assert_business(&resp, RoomErrorCode::GameOngoing);
+
+    // —— WaitForReady 中加入 ——
+    let mut room = factory.create(rid());
+    create_room(&mut room).await;
+    room.handle(
+        ctx(2),
+        RoomCommand::JoinRoom {
+            id: rid(),
+            monitor: false,
+            name: "user2".to_owned(),
+        },
+    )
+    .await;
+    room.handle(ctx(1), RoomCommand::SelectChart { id: 1 })
+        .await;
+    room.handle(ctx(1), RoomCommand::RequestStart).await; // → WaitForReady（user2 未 ready 不开局）
+    let (resp, events) = room
+        .handle(
+            ctx(3),
+            RoomCommand::JoinRoom {
+                id: rid(),
+                monitor: false,
+                name: "user3".to_owned(),
+            },
+        )
+        .await;
+    assert!(events.is_empty());
+    assert_business(resp.as_ref().unwrap(), RoomErrorCode::GameOngoing);
 }
