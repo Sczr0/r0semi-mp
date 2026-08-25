@@ -54,13 +54,10 @@ async fn main() -> Result<()> {
     let room_list = Arc::new(phira_server::server::RoomListSink::new(
         config.hidden_room_prefixes.clone(),
     ));
-    let composite = Arc::new(phira_server::server::CompositeSink::default());
-    composite
-        .push(Arc::clone(&sink) as Arc<dyn EventSink>)
-        .await;
-    composite
-        .push(Arc::clone(&room_list) as Arc<dyn EventSink>)
-        .await;
+    let composite = Arc::new(phira_server::server::CompositeSink::new(vec![
+        Arc::clone(&sink) as Arc<dyn EventSink>,
+        Arc::clone(&room_list) as Arc<dyn EventSink>,
+    ]));
     bus.attach_sink(composite as Arc<dyn EventSink>);
 
     // 鉴权（回源 /me，§6.5-14）

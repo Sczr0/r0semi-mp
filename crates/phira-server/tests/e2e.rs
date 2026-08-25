@@ -105,7 +105,15 @@ fn setup_ctx_custom(
     tokio::spawn(task.run());
 
     let sink = Arc::new(SessionSink::new());
-    bus.attach_sink(Arc::clone(&sink) as Arc<dyn phira_core::EventSink>);
+    let room_list = Arc::new(phira_server::server::RoomListSink::new(
+        hidden_prefixes.into_iter().map(str::to_owned).collect(),
+    ));
+    // 观察者组合（§7.3）：SessionSink + RoomListSink 一起挂 bus（与 Server::run 一致）
+    let composite = Arc::new(phira_server::server::CompositeSink::new(vec![
+        Arc::clone(&sink) as Arc<dyn phira_core::EventSink>,
+        Arc::clone(&room_list) as Arc<dyn phira_core::EventSink>,
+    ]));
+    bus.attach_sink(composite as Arc<dyn phira_core::EventSink>);
 
     Arc::new(ConnContext {
         bus,
@@ -115,9 +123,7 @@ fn setup_ctx_custom(
         sink,
         admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
         welcome_message: welcome.map(str::to_owned),
-        room_list: Arc::new(phira_server::server::RoomListSink::new(
-            hidden_prefixes.into_iter().map(str::to_owned).collect(),
-        )),
+        room_list,
     })
 }
 
@@ -1145,10 +1151,9 @@ async fn read_frame_raw(sock: &mut TcpStream) -> Vec<u8> {
 }
 
 /// §运营：HTTP 独立端口——GET /rooms 返回公开房间列表（私密前缀过滤）。
-/// #[ignore]：Windows 本地 tokio TcpStream 写响应后客户端收 0 字节（write 返回成功但数据未达，
-/// 2026-08 实测，MP 协议写正常故疑似 Windows 特定问题）——部署环境为 Linux，上线前在 Linux 验证。
+/// 回归锚点：源码 CRLF 转义曾被污染成真实换行，读循环空行检测失效导致客户端收不到
+/// （strace 实锤 sendto 174 成功但 shutdown ENOTCONN，连接已死）。此测试保底。
 #[tokio::test]
-#[ignore = "Windows write issue, verify on Linux"]
 async fn http_rooms_endpoint_with_private_filter() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mock_addr = listener.local_addr().unwrap();
@@ -1197,7 +1202,7 @@ async fn http_rooms_endpoint_with_private_filter() {
     .await;
     let _ = recv_cmd(&mut c1).await;
     let _ = recv_cmd(&mut c1).await;
-    drop(c1);
+    // 注意：不 drop c1——房主断线房间销毁（§6.5），需保持连接让房间存活
 
     // 第二个用户建私密房间（solo 前缀）
     let mut c2 = client_connect(server_addr).await;
@@ -1218,9 +1223,9 @@ async fn http_rooms_endpoint_with_private_filter() {
     .await;
     let _ = recv_cmd(&mut c2).await;
     let _ = recv_cmd(&mut c2).await;
-    drop(c2);
+    // 同上，保持 c2 连接
 
-    // HTTP 路径：同端口 GET /rooms
+    // HTTP 路径：独立端口 GET /rooms
     let mut sock = TcpStream::connect(http_addr).await.unwrap();
     sock.write_all(b"GET /rooms HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         .await
@@ -1240,10 +1245,12 @@ async fn http_rooms_endpoint_with_private_filter() {
     assert!(body.contains("pub1"), "公开房间应展示: {body}");
     assert!(!body.contains("solo-9f3a"), "私密前缀房间不应展示: {body}");
 
-    // MP 协议不受 HTTP 分流影响
+    // MP 协议路径不受 HTTP 影响（c1/c2 仍保持连接）
     let mut c3 = client_connect(server_addr).await;
     send_cmd(&mut c3, &ClientCommand::Ping).await;
     assert!(matches!(recv_cmd(&mut c3).await, ServerCommand::Pong));
+    drop(c1);
+    drop(c2);
     drop(c3);
 }
 

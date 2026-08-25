@@ -276,9 +276,12 @@ pub struct CompositeSink {
 }
 
 impl CompositeSink {
-    /// 追加一个观察者。
-    pub async fn push(&self, sink: Arc<dyn EventSink>) {
-        self.sinks.write().await.push(sink);
+    /// 构造时注入观察者列表（同步，避免 async 构造在非 async 上下文不可用）。
+    #[must_use]
+    pub fn new(sinks: Vec<Arc<dyn EventSink>>) -> Self {
+        Self {
+            sinks: tokio::sync::RwLock::new(sinks),
+        }
     }
 }
 
@@ -640,12 +643,7 @@ pub async fn http_serve(
             break;
         }
         head.extend_from_slice(&buf[..n]);
-        if head.windows(4).any(|w| {
-            w == b"
-
-"
-        }) || head.len() > 4096
-        {
+        if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 4096 {
             break;
         }
     }
@@ -672,18 +670,11 @@ pub async fn http_serve(
     };
 
     let resp = format!(
-        "HTTP/1.1 {status}
-Content-Type: {ctype}
-Content-Length: {}
-Connection: close
-
-{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(resp.as_bytes()).await?;
-    // 写完后显式 shutdown（FIN）再 drop——直接 drop 在 Windows 上可能 RST 丢弃
-    // 发送缓冲数据（Windows 实测 write 返回成功但客户端收 0 字节；Linux 正常）
-    let _ = stream.shutdown().await;
+    // 实验：write_all 后不 shutdown，直接 return（drop 由内核收尾）——测客户端能否收到
     info!("http {path} from {addr} -> {status}");
     Ok(())
 }
