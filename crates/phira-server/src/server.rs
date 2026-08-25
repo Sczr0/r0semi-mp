@@ -680,12 +680,9 @@ Connection: close
 {body}",
         body.len()
     );
-    info!(
-        "[dbg-http] resp len {} status {status} path {path}",
-        resp.len()
-    );
-    let n = stream.write(resp.as_bytes()).await?;
-    info!("[dbg-http] wrote {n}/{resp} bytes");
+    stream.write_all(resp.as_bytes()).await?;
+    // 写完后显式 shutdown（FIN）再 drop——直接 drop 在 Windows 上可能 RST 丢弃
+    // 发送缓冲数据（Windows 实测 write 返回成功但客户端收 0 字节；Linux 正常）
     let _ = stream.shutdown().await;
     info!("http {path} from {addr} -> {status}");
     Ok(())
