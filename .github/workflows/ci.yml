@@ -5,6 +5,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  # 手动触发（兜底）：GitHub Actions 页面 → Actions → CI → Run workflow，或 `gh workflow run CI`。
+  # 触发时 GitHub 自带分支选择器（UI 下拉 / `--ref`），checkout 自动校验所选分支（GITHUB_REF）。
+  # 用途：若 push 推送后未自动触发（webhook/配额问题），可手动补跑；release job 仍按 `if: master` 生效。
+  workflow_dispatch:
 
 jobs:
   check:
