@@ -373,6 +373,29 @@ async fn register_keeps_name() {
     assert_eq!(registry.name_of(99), None);
 }
 
+/// ISSUE-0012（方案 A）：`evict_name` 淘汰昵称但不触碰 epoch——
+/// 用户彻底离线后重连，epoch 继续 +1（单调不回收），昵称重新注入。
+/// 且淘汰后 `current_epoch` 仍可查（僵尸连接校验语义不因删除而失效）。
+#[tokio::test]
+async fn evict_name_keeps_monotonic_epoch() {
+    let registry = phira_core::lifecycle::SessionRegistry::new();
+    let e1 = registry.register(1, "alice".to_owned());
+    assert_eq!(e1, 1);
+    assert_eq!(registry.name_of(1).as_deref(), Some("alice"));
+
+    // 用户彻底离线（dangle 到期）→ 淘汰昵称
+    registry.evict_name(1);
+    assert_eq!(registry.name_of(1), None, "昵称应被淘汰");
+    // 但 epoch 保留（单调不变量），ISSUE-0009 校验读入口不失效
+    assert_eq!(registry.current_epoch(1), Some(1), "epoch 保留");
+
+    // 同用户重连：epoch 继续 +1（不回退），昵称重新注入
+    let e2 = registry.register(1, "alice2".to_owned());
+    assert_eq!(e2, 2, "epoch 单调递增，不回退");
+    assert_eq!(registry.name_of(1).as_deref(), Some("alice2"), "昵称重注");
+    assert_eq!(registry.current_epoch(1), Some(2));
+}
+
 // —— ISSUE-0001 修复：幽灵座位重放（§4.9-3 第四竞态）——
 
 /// 慢入房 actor：JoinRoom 处理时 sleep，拉大"增量未应用"窗口（幽灵座位竞态模拟）。

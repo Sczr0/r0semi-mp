@@ -163,10 +163,11 @@ async fn memory_accounting_grows_on_charge_and_drains_on_close() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
+    // 用 Touches（热路径不限速）而非 Chat（D1 已限速）——BigFrameActor 任意命令都返回大帧
     for _ in 0..3 {
         client
-            .write_all(&client_frame(&ClientCommand::Chat {
-                message: Varchar::new("x".to_owned()).unwrap(),
+            .write_all(&client_frame(&ClientCommand::Touches {
+                frames: Arc::new(vec![]),
             }))
             .await
             .unwrap();
@@ -202,10 +203,12 @@ async fn per_conn_memory_over_limit_kicks_client() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     // 投递 ~20MiB（> PER_CONN_MEM_LIMIT=8MiB）——客户端只写不读，队列积压。
     // 20 帧留消费余量：即使写任务消费一半仍超 8MiB 阈值（防并行负载下 flaky）。
-    for i in 0..20 {
+    // 用 Touches（热路径不限速，rate_limit 返回 None）而非 Chat（D1 已限速 2/s）——
+    // BigFrameActor 对任何命令都返回大帧，Touches 足够触发记账且不受限。
+    for _ in 0..20 {
         client
-            .write_all(&client_frame(&ClientCommand::Chat {
-                message: Varchar::new(format!("flood-{i}")).unwrap(),
+            .write_all(&client_frame(&ClientCommand::Touches {
+                frames: Arc::new(vec![]),
             }))
             .await
             .unwrap();

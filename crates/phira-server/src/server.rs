@@ -585,7 +585,8 @@ impl Default for EncodeCache {
 /// - `CreateRoom`：spawn actor + channel（最贵）→ 1/s
 /// - `JoinRoom`：入房流程 + 广播 → 5/s
 /// - `SelectChart`/`Played`：回源官方 API（配额宝贵）→ 5/s
-/// - 热路径（Touches/Judges）不限（靠 DropIfFull + 帧上限）；低频命令（Chat/Ready/...）不限
+/// - `Chat`：高频滥用（刷屏/垃圾消息，对客户端可感知且易被当作攻击面）→ 2/s（D1 技术债）
+/// - 热路径（Touches/Judges）不限（靠 DropIfFull + 帧上限）
 ///
 /// 注：间隔/白名单是 v1 常量（可参数化进 config）；热路径滥用靠队列 DropIfFull + 帧上限兜底。
 const fn rate_limit(cmd: &ClientCommand) -> Option<(&'static str, Duration)> {
@@ -594,6 +595,7 @@ const fn rate_limit(cmd: &ClientCommand) -> Option<(&'static str, Duration)> {
         ClientCommand::JoinRoom { .. } => Some(("join_room", Duration::from_millis(200))),
         ClientCommand::SelectChart { .. } => Some(("select_chart", Duration::from_millis(200))),
         ClientCommand::Played { .. } => Some(("played", Duration::from_millis(200))),
+        ClientCommand::Chat { .. } => Some(("chat", Duration::from_millis(500))),
         _ => None,
     }
 }
@@ -1500,5 +1502,31 @@ mod tests {
         let second = cache.get_or_encode(addr, Box::new(Arc::clone(&frames)), || vec![0x22]);
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(&*second, &[0x11]);
+    }
+
+    /// D1（技术债）：Chat 加入限速白名单（2/s），热路径 Touches/Judges 仍不限。
+    #[test]
+    fn rate_limit_covers_chat_but_not_hot_path() {
+        let chat = ClientCommand::Chat {
+            message: phira_api::Varchar::new("hi".to_owned()).unwrap(),
+        };
+        // Chat 受限：键 chat，间隔 500ms（2/s）
+        let (key, interval) = rate_limit(&chat).expect("Chat 应入限速白名单");
+        assert_eq!(key, "chat");
+        assert_eq!(interval, Duration::from_millis(500));
+
+        // 热路径 Touches/Judges 不受限（靠 DropIfFull + 帧上限兜底）
+        let touches = ClientCommand::Touches {
+            frames: Arc::new(vec![]),
+        };
+        let judges = ClientCommand::Judges {
+            judges: Arc::new(vec![]),
+        };
+        assert!(rate_limit(&touches).is_none(), "Touches 不应限速");
+        assert!(rate_limit(&judges).is_none(), "Judges 不应限速");
+
+        // 现有受限命令仍覆盖
+        assert!(rate_limit(&ClientCommand::Ping).is_none(), "Ping 不限速");
+        assert!(rate_limit(&ClientCommand::Ready).is_none(), "Ready 不限速");
     }
 }

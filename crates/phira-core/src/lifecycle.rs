@@ -42,16 +42,23 @@ const ROUTE_REPLAY_DELAY: Duration = Duration::from_millis(20);
 ///
 /// 独立于任务（server 侧 `register` 与任务侧 `is_current` 并发访问）——
 /// 用 `std::sync::Mutex`（临界区极短，无 await）。
-/// 昵称存这里：`CreateRoom`/`JoinRoom` 派发时需要（§6.6 表 2），
-/// 避免 impl 猜名字 / core 另持影子状态。
+///
+/// ISSUE-0012（方案 A）：拆成两张表——`epochs`（**永不删除**，8B/用户，留作单调纪元
+/// 不变量）与 `names`（可淘汰，仅在用户彻底离线时移除）。昵称只在
+/// `CreateRoom`/`JoinRoom` 派发时需要（§6.6 表 2），那时用户必然已重新鉴权注入 name；
+/// 而 epoch 必须单调递增不回收，否则重连回退可能撞上遗留僵尸连接复活 ISSUE-0009。
 pub struct SessionRegistry {
-    inner: Mutex<HashMap<i32, (u64, String)>>,
+    /// 用户当前纪元（单调递增，永不删除）：`user_id → epoch`。
+    epochs: Mutex<HashMap<i32, u64>>,
+    /// 用户昵称（可淘汰）：`user_id → name`；离线超时后移除，重连时由 authenticate 重注。
+    names: Mutex<HashMap<i32, String>>,
 }
 
 impl Default for SessionRegistry {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            epochs: Mutex::new(HashMap::new()),
+            names: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -66,15 +73,20 @@ impl SessionRegistry {
     /// 用户连接建立：分配新纪元（旧纪元 + 1）并替换，记录昵称。
     ///
     /// 同 id 重连 = 再次调用 → epoch+1（§6.5-19 替换会话语义）。
-    /// 由 server 鉴权成功后调用。
+    /// 由 server 鉴权成功后调用。epoch 单调保留（不删除）；name 注入（覆盖旧值）。
     #[must_use]
     pub fn register(&self, user_id: i32, name: String) -> u64 {
-        let mut m = self
-            .inner
+        let mut epochs = self
+            .epochs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let epoch = m.get(&user_id).map_or(0, |(e, _)| *e) + 1;
-        m.insert(user_id, (epoch, name));
+        let epoch = epochs.get(&user_id).copied().unwrap_or(0) + 1;
+        epochs.insert(user_id, epoch);
+        // name 独立表：覆盖注入（旧的若已被淘汰则重建，未淘汰则替换）
+        self.names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(user_id, name);
         epoch
     }
 
@@ -83,29 +95,39 @@ impl SessionRegistry {
     /// `None` = 从未注册（理论不可达——活着且已鉴权的连接必然已 `register`）。
     #[must_use]
     pub fn current_epoch(&self, user_id: i32) -> Option<u64> {
-        self.inner
+        self.epochs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&user_id)
-            .map(|(e, _)| *e)
+            .copied()
     }
 
     /// 用户当前昵称（CreateRoom/JoinRoom 派发填充，§6.6 表 2）。
+    ///
+    /// `None` = 昵称已被淘汰（用户离线超时）——`impl` 侧用 `unwrap_or_default()` 兜底；
+    /// 但需要昵称的 CreateRoom/JoinRoom 派发只会发生在在线会话上，届时 name 已注入。
     pub fn name_of(&self, user_id: i32) -> Option<String> {
-        self.inner
+        self.names
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&user_id)
-            .map(|(_, n)| n.clone())
+            .cloned()
     }
 
     /// `epoch` 是否为该用户当前纪元（事实/定时器有效性校验，§4.9-3）。
     fn is_current(&self, user_id: i32, epoch: u64) -> bool {
-        self.inner
+        self.current_epoch(user_id) == Some(epoch)
+    }
+
+    /// 淘汰昵称（ISSUE-0012：用户彻底离线且不在任何房间时调用）。
+    ///
+    /// 只删 `names` 表（释放字符串驻留），**不触碰 `epochs`**——epoch 必须单调保留，
+    /// 否则重连回退会撞上遗留僵尸连接复活 ISSUE-0009。
+    pub fn evict_name(&self, user_id: i32) {
+        self.names
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&user_id)
-            .is_some_and(|(e, _)| *e == epoch)
+            .remove(&user_id);
     }
 }
 
@@ -208,6 +230,9 @@ impl LifecycleTask {
                 }
                 self.dispatch(user_id, RoomCommand::UserDangleExpired { user_id })
                     .await;
+                // ISSUE-0012：用户彻底离线（重连窗口到期）→ 淘汰昵称（释放字符串驻留），
+                // 但保留下 epochs（单调不变量，防 ISSUE-0009 复活）。
+                self.registry.evict_name(user_id);
             }
         }
     }
