@@ -41,13 +41,14 @@ Rust 分配器可复用同尺寸类释放块的地址。地址复用 = 新事件
 
 | # | 欠账 | 证据 | 影响 | 参照 |
 |---|---|---|---|---|
-| B1 | **Tick 是空壳**，无任何时间驱动玩法 | lib.rs:851 "v1 无玩法倒计时…占位（§4.6）"；但 bus.rs 队列策略已分类 `Tick→DropIfFull` | 无倒计时/超时强开，对局或无限挂起 | gooophira ready 倒计时（60s 强制开赛，未准备 Aborted，18 测试） |
-| B2 | **lang 字段躺契约里没用**；业务错误全英文 | `UserIdentity.lang` 存在（auth.rs）；错误 `"already uploaded"`/`"game is ongoing"` 英文硬编码 | 中文玩家看英文报错 | 原版 Fluent 三语（en/zh-CN/zh-TW，per-user 作用域） |
+| B1 | **Tick 是空壳**（✅ 已解决 2026-08——WaitForReady 60s 倒计时，契约测试 ready_countdown_tick 三场景） | lib.rs:851 "v1 无玩法倒计时…占位（§4.6）"；但 bus.rs 队列策略已分类 `Tick→DropIfFull` | 无倒计时/超时强开，对局或无限挂起 | gooophira ready 倒计时（60s 强制开赛，未准备 Aborted，18 测试） |
+| B2 | **lang 字段躺契约里没用**（✅ 已解决 2026-08——server 出口按 lang 本地化，l10n 静态表零依赖） | `UserIdentity.lang` 存在（auth.rs）；错误 `"already uploaded"`/`"game is ongoing"` 英文硬编码 | 中文玩家看英文报错 | 原版 Fluent 三语（en/zh-CN/zh-TW，per-user 作用域） |
 | B3 | **Metrics 收集了但不暴露**（✅ 已解决 2026-08） | bus.rs `Metrics::snapshot()`（含 calls/ok/business/internal），但 /healthz 仅 conn_count/rooms/version（server.rs 1121） | 可观测性数据进黑洞 | 一小时可暴露 |
 | B4 | ISSUE-0007 game_time 缺失 | 重连恢复"玩家打到哪"无进度维度 | 断线恢复体验缺一维 | 原版 `NEG_INFINITY` 哨兵 + AtomicU32 |
 | B5 | ISSUE-0010 CreateRoom 非幂等 | 响应丢失重试 → RoomIdOccupied + 孤儿房 | 弱网玩家建房失败率上升 | 协议级限制，已留档 |
 
 B1 的修复与架构最贴合：Tick 插座已预埋，只需生命周期任务周期发 `Tick{now}` + 房间状态机加倒计时字段。B2/B3 是全场最低成本高收益项。
+> **修复注记（2026-08）**：B1 已通电（WaitForReady 倒计时 + 超时驱逐复用 evict）；B2 已落地（对照原版 Fluent 三语语义，但用零依赖静态文案表实现于协议出口，lang 存 SendSlot 随会话生灭）；B3 同日完成（/healthz 暴露 Metrics）。
 
 ---
 
@@ -104,7 +105,7 @@ D2 在协议 v2 到来时会被动暴露；D3 的正确解法不是抄传闻，�
 |---|---|---|
 | **立即**（天级） | ✅ A1 ABA 修复（ISSUE-0011）· ✅ B3 Metrics 暴露 · ✅ D2 版本握手校验 · ⬜ client-conformance 崩溃猎手测试 | 消灭全部已知正确性地雷 |
 | **短期**（周级） | 绿档剩余：B2 i18n · 谱面反作弊 · 观战聚合缓冲 · ✅ D1 Chat 限速 · ✅ C2 Registry 拆表（ISSUE-0012） | 每项带契约测试落地 |
-| **中期**（月级） | B1 Tick 通电（倒计时）· 一致性断言库 + 漂移哨兵 · 管理 API | 玩家可感知 + 护城河成形 |
+| **中期**（月级） | ✅ B1 Tick 通电（倒计时，提前完成）· 一致性断言库 + 漂移哨兵 · 管理 API | 玩家可感知 + 护城河成形 |
 | **择机** | A2 回源出队 · C1 server.rs 拆分 · 回放录制（Store 接口） | 绑定到相关功能进场时顺手做 |
 | **远景** | Store 持久化 · 协议 v2 预案 · 多实例（仅当需求出现） | 文档立 flag，不动代码 |
 
