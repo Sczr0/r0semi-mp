@@ -130,7 +130,8 @@ async fn setup(
     .await
     .unwrap();
 
-    let (task, registry, fact_tx) = LifecycleTask::new(bus.clone(), window);
+    let (task, registry, fact_tx) =
+        LifecycleTask::new(bus.clone(), window, Duration::from_millis(50));
     tokio::spawn(task.run());
     (bus, registry, fact_tx, received)
 }
@@ -473,7 +474,11 @@ async fn ghost_seat_replay_recovers_missed_route() {
         factory as Arc<dyn RoomFactory>,
         Arc::new(RoomConfig { monitors: vec![] }),
     );
-    let (task, registry, fact_tx) = LifecycleTask::new(bus.clone(), Duration::from_secs(10));
+    let (task, registry, fact_tx) = LifecycleTask::new(
+        bus.clone(),
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+    );
     tokio::spawn(task.run());
 
     // 用户 1 建房（路由注册 host=1）
@@ -531,7 +536,11 @@ async fn replay_gives_up_when_user_never_in_room() {
         factory as Arc<dyn RoomFactory>,
         Arc::new(RoomConfig { monitors: vec![] }),
     );
-    let (task, registry, fact_tx) = LifecycleTask::new(bus.clone(), Duration::from_secs(10));
+    let (task, registry, fact_tx) = LifecycleTask::new(
+        bus.clone(),
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+    );
     tokio::spawn(task.run());
 
     let e3 = registry.register(3, "u3".to_owned());

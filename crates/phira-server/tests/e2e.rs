@@ -106,7 +106,11 @@ fn setup_ctx_custom(
         Arc::clone(&config),
     );
 
-    let (task, registry, fact_tx) = LifecycleTask::new(bus.clone(), Duration::from_secs(10));
+    let (task, registry, fact_tx) = LifecycleTask::new(
+        bus.clone(),
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+    );
     tokio::spawn(task.run());
 
     let sink = Arc::new(SessionSink::new());

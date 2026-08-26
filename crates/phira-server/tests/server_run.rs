@@ -54,7 +54,11 @@ fn test_ctx() -> ConnContext {
         factory as Arc<dyn RoomFactory>,
         Arc::new(RoomConfig::default()),
     );
-    let (task, registry, fact_tx) = LifecycleTask::new(bus.clone(), Duration::from_secs(10));
+    let (task, registry, fact_tx) = LifecycleTask::new(
+        bus.clone(),
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+    );
     tokio::spawn(task.run());
     let sink = Arc::new(SessionSink::new());
     bus.attach_sink(Arc::clone(&sink) as Arc<dyn phira_core::EventSink>);

@@ -184,6 +184,20 @@ impl Bus {
         self.inner.routes.read().await.get(&user_id).cloned()
     }
 
+    /// 全部活跃房间（去重）。周期心跳广播 `Tick` 用（§4.6 单一生产者 = 生命周期任务）。
+    ///
+    /// 空”幽灵路由”（用户已离开但表未清的项去重后无房间名册可列）不会出现：
+    /// 路由表以 in-room 用户为源，值域即房间集合。
+    pub async fn active_rooms(&self) -> Vec<RoomId> {
+        let routes = self.inner.routes.read().await;
+        routes
+            .values()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// 派发客户端命令（session 收包解码后调用）。
     ///
     /// # Errors

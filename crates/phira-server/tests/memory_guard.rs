@@ -63,6 +63,11 @@ impl phira_api::RoomActor for BigFrameActor {
         _ctx: CmdCtx,
         cmd: RoomCommand,
     ) -> (Option<RoomResponse>, Vec<RoomEvent>) {
+        // B6/B1：心跳 Tick 不产生大帧（真实 impl 处理 Tick 成本 ≈0），
+        // 否则周期心跳会把内存记账测试的输入变成不可控的持续洪峰。
+        if matches!(cmd, RoomCommand::Tick { .. }) {
+            return (None, Vec::new());
+        }
         let mut events = vec![big_touches()];
         if matches!(cmd, RoomCommand::CreateRoom { .. }) {
             events.push(RoomEvent::RoomCreated {
@@ -88,7 +93,11 @@ fn test_ctx() -> Arc<ConnContext> {
         factory as Arc<dyn RoomFactory>,
         Arc::new(RoomConfig::default()),
     );
-    let (task, registry, fact_tx) = LifecycleTask::new(bus.clone(), Duration::from_secs(10));
+    let (task, registry, fact_tx) = LifecycleTask::new(
+        bus.clone(),
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+    );
     tokio::spawn(task.run());
     let sink = Arc::new(SessionSink::new());
     bus.attach_sink(Arc::clone(&sink) as Arc<dyn phira_core::EventSink>);

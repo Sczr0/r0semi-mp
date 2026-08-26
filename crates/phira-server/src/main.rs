@@ -5,6 +5,7 @@
 //! 换实现 = 组合根换工厂（§3.2：灰度已降级为运维选项，项目内零灰度代码）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use phira_api::{ApiClient, RandomSource, RoomConfig, RoomDeps, RoomFactory};
@@ -45,8 +46,11 @@ async fn main() -> Result<()> {
     );
 
     // 用户生命周期（§4.9-3）：单一生产者任务 + 注册表（重连窗口 = yml `reconnect_window`，§6.5-21）
-    let (lifecycle_task, registry, fact_tx) =
-        LifecycleTask::new(bus.clone(), config.reconnect_window);
+    let (lifecycle_task, registry, fact_tx) = LifecycleTask::new(
+        bus.clone(),
+        config.reconnect_window,
+        Duration::from_millis(50),
+    );
     tokio::spawn(lifecycle_task.run());
 
     // 事件投递（§6.6 表 2）：user → 会话写通道 + 房间列表观察者（§7.3 组合）

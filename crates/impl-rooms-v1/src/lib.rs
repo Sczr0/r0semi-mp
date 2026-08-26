@@ -12,10 +12,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use std::sync::Arc;
+
 use phira_api::{
-    ApiError, Chart, ClientRoomState, CmdCtx, JoinRoomResponse, Origin, Record, RoomActor,
-    RoomCommand, RoomConfig, RoomDeps, RoomError, RoomErrorCode, RoomEvent, RoomFactory, RoomId,
-    RoomResponse, RoomState, Targets, TimeMs, UserInfo,
+    ApiError, Chart, ClientRoomState, CmdCtx, JoinRoomResponse, JudgeEvent, Origin, Record,
+    RoomActor, RoomCommand, RoomConfig, RoomDeps, RoomError, RoomErrorCode, RoomEvent, RoomFactory,
+    RoomId, RoomResponse, RoomState, Targets, TimeMs, TouchFrame, UserInfo,
 };
 
 /// 房间容量：玩家上限 8 人（§6.5-1）；monitor 不占名额、不限数量。
@@ -70,6 +72,11 @@ pub struct RoomV1 {
     /// 断线未驱逐的玩家（§4.6：impl 只记状态，计时归 core 生命周期任务）。
     absent: HashSet<i32>,
     chart: Option<Chart>,
+    /// 观战聚合缓冲（B6 对齐 gooophira MonitorBuffer）：live 下攒待转播的触摸帧，
+    /// Tick 到达按 player 合并产出 `RelayTouches`（§6.5-17；键 = 发帧玩家）。
+    touch_buf: HashMap<i32, Vec<Arc<Vec<TouchFrame>>>>,
+    /// 判定事件同款聚合缓冲。
+    judge_buf: HashMap<i32, Vec<Arc<Vec<JudgeEvent>>>>,
 }
 
 impl RoomV1 {
@@ -88,6 +95,8 @@ impl RoomV1 {
             user_order: Vec::new(),
             absent: HashSet::new(),
             chart: None,
+            touch_buf: HashMap::new(),
+            judge_buf: HashMap::new(),
         }
     }
 
@@ -191,9 +200,16 @@ impl RoomV1 {
         self.monitors.remove(&user_id);
         self.user_order.retain(|id| *id != user_id);
         self.absent.remove(&user_id);
+        // B6：其未 flush 的触摸/判定残帧不应再播出
+        self.drop_relay_bufs_of(user_id);
 
         if self.is_host(user_id) {
             events.extend(self.migrate_host(user_id, false));
+        }
+        // B6 发现的遗留 bug：live 只在 monitor 加入时置 true、从不回落。
+        // 观战者全走后必须复位，否则 GetClientState.live 与转发路径长期虚热。
+        if self.monitors.is_empty() {
+            self.live = false;
         }
         if self.users.is_empty() {
             // 空房自毁（§6.5-6 / §4.9-9）：monitors 不阻止销毁（原版语义）
@@ -206,26 +222,25 @@ impl RoomV1 {
         events
     }
 
-    /// 玩法倒计时（B1 通电，Tick 驱动 §4.6；对照 gooophira ready 60s 强开）。
+    /// 周期心跳（B1/B6 通电，Tick 驱动 §4.6；倒计时对照 gooophira ready 60s 强开）。
     ///
-    /// - 仅 `WaitForReady` 状态消费 Tick：首个 Tick 锚定 `deadline = now + 60s`；
+    /// - **B6 flush**：先合并观战聚合缓冲产出 Relay* 事件（任何状态，缓冲空零成本）。
+    /// - **B1 倒计时**：仅 `WaitForReady` 消费：首个 Tick 锚定 deadline = now + 60s；
     ///   到期时把未 ready 者走 [`Self::evict`]（复用 UserLeft 广播/房主迁移/空房
     ///   自毁收尾），剩余全员已 ready 则顺势 StartPlaying。
-    /// - `Playing` 结算靠 Played 触发（原版同），v1 不加对局超时；
-    ///   `SelectChart` 无计时需求——两态直接无视 Tick。
+    /// - `Playing` 结算靠 Played 触发（原版同），v1 不加对局超时。
     /// - 绝对截止时刻（而非相对计数）：Tick 可丢（DropIfFull §4.9-9），丢一拍自愈。
     fn handle_tick(&mut self, now: TimeMs) -> (Option<RoomResponse>, Vec<RoomEvent>) {
         const READY_TIMEOUT_MS: TimeMs = 60_000;
-        match &mut self.state {
-            InternalState::WaitForReady { started, deadline } => {
-                let Some(d) = *deadline else {
-                    // 首拍：锚定强开时刻（进入 WaitForReady 后的下一个 Tick）
-                    *deadline = Some(now.saturating_add(READY_TIMEOUT_MS));
-                    return (None, Vec::new());
-                };
-                if now < d {
-                    return (None, Vec::new()); // 未到期
-                }
+        // B6：观战聚合 flush（优先于倒计时，产出顺序在先——触摸是更旧的输入）
+        let mut events = self.flush_relay_buffers();
+        if let InternalState::WaitForReady { started, deadline } = &mut self.state {
+            let Some(d) = *deadline else {
+                // 首拍：锚定强开时刻（进入 WaitForReady 后的下一个 Tick）
+                *deadline = Some(now.saturating_add(READY_TIMEOUT_MS));
+                return (None, events);
+            };
+            if now >= d {
                 // 到期：驱逐未 ready 者（started 外的全部在线成员）
                 let not_ready: Vec<i32> = self
                     .users
@@ -234,7 +249,6 @@ impl RoomV1 {
                     .copied()
                     .filter(|id| !started.contains(id))
                     .collect();
-                let mut events = Vec::new();
                 for id in &not_ready {
                     events.extend(self.evict(*id));
                 }
@@ -243,10 +257,58 @@ impl RoomV1 {
                 if matches!(self.state, InternalState::WaitForReady { .. }) {
                     events.extend(self.check_all_ready());
                 }
-                (None, events)
             }
-            _ => (None, Vec::new()),
         }
+        (None, events)
+    }
+
+    /// 合并并清空观战聚合缓冲，产出转播事件（B6，§6.5-17；对齐 gooophira
+    /// MonitorBuffer.Flush）。同玩家多批 frames 拼接为一条命令（协议兼容：frames
+    /// 向量拼接不改帧边界）；不同 player 分开命令（`SrvTouches.player` 语义）；
+    /// touch 先 judge 后。targets 取**当前** monitor 集（flush 时解析最准确）。
+    fn flush_relay_buffers(&mut self) -> Vec<RoomEvent> {
+        if self.touch_buf.is_empty() && self.judge_buf.is_empty() {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if self.monitors.is_empty() {
+            // 无观战者：直接丢弃（不延迟投递——积压无意义）
+            self.touch_buf.clear();
+            self.judge_buf.clear();
+            return events;
+        }
+        let targets = Targets::Specific(self.monitors.keys().copied().collect());
+        for (player, batches) in self.touch_buf.drain() {
+            let merged: Vec<TouchFrame> = batches.iter().flat_map(|b| b.iter().cloned()).collect();
+            events.push(RoomEvent::RelayTouches {
+                room_id: self.id.clone(),
+                targets: targets.clone(),
+                player,
+                frames: Arc::new(merged),
+            });
+        }
+        for (player, batches) in self.judge_buf.drain() {
+            let merged: Vec<JudgeEvent> = batches.iter().flat_map(|b| b.iter().cloned()).collect();
+            events.push(RoomEvent::RelayJudges {
+                room_id: self.id.clone(),
+                targets: targets.clone(),
+                player,
+                judges: Arc::new(merged),
+            });
+        }
+        events
+    }
+
+    /// 清理某用户的聚合缓冲残留（被驱逐时调用——其未 flush 的帧不应再播出）。
+    fn drop_relay_bufs_of(&mut self, user_id: i32) {
+        self.touch_buf.remove(&user_id);
+        self.judge_buf.remove(&user_id);
+    }
+
+    /// 对局彻底结束/流产（回 SelectChart）后的残余清理。
+    fn clear_relay_bufs(&mut self) {
+        self.touch_buf.clear();
+        self.judge_buf.clear();
     }
 
     /// 检查开局/结算（原版 check_all_ready，规则 8/11）。
@@ -285,6 +347,8 @@ impl RoomV1 {
                     }];
                     let old_host = self.host;
                     self.state = InternalState::SelectChart;
+                    // B6：对局结束，残余触摸/判定不再播出
+                    self.clear_relay_bufs();
                     if self.cycle
                         && let Some(old) = old_host
                     {
@@ -591,6 +655,8 @@ impl RoomV1 {
                 if self.is_host(user_id) {
                     // host 取消 → CancelGame + 回 SelectChart（§6.5-9）
                     self.state = InternalState::SelectChart;
+                    // B6：对局流产，残余触摸/判定不再播出
+                    self.clear_relay_bufs();
                     (
                         Some(RoomResponse::Ok),
                         vec![RoomEvent::CancelGame {
@@ -710,6 +776,8 @@ impl RoomV1 {
                     room_id: self.id.clone(),
                     user: user_id,
                 }];
+                // B6：已 abort 的玩家不再有未播出的帧
+                self.drop_relay_bufs_of(user_id);
                 events.extend(self.check_all_ready());
                 (Some(RoomResponse::Ok), events)
             }
@@ -862,40 +930,22 @@ impl RoomActor for RoomV1 {
                 let Origin::Client { user_id } = ctx.origin else {
                     return (None, Vec::new());
                 };
-                // live 时只转发给 monitor（§6.5-16）
+                // live 时只转发给 monitor（§6.5-16）。B6：不再立即产出 Relay 事件，
+                // 入聚合缓冲，Tick 到达按 player 合并 flush（高频帧零碎冲击不再直达网络）。
                 if self.live {
-                    let targets = Targets::Specific(self.monitors.keys().copied().collect());
-                    (
-                        None,
-                        vec![RoomEvent::RelayTouches {
-                            room_id: self.id.clone(),
-                            targets,
-                            player: user_id,
-                            frames,
-                        }],
-                    )
-                } else {
-                    (None, Vec::new())
+                    self.touch_buf.entry(user_id).or_default().push(frames);
                 }
+                (None, Vec::new())
             }
             RoomCommand::Judges { judges } => {
                 let Origin::Client { user_id } = ctx.origin else {
                     return (None, Vec::new());
                 };
+                // B6：同 Touches —— 聚合缓冲，Tick flush。
                 if self.live {
-                    let targets = Targets::Specific(self.monitors.keys().copied().collect());
-                    (
-                        None,
-                        vec![RoomEvent::RelayJudges {
-                            room_id: self.id.clone(),
-                            targets,
-                            player: user_id,
-                            judges,
-                        }],
-                    )
-                } else {
-                    (None, Vec::new())
+                    self.judge_buf.entry(user_id).or_default().push(judges);
                 }
+                (None, Vec::new())
             }
             RoomCommand::Tick { now } => self.handle_tick(now),
             RoomCommand::UserDisconnected { user_id, .. } => self.handle_user_disconnected(user_id),

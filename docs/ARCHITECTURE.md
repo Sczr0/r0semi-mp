@@ -418,7 +418,7 @@ async fn main() -> Result<()> {
 
 分工：
 
-- **core（柜台）拥有时间与连接生命周期**：session 任务检测断线；**用户生命周期任务（单一生产者）**按序派发 `UserDisconnected{user, epoch}` →（`UserReconnected{user, epoch}` | `UserDangleExpired{user}`）；定时器按固定节拍（如 500ms）派发 `Tick { now: TimeMs }` 给活跃房间
+- **core（柜台）拥有时间与连接生命周期**：session 任务检测断线；**用户生命周期任务（单一生产者）**按序派发 `UserDisconnected{user, epoch}` →（`UserReconnected{user, epoch}` | `UserDangleExpired{user}`）；定时器按固定节拍派发 `Tick { now: TimeMs }` 给活跃房间。**兑现注记（2026-08，B1/B6 通电）**：生命周期任务 `run()` 以 `tokio::select!` 挂定时器（`MissedTickBehavior::Skip` 不追帧），每拍向全部活跃房间广播 `Tick`（`Bus::active_rooms()` 去重路由值域），间隔生产 50ms（对齐 gooophira MonitorBuffer 慢档刷新窗；测试可注入）、`now = UNIX_EPOCH 毫秒；此前仅约定未实现，`WaitForReady` 倒计时与观战聚合都因缺心跳而休眠。
 - **impl（货物）拥有游戏语义**：`UserDisconnected` 标记缺席、`UserReconnected` 恢复座位、`UserDangleExpired` 执行驱逐（踢人/迁移房主/广播）；打歌倒计时由 `Tick` 推进。**impl 不再自己计时**——计时归 core 生命周期任务（§4.9）
 - 系统命令没有要回话的客户端 → 返回值是 `Option<RoomResponse>`（§4.4 已改）
 
@@ -718,10 +718,10 @@ Playing ──全员 Played/Abort──► SelectChart（cycle 则顺延换房�
 
 **观战转播（性能热点）**
 16. live 模式下收到 `Touches`/`Judges` → **只转发给 monitor**（不广播给玩家）
-17. 转发实现必须是"序列化一次 + 共享缓冲"（零拷贝），禁止逐接收者克隆；共享缓冲用 `bytes::Bytes`（O(1) 切片，见 §4.8）；**慢消费策略：monitor 队列满则丢最旧帧（丢旧保新），绝不阻塞房间、绝不无限积压**（§10.4，评审 §7）；**热路径机制（方案 A：结构化转发，编解码归 core）**：core 解码一次（校验）→ 命令侧 `Touches{frames}`/`Judges{judges}`（§4.4）→ actor 查 live、计算 `targets = Specific(monitor_ids)` → 返回结构化事件 `RelayTouches`/`RelayJudges`（§4.4）→ **core 用它的编码器把 ServerCommand 编码一次**为 `Bytes` → 共享给所有 monitor。总编解码：**每命令 1 解 + 1 编，每接收者 0 次**；impl 永不碰协议编码（§4.3-3 成立，评审 §8 一-1）。**兑现注记（2026-08，ADR-0009）**：热路径编码一次已兑现（方案 2）——`EncodeCache` 按帧 Arc 指针缓存编码载荷（`Outbound::Encoded` 直写共享），同一帧 N 个 monitor 只编码一次；非热路径仍每接收者编码（低频可接受）；泛化触发条件 = 第二个大扇出广播场景（原则 5）
+17. 转发实现必须是"序列化一次 + 共享缓冲"（零拷贝），禁止逐接收者克隆；共享缓冲用 `bytes::Bytes`（O(1) 切片，见 §4.8）；**慢消费策略：monitor 队列满则丢最旧帧（丢旧保新），绝不阻塞房间、绝不无限积压**（§10.4，评审 §7）；**热路径机制（方案 A：结构化转发，编解码归 core）**：core 解码一次（校验）→ 命令侧 `Touches{frames}`/`Judges{judges}`（§4.4）→ actor 查 live、计算 `targets = Specific(monitor_ids)` → 返回结构化事件 `RelayTouches`/`RelayJudges`（§4.4）→ **core 用它的编码器把 ServerCommand 编码一次**为 `Bytes` → 共享给所有 monitor。总编解码：**每命令 1 解 + 1 编，每接收者 0 次**；impl 永不碰协议编码（§4.3-3 成立，评审 §8 一-1）。**兑现注记（2026-08，ADR-0009）**：热路径编码一次已兑现（方案 2）——`EncodeCache` 按帧 Arc 指针缓存编码载荷（`Outbound::Encoded` 直写共享），同一帧 N 个 monitor 只编码一次；非热路径仍每接收者编码（低频可接受）；泛化触发条件 = 第二个大扇出广播场景（原则 5）。**B6 观战聚合缓冲（2026-08 兑现，对齐 gooophira AggregatingMonitorBuffer）**：朴素客户端可 60Hz 单帧轰炸 Touches——8 玩家即 ~480 cmd/s/房的小包洪峰；V1 的 actor 在 live 下把入站的 Touch/Judge 帧按 player 存进聚合缓冲（`touch_buf`/`judge_buf`），**Tick 心跳（50ms，§4.6 兑现注记）到达时才 flush**：同玩家多批帧拼接为一条合并命令（协议兼容：frames 向量拼接不改帧边界）、不同 player 分命令、touch 先 judge 后、targets 取 flush 当时的 monitor 集（比命令时点更准），合并结果的新 Arc 进 EncodeCache → **每窗口每 player 编码一次**。窗口内可观察顺序漂移（Touches 可能晚于同窗其它事件到达 monitor）是有意的契约行为：触摸流每帧独立自愈，与 §10.4 丢新哲学一致（gooophira 同款）。离开/abort/结算/host 取消时清相应缓冲——残帧不跨局播出；无 monitor 时直接丢弃不积压
 
 **时间驱动逻辑（§4.6）**
-18. 掉线超时/倒计时等时间逻辑由柜台 `Tick`/`UserDisconnected` 驱动；**impl 内禁止后台任务直接广播**
+18. 掉线超时/倒计时等时间逻辑由柜台 `Tick`/`UserDisconnected` 驱动；**impl 内禁止后台任务直接广播**。**B1 玩法倒计时（2026-08 兑现，对照 gooophira ready 60s 强开）**：`WaitForReady` 态由首个 `Tick` 锚定 `deadline = now + 60s`（进入态时 impl 无时钟可取——`Option<TimeMs>` 补锚）；到期把未 ready 者（users+monitors）走既有 evict（复用 UserLeft/房主迁移/空房自毁收尾），剩余全员已 ready 则顺势 StartPlaying；`Playing` 结算仍靠 Played（原版同），不加对局超时；绝对截止时刻而非相对计数——Tick 可丢，丢一拍自愈
 
 **断线与重连（规则 19-23）**
 19. **身份与重连**：用户身份 = token 解析出的 user id；同 id 再次鉴权 = 重连 → 复用用户对象、**替换会话（epoch+1，关闭旧 TCP、取消旧会话任务）**（core 职责，§4.9-3）

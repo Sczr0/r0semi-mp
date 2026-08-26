@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use phira_api::{
     ApiClient, ApiError, Chart, ClientRoomState, CmdCtx, Origin, RandomSource, Record, RoomActor,
     RoomCommand, RoomConfig, RoomDeps, RoomError, RoomErrorCode, RoomEvent, RoomFactory, RoomId,
-    RoomResponse, RoomState, Targets, UserInfo, Varchar,
+    RoomResponse, RoomState, Targets, TouchFrame, UserInfo, Varchar,
 };
 
 // —— 测试替身（§4.9-6 依赖注入的兑现） ——
@@ -183,6 +183,7 @@ pub async fn room_contract_suite<F: RoomFactory>(factory: &F) {
     playing_leave_triggers_settle(factory).await;
     join_during_game_rejected(factory).await;
     ready_countdown_tick(factory).await;
+    relay_aggregation_buffer(factory).await;
 }
 
 /// 建房/入房/容量（§6.5-1/3/4/6/27）
@@ -679,18 +680,42 @@ async fn monitor_and_relay<F: RoomFactory>(factory: &F) {
         )
         .await;
     assert!(resp.is_none(), "Touches 无回话");
-    assert_eq!(events.len(), 1, "live 下应转发: {events:?}");
+    // B6 观战聚合：入缓冲不立即转播（Tick 驱动 flush）
+    assert!(events.is_empty(), "应先入聚合缓冲: {events:?}");
+
+    // 同一玩家两批帧 → 一次 Tick flush 合并为一条 RelayTouches（B6 对齐 gooophira）
+    let (_, _) = room
+        .handle(
+            ctx(1),
+            RoomCommand::Touches {
+                frames: Arc::new(vec![TouchFrame {
+                    time: 0.5,
+                    points: Vec::new(),
+                }]),
+            },
+        )
+        .await;
+    let (resp, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 1_000 })
+        .await;
+    assert!(resp.is_none());
+    assert_eq!(events.len(), 1, "flush 应产出合并后的单条转播: {events:?}");
     match &events[0] {
         RoomEvent::RelayTouches {
-            targets, player, ..
+            targets,
+            player,
+            frames,
+            ..
         } => {
             assert_eq!(player, &1);
             assert_eq!(targets, &Targets::Specific(vec![9]), "只投 monitor");
+            // 空 frames 批 + 1 帧 = 合并后 1 帧
+            assert_eq!(frames.len(), 1, "同玩家多批帧应拼接合并");
         }
         other => panic!("期望 RelayTouches: {other:?}"),
     }
 
-    // —— 非 live 下 Touches 不转发 ——
+    // —— 非 live 下 Touches 不转发，也不留缓冲残留 ——
     let mut room = factory.create(rid());
     create_room(&mut room).await;
     let (_, events) = room
@@ -702,6 +727,10 @@ async fn monitor_and_relay<F: RoomFactory>(factory: &F) {
         )
         .await;
     assert!(events.is_empty(), "非 live 不转发: {events:?}");
+    let (_, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 2_000 })
+        .await;
+    assert!(events.is_empty(), "非 live 下 Tick 也无产出: {events:?}");
 
     // —— 8 人上限（§6.5-1）——
     let mut room = factory.create(rid());
@@ -790,7 +819,7 @@ async fn config_and_client_state<F: RoomFactory>(factory: &F) {
     );
     assert!(!state.live, "monitor 未加入时 live 应为 false");
 
-    // —— Playing 态 Tick 无副作用（B1：仅 WaitForReady 消费 Tick；结算靠 Played §4.6）——
+    // —— Playing 态且聚合缓冲空时 Tick 无产出（B1 倒计时只挂 WaitForReady；B6 flush 空转）——
     let (resp, events) = room.handle(sys_ctx(), RoomCommand::Tick { now: 999 }).await;
     assert!(resp.is_none());
     assert!(events.is_empty());
@@ -1246,5 +1275,213 @@ async fn ready_countdown_tick<F: RoomFactory>(factory: &F) {
             .iter()
             .any(|e| matches!(e, RoomEvent::UserLeft { user: 9, .. })),
         "未 ready 的 monitor 也应被驱逐: {events:?}"
+    );
+}
+
+/// B6 观战聚合缓冲（§6.5-17，对齐 gooophira AggregatingMonitorBuffer）：
+///
+/// 1. 不同玩家分命令（`SrvTouches.player` 语义——不跨玩家合并）
+/// 2. Judges 同款聚合并与 Touches 分离（touch 先 judge 后）
+/// 3. abort 玩家的残余帧不再播出（对局内离开即断流）
+/// 4. monitor 全部离开 → 缓冲直接丢弃（Tick 无产出、无积压）
+#[allow(clippy::too_many_lines)] // 四场景脚本长是验收需求
+async fn relay_aggregation_buffer<F: RoomFactory>(factory: &F) {
+    let frame = |t: f32| TouchFrame {
+        time: t,
+        points: Vec::new(),
+    };
+    // —— 场景 1+2：分玩家分命令 + judges 聚合 ——
+    let mut room = factory.create(rid());
+    room.handle(
+        sys_ctx(),
+        RoomCommand::UpdateConfig {
+            config: Arc::new(RoomConfig { monitors: vec![9] }),
+        },
+    )
+    .await;
+    create_room(&mut room).await;
+    for uid in [2, 3] {
+        room.handle(
+            ctx(uid),
+            RoomCommand::JoinRoom {
+                id: rid(),
+                monitor: false,
+                name: format!("user{uid}"),
+            },
+        )
+        .await;
+    }
+    room.handle(
+        ctx(9),
+        RoomCommand::JoinRoom {
+            id: rid(),
+            monitor: true,
+            name: "mon".to_owned(),
+        },
+    )
+    .await;
+    // 进入 live 对局：选图 + RequestStart + 全员 ready（玩家 + monitor 同口径）
+    room.handle(ctx(1), RoomCommand::SelectChart { id: 1 })
+        .await;
+    let (_, _) = room.handle(ctx(1), RoomCommand::RequestStart).await;
+    let (_, _) = room.handle(ctx(2), RoomCommand::Ready).await;
+    let (_, _) = room.handle(ctx(3), RoomCommand::Ready).await;
+    let (_, events) = room.handle(ctx(9), RoomCommand::Ready).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::StartPlaying { .. })),
+        "全员 ready 应开局"
+    );
+
+    // 两玩家交错发帧；player2 同时发判定
+    let (_, _) = room
+        .handle(
+            ctx(2),
+            RoomCommand::Touches {
+                frames: Arc::new(vec![frame(1.0)]),
+            },
+        )
+        .await;
+    let (_, _) = room
+        .handle(
+            ctx(3),
+            RoomCommand::Touches {
+                frames: Arc::new(vec![frame(2.0), frame(2.5)]),
+            },
+        )
+        .await;
+    let (_, _) = room
+        .handle(
+            ctx(2),
+            RoomCommand::Judges {
+                judges: Arc::new(vec![]),
+            },
+        )
+        .await;
+    let (_, _) = room
+        .handle(
+            ctx(3),
+            RoomCommand::Touches {
+                frames: Arc::new(vec![frame(3.0)]),
+            },
+        )
+        .await;
+    let (resp, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 10_000 })
+        .await;
+    assert!(resp.is_none());
+    // player2 一条（含 judges 先行？不行——实现为 touches 全部先 flush），
+    // 精确断言：player2 的 Touches 1 条（1 帧）、player3 的 Touches 1 条（3 帧）、judges 1 条
+    let mut touch_players = std::collections::HashMap::new();
+    let mut judge_count = 0usize;
+    let mut judge_frames = 0usize;
+    for ev in &events {
+        match ev {
+            RoomEvent::RelayTouches { player, frames, .. } => {
+                *touch_players.entry(*player).or_insert(0) += frames.len();
+            }
+            RoomEvent::RelayJudges { player, judges, .. } => {
+                if *player == 2 {
+                    judge_count += 1;
+                    judge_frames += judges.len();
+                }
+            }
+            _ => panic!("flush 只应产出 Relay* 事件: {ev:?}"),
+        }
+    }
+    assert_eq!(
+        touch_players.get(&2),
+        Some(&1),
+        "player2 应合并为一条/帧数 1"
+    );
+    assert_eq!(
+        touch_players.get(&3),
+        Some(&3),
+        "player3 应合并为一条/帧数 3"
+    );
+    assert_eq!(judge_count, 1, "judges 应聚为一条");
+    assert_eq!(judge_frames, 0, "空 judges 批合并后仍为空向量");
+
+    // —— 场景 3：abort 玩家残余不播出 ——
+    let (_, _) = room
+        .handle(
+            ctx(2),
+            RoomCommand::Touches {
+                frames: Arc::new(vec![frame(4.0)]),
+            },
+        )
+        .await; // 入缓冲
+    let (_, _) = room.handle(ctx(2), RoomCommand::Abort).await; // 随即 abort
+    let (_, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 11_000 })
+        .await;
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            RoomEvent::RelayTouches { player: 2, .. } | RoomEvent::RelayJudges { player: 2, .. }
+        )),
+        "abort 后残余应被清理: {events:?}"
+    );
+
+    // —— 场景 4：monitor 全部离开 → 缓冲丢弃、无积压、live 变 false ——
+    let (_, _) = room.handle(ctx(9), RoomCommand::LeaveRoom).await; // 唯一 monitor 走人
+    let (_, _) = room
+        .handle(
+            ctx(3),
+            RoomCommand::Touches {
+                frames: Arc::new(vec![frame(5.0)]),
+            },
+        )
+        .await;
+    let (_, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 12_000 })
+        .await;
+    assert!(events.is_empty(), "无观战者不应产出转播: {events:?}");
+    // live 关闭状态直接反映（GetClientState.live = monitor 存在性）
+    let (resp, _) = room
+        .handle(sys_ctx(), RoomCommand::GetClientState { user_id: 1 })
+        .await;
+    let Some(RoomResponse::ClientState(Some(state))) = resp else {
+        panic!("应返回状态: {resp:?}");
+    };
+    assert!(!state.live, "monitor 走人后 live 应为 false");
+
+    // —— 场景 4b：回 SelectChart 后 monitor 重入 → 转播恢复 ——
+    // （Playing 中不能加入，§6.5-3，join_during_game_rejected 已覆盖；
+    //   这里全员 abort 触发 GameEnd → 回 SelectChart 再重入）
+    let (_, _) = room.handle(ctx(3), RoomCommand::Abort).await;
+    let (_, events) = room.handle(ctx(1), RoomCommand::Abort).await; // host 补 abort → 全员完成
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::GameEnd { .. }))
+    );
+    let (_, _) = room
+        .handle(
+            ctx(9),
+            RoomCommand::JoinRoom {
+                id: rid(),
+                monitor: true,
+                name: "mon".to_owned(),
+            },
+        )
+        .await;
+    let (_, _) = room
+        .handle(
+            ctx(3),
+            RoomCommand::Touches {
+                frames: Arc::new(vec![frame(6.0)]),
+            },
+        )
+        .await;
+    let (_, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 13_000 })
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::RelayTouches { player: 3, .. })),
+        "monitor 回归后应恢复转播: {events:?}"
     );
 }

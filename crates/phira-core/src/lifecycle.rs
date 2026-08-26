@@ -156,6 +156,8 @@ pub struct LifecycleTask {
     event_tx: mpsc::Sender<LifecycleEvent>,
     /// 断线到驱逐的窗口（默认 10s，§6.1/§6.5-21；测试注入更小值）。
     dangle_window: Duration,
+    /// 周期 `Tick` 心跳间隔（B1/B6 通电：倒计时 + 观战聚合 flush 节拍；生产 50ms）。
+    tick_interval: Duration,
 }
 
 impl LifecycleTask {
@@ -163,11 +165,13 @@ impl LifecycleTask {
     /// - `registry` 交给 server（鉴权成功后 `register` 分配 epoch）
     /// - `fact_tx` 交给 server（每连接发 Connected/Disconnected）
     ///
-    /// `dangle_window` = 重连窗口（生产 10s；测试可注入）。
+    /// `dangle_window` = 重连窗口（生产 10s；测试可注入）；
+    /// `tick_interval` = `Tick` 心跳周期（生产 50ms，对齐 gooophira 慢档刷新窗口；测试可调大减少噪声或调小加速观察）。
     #[must_use]
     pub fn new(
         bus: Bus,
         dangle_window: Duration,
+        tick_interval: Duration,
     ) -> (Self, Arc<SessionRegistry>, mpsc::Sender<LifecycleEvent>) {
         let (event_tx, rx) = mpsc::channel(64);
         let registry = Arc::new(SessionRegistry::new());
@@ -178,6 +182,7 @@ impl LifecycleTask {
                 rx,
                 event_tx: event_tx.clone(),
                 dangle_window,
+                tick_interval,
             },
             registry,
             event_tx.clone(),
@@ -185,11 +190,44 @@ impl LifecycleTask {
     }
 
     /// 消费循环（组合根 spawn）。channel 关闭（server 全部断开）时自然退出。
+    ///
+    /// B1/B6 通电（2026-08）：select 上周期 `Tick` 心跳——对全部活跃房间广播
+    /// `RoomCommand::Tick{now}`，作为 impl 内唯一时钟源（§4.9-6：时间事实命令化），
+    /// 驱动 WaitForReady 倒计时与观战聚合缓冲 flush。选 [`MissedTickBehavior::Skip`]
+    /// 不追帧：心跳只是节拍器，落后就跳过下一拍（积压无意义）。
     pub async fn run(mut self) {
-        while let Some(event) = self.rx.recv().await {
-            self.handle(event).await;
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.tick_interval, // interval 首拍立即完成，跳过它
+            self.tick_interval,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                event = self.rx.recv() => {
+                    let Some(event) = event else { break };
+                    self.handle(event).await;
+                }
+                _ = ticker.tick() => self.broadcast_tick().await,
+            }
         }
         debug!("lifecycle task exiting");
+    }
+
+    /// 心跳拍：向全部活跃房间广播 `Tick{now}`。空房间不收（无人可计时）；
+    /// 房间队列满时 Tick 按 DropIfFull 丢弃（§4.9-9：可丢节拍，丢一拍自愈）。
+    async fn broadcast_tick(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        for room_id in self.bus.active_rooms().await {
+            if let Err(err) = self
+                .bus
+                .dispatch_system(room_id, RoomCommand::Tick { now })
+                .await
+            {
+                debug!("tick dispatch failed (room likely closing): {err:?}");
+            }
+        }
     }
 
     async fn handle(&mut self, event: LifecycleEvent) {
