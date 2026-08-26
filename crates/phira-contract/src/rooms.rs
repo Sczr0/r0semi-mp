@@ -182,6 +182,7 @@ pub async fn room_contract_suite<F: RoomFactory>(factory: &F) {
     host_leave_migrates(factory).await;
     playing_leave_triggers_settle(factory).await;
     join_during_game_rejected(factory).await;
+    ready_countdown_tick(factory).await;
 }
 
 /// 建房/入房/容量（§6.5-1/3/4/6/27）
@@ -789,7 +790,7 @@ async fn config_and_client_state<F: RoomFactory>(factory: &F) {
     );
     assert!(!state.live, "monitor 未加入时 live 应为 false");
 
-    // —— Tick 无副作用（§4.6：v1 无玩法倒计时）——
+    // —— Playing 态 Tick 无副作用（B1：仅 WaitForReady 消费 Tick；结算靠 Played §4.6）——
     let (resp, events) = room.handle(sys_ctx(), RoomCommand::Tick { now: 999 }).await;
     assert!(resp.is_none());
     assert!(events.is_empty());
@@ -1112,4 +1113,138 @@ async fn join_during_game_rejected<F: RoomFactory>(factory: &F) {
         .await;
     assert!(events.is_empty());
     assert_business(resp.as_ref().unwrap(), RoomErrorCode::GameOngoing);
+}
+
+/// B1 玩法倒计时（§4.6 时间事实命令化 + §6.5-8 对照 gooophira 60s 强开）：
+///
+/// 1. 首 Tick 锚定 deadline（无事件、无响应）
+/// 2. 全员已 ready → StartPlaying 后 Tick 无副作用
+/// 3. 超时：未 ready 者被驱逐（UserLeft），剩余全员 ready → 强制 StartPlaying
+#[allow(clippy::too_many_lines)] // 倒计时三场景长是契约验收需求（同 monitor_and_relay）
+async fn ready_countdown_tick<F: RoomFactory>(factory: &F) {
+    // —— 场景 A：全员 ready 进入 Playing → Tick 不再有副作用 ——
+    let mut room = factory.create(rid());
+    create_room(&mut room).await;
+    room.handle(
+        ctx(2),
+        RoomCommand::JoinRoom {
+            id: rid(),
+            monitor: false,
+            name: "user2".to_owned(),
+        },
+    )
+    .await;
+    room.handle(ctx(1), RoomCommand::SelectChart { id: 1 })
+        .await;
+    let (_, events) = room.handle(ctx(1), RoomCommand::RequestStart).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::GameStart { .. })),
+        "RequestStart 应 GameStart"
+    );
+
+    // 首个 Tick：锚定 deadline，无事件
+    let (resp, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 1_000 })
+        .await;
+    assert!(resp.is_none(), "锚定 Tick 无响应: {resp:?}");
+    assert!(events.is_empty(), "锚定 Tick 无事件: {events:?}");
+
+    // user2 ready → StartPlaying；此后 Tick 无副作用（Playing 不消费）
+    let (_, _) = room.handle(ctx(2), RoomCommand::Ready).await;
+    let (resp, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 70_000 })
+        .await;
+    assert!(resp.is_none());
+    assert!(events.is_empty(), "Playing 态不应消费 Tick: {events:?}");
+
+    // —— 场景 B：超时强开 —— host(1) 已 ready，user3 未 ready 到期被驱逐，
+    //    剩余玩家全员 ready → StartPlaying（gooophira「未准备 Aborted」语义）——
+    let mut room = factory.create(rid());
+    create_room(&mut room).await;
+    for (uid, name) in [(2, "user2"), (3, "user3")] {
+        room.handle(
+            ctx(uid),
+            RoomCommand::JoinRoom {
+                id: rid(),
+                monitor: false,
+                name: name.to_owned(),
+            },
+        )
+        .await;
+    }
+    room.handle(ctx(1), RoomCommand::SelectChart { id: 1 })
+        .await;
+    let (_, _) = room.handle(ctx(1), RoomCommand::RequestStart).await; // WaitForReady
+    let (_, _) = room.handle(ctx(2), RoomCommand::Ready).await; // user2 就绪
+
+    // 锚定 + 直接到期（60s 后的 Tick）
+    let (_, _) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 1_000 })
+        .await;
+    let (resp, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 61_500 })
+        .await;
+    assert!(resp.is_none(), "超时驱逐无响应: {resp:?}");
+    // user3 被驱逐（UserLeft）；随后剩余全员 ready → StartPlaying
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::UserLeft { user: 3, .. })),
+        "未 ready 的 user3 应被驱逐: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::StartPlaying { .. })),
+        "驱逐后剩余全员已 ready 应强制开局: {events:?}"
+    );
+
+    // 开局后的状态确认：Playing
+    let (resp, _) = room
+        .handle(sys_ctx(), RoomCommand::GetClientState { user_id: 1 })
+        .await;
+    let Some(RoomResponse::ClientState(Some(state))) = resp else {
+        panic!("应返回房间状态: {resp:?}");
+    };
+    assert_eq!(state.state, RoomState::Playing, "强制开局后应在 Playing");
+
+    // —— 场景 C：仅 monitor 未 ready → 也被驱逐（check_all_ready 要求 users+monitors 全就绪）——
+    let mut room = factory.create(rid());
+    // monitor 白名单注入 id=9（§6.5-4，与 monitor_and_relay 同款手法）
+    room.handle(
+        sys_ctx(),
+        RoomCommand::UpdateConfig {
+            config: Arc::new(RoomConfig { monitors: vec![9] }),
+        },
+    )
+    .await;
+    create_room(&mut room).await;
+    // monitor 先入房（仅 SelectChart 状态可加入，§6.5-3），再进 WaitForReady
+    room.handle(
+        ctx(9),
+        RoomCommand::JoinRoom {
+            id: rid(),
+            monitor: true,
+            name: "watcher".to_owned(),
+        },
+    )
+    .await;
+    room.handle(ctx(1), RoomCommand::SelectChart { id: 1 })
+        .await;
+    let (_, _) = room.handle(ctx(1), RoomCommand::RequestStart).await;
+    let (_, _) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 1_000 })
+        .await;
+    let (resp, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 62_000 })
+        .await;
+    assert!(resp.is_none());
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::UserLeft { user: 9, .. })),
+        "未 ready 的 monitor 也应被驱逐: {events:?}"
+    );
 }

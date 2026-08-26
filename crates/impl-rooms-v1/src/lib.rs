@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use phira_api::{
     ApiError, Chart, ClientRoomState, CmdCtx, JoinRoomResponse, Origin, Record, RoomActor,
     RoomCommand, RoomConfig, RoomDeps, RoomError, RoomErrorCode, RoomEvent, RoomFactory, RoomId,
-    RoomResponse, RoomState, Targets, UserInfo,
+    RoomResponse, RoomState, Targets, TimeMs, UserInfo,
 };
 
 /// 房间容量：玩家上限 8 人（§6.5-1）；monitor 不占名额、不限数量。
@@ -30,6 +30,9 @@ enum InternalState {
     WaitForReady {
         /// 已 ready 的用户集（玩家 + monitor）。
         started: HashSet<i32>,
+        /// 强开截止时刻（B1 倒计时）：`None` = 尚未锚定（impl 唯一时钟源是 Tick，
+        /// 进入状态时拿不到 now，等首个 Tick 补记 `now + READY_TIMEOUT_MS`）。
+        deadline: Option<TimeMs>,
     },
     /// 游玩中。
     Playing {
@@ -116,7 +119,7 @@ impl RoomV1 {
     fn to_client_state(&self, user_id: i32) -> ClientRoomState {
         let is_ready = matches!(
             &self.state,
-            InternalState::WaitForReady { started } if started.contains(&user_id)
+            InternalState::WaitForReady { started, .. } if started.contains(&user_id)
         );
         let users: HashMap<i32, UserInfo> = self
             .users
@@ -203,10 +206,53 @@ impl RoomV1 {
         events
     }
 
+    /// 玩法倒计时（B1 通电，Tick 驱动 §4.6；对照 gooophira ready 60s 强开）。
+    ///
+    /// - 仅 `WaitForReady` 状态消费 Tick：首个 Tick 锚定 `deadline = now + 60s`；
+    ///   到期时把未 ready 者走 [`Self::evict`]（复用 UserLeft 广播/房主迁移/空房
+    ///   自毁收尾），剩余全员已 ready 则顺势 StartPlaying。
+    /// - `Playing` 结算靠 Played 触发（原版同），v1 不加对局超时；
+    ///   `SelectChart` 无计时需求——两态直接无视 Tick。
+    /// - 绝对截止时刻（而非相对计数）：Tick 可丢（DropIfFull §4.9-9），丢一拍自愈。
+    fn handle_tick(&mut self, now: TimeMs) -> (Option<RoomResponse>, Vec<RoomEvent>) {
+        const READY_TIMEOUT_MS: TimeMs = 60_000;
+        match &mut self.state {
+            InternalState::WaitForReady { started, deadline } => {
+                let Some(d) = *deadline else {
+                    // 首拍：锚定强开时刻（进入 WaitForReady 后的下一个 Tick）
+                    *deadline = Some(now.saturating_add(READY_TIMEOUT_MS));
+                    return (None, Vec::new());
+                };
+                if now < d {
+                    return (None, Vec::new()); // 未到期
+                }
+                // 到期：驱逐未 ready 者（started 外的全部在线成员）
+                let not_ready: Vec<i32> = self
+                    .users
+                    .keys()
+                    .chain(self.monitors.keys())
+                    .copied()
+                    .filter(|id| !started.contains(id))
+                    .collect();
+                let mut events = Vec::new();
+                for id in &not_ready {
+                    events.extend(self.evict(*id));
+                }
+                // 剩余者若已全部 ready → 强制开局；否则留在 WaitForReady
+                // （如全员被驱逐则空房自毁已由 evict 产出 RoomClosed）
+                if matches!(self.state, InternalState::WaitForReady { .. }) {
+                    events.extend(self.check_all_ready());
+                }
+                (None, events)
+            }
+            _ => (None, Vec::new()),
+        }
+    }
+
     /// 检查开局/结算（原版 check_all_ready，规则 8/11）。
     fn check_all_ready(&mut self) -> Vec<RoomEvent> {
         match &self.state {
-            InternalState::WaitForReady { started } => {
+            InternalState::WaitForReady { started, .. } => {
                 let all = self
                     .users
                     .keys()
@@ -482,7 +528,11 @@ impl RoomV1 {
         // 进入 WaitForReady，host 默认已 ready（§6.5-7）
         let mut started = HashSet::new();
         started.insert(user_id);
-        self.state = InternalState::WaitForReady { started };
+        // B1：deadline 由首个 Tick 锚定（impl 无主动时钟，§4.9-6）
+        self.state = InternalState::WaitForReady {
+            started,
+            deadline: None,
+        };
         let mut events = vec![RoomEvent::GameStart {
             room_id: self.id.clone(),
             user: user_id,
@@ -496,7 +546,7 @@ impl RoomV1 {
             return (None, Vec::new());
         };
         match &mut self.state {
-            InternalState::WaitForReady { started } => {
+            InternalState::WaitForReady { started, .. } => {
                 if !started.insert(user_id) {
                     return (
                         Some(RoomResponse::Failure(RoomError::Business {
@@ -528,7 +578,7 @@ impl RoomV1 {
             return (None, Vec::new());
         };
         match &mut self.state {
-            InternalState::WaitForReady { started } => {
+            InternalState::WaitForReady { started, .. } => {
                 if !started.remove(&user_id) {
                     return (
                         Some(RoomResponse::Failure(RoomError::Business {
@@ -847,10 +897,7 @@ impl RoomActor for RoomV1 {
                     (None, Vec::new())
                 }
             }
-            RoomCommand::Tick { .. } => {
-                // v1 无玩法倒计时（原版同：结算靠 Played 触发），占位（§4.6）
-                (None, Vec::new())
-            }
+            RoomCommand::Tick { now } => self.handle_tick(now),
             RoomCommand::UserDisconnected { user_id, .. } => self.handle_user_disconnected(user_id),
             RoomCommand::UserReconnected { user_id, .. } => self.handle_user_reconnected(user_id),
             RoomCommand::UserDangleExpired { user_id } => self.handle_user_dangle_expired(user_id),
