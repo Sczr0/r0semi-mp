@@ -67,12 +67,16 @@ server.rs → front-gate/(admission, proxy, limiter)
 **触发时机**：不要为拆而拆，绑定到下一个必然功能（管理 API / 回放 Sink）进场时"顺便"抽出。
 bus.rs:520 已留升级路径："泛化触发条件 = 第二个大扇出广播场景"——作者自知但未到阈值。
 
-### C2. SessionRegistry 只进不出 → **ISSUE-0012**
+### C2. SessionRegistry 只进不出 → **ISSUE-0012**（✅ 已解决 2026-08）
 
 `register()` 只 insert（lifecycle.rs:71），无 remove；每用户永久占 `(i32,u64,String)`≈40-80B。
 **注意**：不能简单"离线删除"——epoch 需单调递增且不回收，否则重连回退 epoch 1 可能撞上
 遗僵尸连接 `current_epoch==state.epoch`，复活 ISSUE-0009 漏洞。推荐方案 A：拆 `epochs`（永不删，8B/用户）
 与 `names`（可淘汰）两表。
+
+**修复（方案 A 已落地）**：`SessionRegistry` 拆为 `epochs`（永不删）+ `names`（可淘汰）两表；
+`DangleExpired` 后调 `evict_name` 释放昵称；epoch 单调不回收保 ISSUE-0009 语义。
+详见 ISSUE-0012 文末修复记录。
 
 ### C3. 手写 HTTP 客户端健壮性天花板
 
@@ -86,7 +90,7 @@ bus.rs:520 已留升级路径："泛化触发条件 = 第二个大扇出广播�
 
 | # | 缺口 | 现状 | 对照 |
 |---|---|---|---|
-| D1 | Chat 不限速 | `rate_limit()` 白名单只有 CreateRoom/JoinRoom/SelectChart/Played；注释"低频命令(Chat/Ready…)不限"是显式决定 | gooophira 聊天 2/s 令牌桶 |
+| D1 | Chat 不限速（✅ 已解决 2026-08）——`rate_limit()` 白名单加入 `ClientCommand::Chat`（2/s，500ms 间隔），超限回 `TooManyRequests`；`rate_limit` 单元测试 + 移植 memory_guard 测试改用 Touches | `rate_limit()` 白名单只有 CreateRoom/JoinRoom/SelectChart/Played；注释"低频命令(Chat/Ready…)不限"是显式决定 | gooophira 聊天 2/s 令牌桶 |
 | D2 | 版本握手不校验（✅ 已解决 2026-08）——`handle_connection` 握手后校验 `stream.version() != PROTOCOL_VERSION` 即释放准入并断开，回归测试 `handshake_rejects_wrong_version_then_accepts_v1` | stream.rs 读取版本但只记录展示（healthz），不拒绝不匹配 | gooophira `ver != protocolVersion` 即断 |
 | D3 | protocol_hack 层缺失 | 无真客户端怪癖补偿机制 | gooophira/jphira 的 forceSyncInfo/fixClientRoomState（但需源码验证，见 client-conformance.md） |
 
@@ -99,7 +103,7 @@ D2 在协议 v2 到来时会被动暴露；D3 的正确解法不是抄传闻，�
 | 阶段 | 内容 | 判据 |
 |---|---|---|
 | **立即**（天级） | ✅ A1 ABA 修复（ISSUE-0011）· ✅ B3 Metrics 暴露 · ✅ D2 版本握手校验 · ⬜ client-conformance 崩溃猎手测试 | 消灭全部已知正确性地雷 |
-| **短期**（周级） | 绿档五件套：B2 i18n · 谱面反作弊 · 观战聚合缓冲 · D1 Chat 限速 · C2 Registry 拆表（ISSUE-0012） | 每项带契约测试落地 |
+| **短期**（周级） | 绿档剩余：B2 i18n · 谱面反作弊 · 观战聚合缓冲 · ✅ D1 Chat 限速 · ✅ C2 Registry 拆表（ISSUE-0012） | 每项带契约测试落地 |
 | **中期**（月级） | B1 Tick 通电（倒计时）· 一致性断言库 + 漂移哨兵 · 管理 API | 玩家可感知 + 护城河成形 |
 | **择机** | A2 回源出队 · C1 server.rs 拆分 · 回放录制（Store 接口） | 绑定到相关功能进场时顺手做 |
 | **远景** | Store 持久化 · 协议 v2 预案 · 多实例（仅当需求出现） | 文档立 flag，不动代码 |
