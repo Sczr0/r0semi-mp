@@ -527,7 +527,7 @@ pub trait RoomActor: Send {
    - **Tick 可丢**：自带 `now`，下一拍自愈
    - **生命周期事实不可丢**：bus 等待
    - **其它客户端命令**：丢弃并断连（滥用防护）
-   **滥用控制优先用每连接限速**（热路径 ~60-70Hz 上限），不让队列压力触发断连。**分发并发边界**：bus 对每个房间的投递独立进行（不跨房间串行 `await`）——一个房间拥塞不得拖延其它房间的 Tick/生命周期事实。**RoomClosed 排空（评审 §8 二-4）**：core 见 RoomClosed 即停路由——新命令回 room-closed 错误；排空期间到达的命令一律 `Failure(Business)`。禁止"加入成功然后房间被拆"的状态
+   **滥用控制优先用每连接限速**（热路径 ~60-70Hz 上限），不让队列压力触发断连。**已兑现（ADR-0008 / ISSUE-0006 + D1 2026-08）**：`CommandLimiter` 限 CreateRoom 1/s、JoinRoom/SelectChart/Played 5/s、Chat 2/s，超限回 `TooManyRequests`；语义级拦截（审核/封禁/反作弊）走 Observer（§7.3），不在本层。**分发并发边界**：bus 对每个房间的投递独立进行（不跨房间串行 `await`）——一个房间拥塞不得拖延其它房间的 Tick/生命周期事实。**RoomClosed 排空（评审 §8 二-4）**：core 见 RoomClosed 即停路由——新命令回 room-closed 错误；排空期间到达的命令一律 `Failure(Business)`。禁止"加入成功然后房间被拆"的状态
 
 **两个 10s 的归属**（随评审修订）：
 - 断线判定 10s（心跳）→ core session 任务
@@ -664,7 +664,7 @@ jobs:
 | 项 | 规范 |
 |---|---|
 | 协议 | 纯 TCP，明文（无 TLS，公网部署见 §11） |
-| 握手 | 客户端先发 1 字节版本号（当前 v1），服务端读取 |
+| 握手 | 客户端先发 1 字节版本号（当前 v1），服务端读取并**校验**：`version != PROTOCOL_VERSION`（当前 1）→ 立即断开（D2 技术债，2026-08；对照 gooophira `ver != protocolVersion` 即断；版本字节 + 契约演进 §5.6 应对协议漂移） |
 | 帧格式 | `ULEB128 长度 + 载荷`，载荷以 `u8` 命令 tag 开头 |
 | 包上限 | 协议上限 2 MiB（服务端可配置更紧，默认 ~1MiB）；长度字段超过 32 bit 拒绝（防攻击）；**鉴权前帧上限 ~4KiB**（§10.4，评审 §7） |
 | 心跳 | **客户端**每 3s 发 `Ping`、2s 未收到 `Pong` 计 1 次失败；**服务端不发 `Ping`**（ServerCommand 只有 `Pong`，评审 §7），以 10s 无任何包判定断线 |
@@ -905,7 +905,7 @@ pub trait Moderator: Send + Sync {
 | 会话劫持 | 明文 + token 即身份：token 泄露 → 同 id 重连直接顶替原会话（规则 19）。**协议层无法根治**，缓解：token 不落日志、短有效期、异常顶替告警（Observer）；记为已知风险（评审 §8） |
 | 传输安全 | 明文 TCP 是协议特性；TLS 前置仅适用于自建端/受信网络——**落地前需验证 Phira 客户端是否支持 TLS（大概率不支持，与 P1 真客户端直连目标冲突，评审 §8）** |
 | 鉴权前包 | 未鉴权时忽略非 Ping/Auth 包（§6.5-13） |
-| 滥用防护（可选观察者） | 登录失败限速、聊天频率限制——做成 Observer，不塞进核心 |
+| 滥用防护 | **每连接命令限速已在核心**（ADR-0008 / ISSUE-0006 兑现）——`CommandLimiter` 限"贵"命令：CreateRoom 1/s、JoinRoom/SelectChart/Played 5/s、**Chat 2/s（D1 技术债，2026-08）**，热路径 Touches/Judges 不限（靠 DropIfFull + 帧上限）；超限回 `TooManyRequests`。**更重的滥用控制**（登录失败限速、封禁/审核、反作弊）**做成 Observer**（§7.3，订阅事件 + 命令路径否决，不塞进核心）——与 §4.9-9 统一：命令级限速用每连接（核心），语义级拦截用 Observer |
 | 连接准入 | 总连接数上限、**未鉴权连接数上限**（全局小额度）、每 IP 限额、握手/鉴权超时（评审 §7）——**已鉴权连接上限已兑现（2026-08，ADR-0010 安全锁 B）**：全局 1000，超限拒绝鉴权 |
 | 内存 DoS | 帧大小分级上限（鉴权前 ~4KiB）+ 每连接记账 + 全局在途字节上限（§10.4） |
 | 供应链 | `cargo deny` 许可审查 + 依赖白名单；impl 是编译进二进制的**受信代码**（无沙箱需求，信任模型简单） |
@@ -933,8 +933,9 @@ pub trait Moderator: Send + Sync {
 
 - 端口复用（accept 后 peek 分流）——**2026-08 实测放弃**：peek 在 Windows/current_thread 下不稳定（5s 延迟 + 后续卡死，ISSUE-0005）。实际实现 = **独立监听端口 `http_port`**（`Server::new` 的 `http_port` 参数），MP 入口与 HTTP 管理端点端口隔离，状态机零污染由端口隔离保证（不依赖 Metrics 或 impl）
 - 端点：`GET /rooms`（房间列表，§运营）+ `GET /healthz`（健康检查）
-- `/healthz` 返回 JSON：`{"status":"ok","version":...,"uptime_s":...,"connections":...,"rooms":...}`——数据源 = 柜台（SessionSink 连接数 / 房间列表），**不依赖官方 API**（官方 API 挂掉不影响测活，验收标准成立）
-- 安全：不返回用户名/房间内容等敏感信息；公开部署建议限速或仅内网可访问
+- `/healthz` 返回 JSON：`{"status":"ok","version":...,"uptime_s":...,"connections":...,"rooms":...,"internal_errors":...,"metrics":{...}}`——数据源 = 柜台（SessionSink 连接数 / 房间列表）+ **bus 的 `Metrics` 观测数据**（B3 技术债，2026-08：`metrics` 每命令 calls/ok/business/internal/avg_latency_ms + `internal_errors` 总内部故障数），**不依赖官方 API**（官方 API 挂掉不影响测活，验收标准成立）
+  - **测活判定仍不依赖 Metrics**：`status` 固定为 "ok"（存活判定只看连接数/房间数/uptime），Metrics 仅是**额外暴露的观测数据**——即使 Metrics 层面异常也不影响测活结果（意义：测活 = 服务活着，而不是 Metrics 指标健康）
+- 安全：不返回用户名/房间内容等敏感信息（Metrics 仅命令计数/延迟/错误率，非个人数据）；公开部署建议限速或仅内网可访问
 
 **验收标准**：无 token、无官方 API 依赖，3s 内判定存活；官方 API 挂掉不影响测活结果。
 
