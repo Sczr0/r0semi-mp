@@ -5,7 +5,6 @@ use std::sync::Arc;
 use phira_api::{RoomEvent, RoomId, UserInfo};
 use phira_core::EventSink;
 use phira_server::server::RoomListSink;
-
 fn rid(id: &str) -> RoomId {
     RoomId::new(id.to_owned()).unwrap()
 }
@@ -155,4 +154,87 @@ async fn chart_select_and_game_end_states() {
     )
     .await;
     assert_eq!(sink.snapshot().await[0].state, "SelectChart(7)");
+}
+
+/// 集成测试：真实 bus → RoomListSink 链路——最后一人离开后快照必须清空。
+///
+/// 回归（用户实测）：空房残留列表（`users: 0` 僵尸条目）。根因：bus 把 `RoomClosed`
+/// 拦在 `process_events` 步骤 1（§4.4 旧语义"core 信号不投递"），RoomListSink 的
+/// `RoomClosed => remove` 分支是死代码。修复：bus 步骤 4 对观察者补投 RoomClosed。
+#[tokio::test]
+async fn bus_room_closed_clears_snapshot() {
+    use phira_api::{
+        CmdCtx, Origin, RoomActor, RoomCommand, RoomConfig, RoomFactory, RoomResponse,
+    };
+    use phira_core::Bus;
+
+    // 回声 actor：建房 → RoomCreated；离开（最后一人）→ UserLeft + RoomClosed
+    struct EchoActor;
+    #[async_trait::async_trait]
+    impl RoomActor for EchoActor {
+        async fn handle(
+            &mut self,
+            _ctx: CmdCtx,
+            cmd: RoomCommand,
+        ) -> (Option<RoomResponse>, Vec<RoomEvent>) {
+            match cmd {
+                RoomCommand::CreateRoom { .. } => (
+                    Some(RoomResponse::Ok),
+                    vec![RoomEvent::RoomCreated {
+                        room_id: rid("abc"),
+                        host: 1,
+                    }],
+                ),
+                RoomCommand::LeaveRoom => (
+                    Some(RoomResponse::Ok),
+                    vec![
+                        RoomEvent::UserLeft {
+                            room_id: rid("abc"),
+                            user: 1,
+                            name: "p1".to_owned(),
+                        },
+                        RoomEvent::RoomClosed {
+                            room_id: rid("abc"),
+                        },
+                    ],
+                ),
+                _ => (Some(RoomResponse::Ok), vec![]),
+            }
+        }
+    }
+    struct EchoFactory;
+    impl RoomFactory for EchoFactory {
+        fn create(&self, _room_id: RoomId) -> Box<dyn RoomActor> {
+            Box::new(EchoActor)
+        }
+    }
+
+    let bus = Bus::new(
+        Arc::new(EchoFactory) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    );
+    let list = Arc::new(RoomListSink::new(Vec::new()));
+    bus.attach_sink(Arc::clone(&list) as Arc<dyn EventSink>);
+
+    let ctx = CmdCtx {
+        origin: Origin::Client { user_id: 1 },
+        room_id: rid("abc"),
+    };
+    bus.dispatch(
+        ctx.clone(),
+        RoomCommand::CreateRoom {
+            id: rid("abc"),
+            name: "p1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(list.snapshot().await.len(), 1, "建房后列表有房");
+
+    // 最后一人离开 → 快照必须清空（修复前残留 users:0 僵尸条目）
+    bus.dispatch(ctx, RoomCommand::LeaveRoom).await.unwrap();
+    assert!(
+        list.snapshot().await.is_empty(),
+        "最后一人离开后列表必须清空"
+    );
 }

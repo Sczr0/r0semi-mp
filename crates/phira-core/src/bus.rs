@@ -552,6 +552,8 @@ async fn process_events(
                 }
             }
         }
+        // RoomClosed（core 信号）：无目标用户，不进 deliveries——步骤 4 单独通知观察者
+        // （§4.4 修订：观察者依赖它清理快照；user_id=0 系统约定）。
     }
 
     // 2. 应用路由增量（事件封闭集：UserJoined 增 / UserLeft 删 / RoomClosed 删房间，§4.9-4）
@@ -595,6 +597,19 @@ async fn process_events(
     if let Some(sink) = sink {
         for (user_id, ev) in deliveries {
             sink.deliver(user_id, &ev).await;
+        }
+        // core 信号（RoomClosed）也通知观察者（§4.4 修订：RoomListSink 依赖它清理快照——
+        // 修复前 RoomClosed 被拦在步骤 1，观察者永远收不到 → 空房残留列表）。
+        // user_id=0 = 系统广播约定：转换层对 RoomClosed 无协议输出（§6.6 表 2），会话侧无害；
+        // 观察者忽略 user_id 按事件清理。顺序：先 UserLeft（计数归零）后 RoomClosed（移除）。
+        if closed {
+            sink.deliver(
+                0,
+                &RoomEvent::RoomClosed {
+                    room_id: room_id.clone(),
+                },
+            )
+            .await;
         }
     }
 

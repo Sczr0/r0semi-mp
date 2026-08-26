@@ -332,13 +332,28 @@ async fn room_closed_cleans_up() {
                     host: 1,
                 }],
             ),
-            (ok(), vec![RoomEvent::RoomClosed { room_id: rid() }]),
+            // 最后一人离开（真实 evict 语义）：UserLeft + RoomClosed
+            (
+                ok(),
+                vec![
+                    RoomEvent::UserLeft {
+                        room_id: rid(),
+                        user: 1,
+                        name: "user1".to_owned(),
+                    },
+                    RoomEvent::RoomClosed { room_id: rid() },
+                ],
+            ),
         ],
     );
     let bus = Bus::new(
         Arc::clone(&factory) as Arc<dyn RoomFactory>,
         Arc::new(RoomConfig::default()),
     );
+    // 观察者（§4.4 修订）：RoomClosed 也投递给 sink（user_id=0 系统约定）——
+    // RoomListSink 依赖它清理快照；修复前被拦在 process_events 步骤 1，列表残留。
+    let sink = Arc::new(FakeSink::default());
+    bus.attach_sink(Arc::clone(&sink) as Arc<dyn EventSink>);
 
     bus.dispatch(
         client_ctx(1),
@@ -353,6 +368,23 @@ async fn room_closed_cleans_up() {
     bus.dispatch(client_ctx(1), RoomCommand::LeaveRoom)
         .await
         .unwrap();
+
+    // 观察者应收到 RoomClosed（user_id=0），且收到顺序在 UserLeft 之后（先计数归零再移除）
+    let deliveries = sink.deliveries.lock().unwrap().clone();
+    let closed_idx = deliveries
+        .iter()
+        .position(|(uid, ev)| *uid == 0 && matches!(ev, RoomEvent::RoomClosed { .. }));
+    assert!(
+        closed_idx.is_some(),
+        "观察者应收到 RoomClosed: {deliveries:?}"
+    );
+    let left_idx = deliveries
+        .iter()
+        .position(|(_, ev)| matches!(ev, RoomEvent::UserLeft { .. }));
+    assert!(
+        left_idx.is_some_and(|l| closed_idx.is_some_and(|c| l < c)),
+        "UserLeft 应先于 RoomClosed（快照计数归零再移除）: {deliveries:?}"
+    );
 
     // 房间已删：JoinRoom 应 RoomNotFound
     let resp = bus

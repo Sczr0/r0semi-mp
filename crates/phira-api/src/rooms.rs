@@ -365,7 +365,8 @@ pub enum Targets {
 /// 分类学：
 /// - **领域事件**（与协议 Message 一一对应）：投递目标恒为房内 All，不再携带 targets
 /// - **转发指令**（RelayTouches/RelayJudges）：仅 monitor——不进观察者通道，携带 targets
-/// - **core 信号**（RoomClosed）：仅 core，删房间
+/// - **core 信号**（RoomClosed）：core 拆房间 + **通知观察者**（RoomListSink 等依赖它清理快照；
+///   投递经 bus 步骤 4，`user_id=0` 系统约定，不发给任何用户会话）
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum RoomEvent {
