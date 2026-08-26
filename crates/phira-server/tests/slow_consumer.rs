@@ -266,8 +266,8 @@ async fn encode_cache_encodes_once_per_frame_key() {
         calls.fetch_add(1, Ordering::SeqCst);
         vec![1u8, 2, 3]
     };
-    let a = cache.get_or_encode(key, f);
-    let b = cache.get_or_encode(key, f);
+    let a = cache.get_or_encode(key, Box::new(()), f);
+    let b = cache.get_or_encode(key, Box::new(()), f);
     assert_eq!(calls.load(Ordering::SeqCst), 1, "同 key 只编码一次");
     assert_eq!(&*a, &*b, "同一帧共享同一载荷（Arc 引用）");
 }
@@ -277,13 +277,13 @@ async fn encode_cache_evicts_when_full() {
     let cache = phira_server::server::EncodeCache::new(2);
     let calls = Arc::new(AtomicUsize::new(0));
     for i in 0..3 {
-        cache.get_or_encode(i, || {
+        cache.get_or_encode(i, Box::new(()), || {
             calls.fetch_add(1, Ordering::SeqCst);
             vec![u8::try_from(i).unwrap()]
         });
     }
     // 第 3 条插入时满 → 清空；旧 key(0) 重新编码
-    cache.get_or_encode(0, || {
+    cache.get_or_encode(0, Box::new(()), || {
         calls.fetch_add(1, Ordering::SeqCst);
         vec![9]
     });

@@ -103,6 +103,47 @@ async fn healthz_returns_ok_json_without_api_dependency() {
         "连接数（无会话）: {resp}"
     );
     assert!(resp.contains("\"rooms\":0"), "房间数: {resp}");
+    // B3（技术债）：Metrics 必须暴露给 /healthz，不让可观测性数据进黑洞
+    assert!(
+        resp.contains("\"internal_errors\":0"),
+        "内部错误数（无故障）: {resp}"
+    );
+    assert!(
+        resp.contains("\"metrics\":{"),
+        "metrics 字段（即使空对象）: {resp}"
+    );
+}
+
+/// B3（技术债）：bus 收集的 Metrics 要在 /healthz 暴露——数据驱动验证：
+/// 先 dispatch 一个命令记录统计，再断言 /healthz 返回的 metrics 含该命令且 calls≥1。
+#[tokio::test]
+async fn healthz_exposes_bus_metrics() {
+    use phira_api::CmdCtx;
+    let bus = {
+        let ctx = test_ctx();
+        // dispatch 一个命令（记录 metrics；放到未知/空房间会返回 Err，但 calls 仍 +1）
+        let _ = ctx
+            .bus
+            .dispatch(
+                CmdCtx {
+                    origin: phira_api::Origin::System,
+                    room_id: RoomId::new("none".to_owned()).expect("test room id"),
+                },
+                RoomCommand::Tick { now: 1000 },
+            )
+            .await;
+        let resp = http_get(ctx, "/healthz").await;
+        assert!(
+            resp.contains("\"metrics\":{") && resp.contains("\"tick\""),
+            "metrics 应含 dispatched 命令 tick（command_name 小写）: {resp}"
+        );
+        resp
+    };
+    // 空对象守卫：metrics 不是空对象
+    assert!(
+        bus.contains("\"calls\":"),
+        "metrics 条目含 calls 统计: {bus}"
+    );
 }
 
 #[tokio::test]

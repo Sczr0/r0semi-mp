@@ -46,7 +46,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn};
 
 use crate::proxy;
-use crate::stream::{MAX_PACKET_SIZE, Outbound, PRE_AUTH_MAX_PACKET, Stream};
+use crate::stream::{MAX_PACKET_SIZE, Outbound, PRE_AUTH_MAX_PACKET, PROTOCOL_VERSION, Stream};
 
 /// 服务器：持有监听器 + 柜台（组合根唯一接线点之外，本结构不认识具体货物）。
 pub struct Server {
@@ -510,9 +510,25 @@ impl Default for CommandLimiter {
 /// 可整体提升到 bus 层（ADR-0009：泛化触发条件 = 第二个大扇出广播场景）。
 /// 缓存键 = 帧 `Arc` 指针地址（同一帧的多个 monitor 投递命中同一缓存），
 /// 值 = 编码后的载荷（不含 ULEB128 长度前缀，写任务统一加）。
+///
+/// ## ABA 防护（ISSUE-0011）
+/// 键是裸地址；缓存条目**同时持有源 `Arc` 的克隆**（[`EncodeEntry::_pin`]），
+/// 条目存活期间该源地址被强引用钉住 → 分配器不可能把这块内存复用于新批次，
+/// 从而**杜绝**"新事件命中历史死条目、观战者收到陈旧帧"的 ABA 危害。
+/// 旧注释「旧帧指针不复用，留着只会是死条目」是错误断言：
+/// Rust 分配器不承诺地址唯一性，同尺寸释放块被立即复用是常见行为。
 pub struct EncodeCache {
-    inner: Mutex<std::collections::HashMap<usize, Arc<Vec<u8>>>>,
+    inner: Mutex<std::collections::HashMap<usize, EncodeEntry>>,
     capacity: usize,
+}
+
+/// 缓存条目：编码结果 + 钉住源 `Arc` 的擦除类型持有者（[`EncodeCache`] 的 ABA 说明）。
+struct EncodeEntry {
+    /// 钉住键所指向的内存块（源帧 `Arc` 克隆）；条目存活期间该地址不可被分配器复用。
+    /// 用 `Box<dyn Any>` 擦除类型——`Touches`/`Judges` 两种源 `Arc` 类型不同，统一装箱。
+    /// 字段名为 `_pin`（不以 `_` 开头的字段也会有未用警告，但这里它专用于生命周期钉住）。
+    _pin: Box<dyn std::any::Any + Send + Sync>,
+    bytes: Arc<Vec<u8>>,
 }
 
 impl EncodeCache {
@@ -527,20 +543,34 @@ impl EncodeCache {
     }
 
     /// 取或编码：命中返回共享 `Arc<Vec<u8>>`；miss 则调用 `encode` 一次并缓存。
-    pub fn get_or_encode(&self, key: usize, encode: impl FnOnce() -> Vec<u8>) -> Arc<Vec<u8>> {
+    ///
+    /// `pin` = 键所指向的源 `Arc` 的克隆（`Box<dyn Any>` 擦除类型）：miss 时存入
+    /// 条目以钉住地址（ISSUE-0011 ABA 防护），hit 时直接丢弃（缓存命中，无需新 pin）。
+    pub fn get_or_encode(
+        &self,
+        key: usize,
+        pin: Box<dyn std::any::Any + Send + Sync>,
+        encode: impl FnOnce() -> Vec<u8>,
+    ) -> Arc<Vec<u8>> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(v) = inner.get(&key) {
-            return Arc::clone(v);
+        if let Some(entry) = inner.get(&key) {
+            return Arc::clone(&entry.bytes);
         }
-        let v = Arc::new(encode());
+        let bytes = Arc::new(encode());
         if inner.len() >= self.capacity {
-            inner.clear(); // 满则清（简单淘汰：旧帧指针不复用，留着只会是死条目）
+            inner.clear(); // 满则清（简单淘汰：pin 随条目一起释放，地址归还分配器）
         }
-        inner.insert(key, Arc::clone(&v));
-        v
+        inner.insert(
+            key,
+            EncodeEntry {
+                _pin: pin,
+                bytes: Arc::clone(&bytes),
+            },
+        );
+        bytes
     }
 }
 
@@ -670,19 +700,29 @@ impl EventSink for SessionSink {
                 let out = match &cmd {
                     ServerCommand::Touches { frames, .. } => {
                         let key = Arc::as_ptr(frames) as usize;
-                        Outbound::Encoded(self.encode_cache.get_or_encode(key, || {
-                            let mut buf = Vec::new();
-                            encode_packet(&cmd, &mut buf);
-                            buf
-                        }))
+                        // ISSUE-0011：把源帧 Arc 克隆传入，miss 时被条目钉住（防 ABA）
+                        Outbound::Encoded(self.encode_cache.get_or_encode(
+                            key,
+                            Box::new(Arc::clone(frames)),
+                            || {
+                                let mut buf = Vec::new();
+                                encode_packet(&cmd, &mut buf);
+                                buf
+                            },
+                        ))
                     }
                     ServerCommand::Judges { judges, .. } => {
                         let key = Arc::as_ptr(judges) as usize;
-                        Outbound::Encoded(self.encode_cache.get_or_encode(key, || {
-                            let mut buf = Vec::new();
-                            encode_packet(&cmd, &mut buf);
-                            buf
-                        }))
+                        // ISSUE-0011：同 Touches——钉住源 Arc，杜绝地址复用命中死条目
+                        Outbound::Encoded(self.encode_cache.get_or_encode(
+                            key,
+                            Box::new(Arc::clone(judges)),
+                            || {
+                                let mut buf = Vec::new();
+                                encode_packet(&cmd, &mut buf);
+                                buf
+                            },
+                        ))
                     }
                     _ => Outbound::Command(cmd),
                 };
@@ -923,6 +963,22 @@ pub async fn handle_connection(
         }
     };
 
+    // D2（技术债）：版本握手校验——客户端版本不匹配立即断开（§6.1 / 对照 gooophira）。
+    // 服务端模式 = 读客户端发来的 1 字节版本；v1 协议到来前只认 PROTOCOL_VERSION。
+    // 不匹配一般为旧/新客户端，拒绝比容忍安全（避免旧客户端发 v2 帧被误解析）。
+    if stream.version() != PROTOCOL_VERSION {
+        warn!(
+            "protocol version mismatch from {addr}: got {}, want {}",
+            stream.version(),
+            PROTOCOL_VERSION
+        );
+        // 校验失败：显式释放准入（§10.4 防泄漏），然后断开连接。
+        if state.admission_held.swap(false, Ordering::SeqCst) {
+            ctx.admission.release(state.peer_ip);
+        }
+        return Ok(());
+    }
+
     // 心跳监控（§6.1）：10s 无任何包 → 判断线 → 生命周期 Disconnected + 通知主流程断开。
     // 主流程用 `select!` 同时等待客户端断开与超时信号（避免共享 Stream 的 take 竞争）。
     let monitor_state = Arc::clone(&state);
@@ -1113,12 +1169,32 @@ pub async fn http_serve(
         }
         "/healthz" => {
             // §11.1 方案 B：测活 + 测健康一步到位；不依赖官方 API（官方挂掉不影响测活）
+            // B3（技术债）：把 bus 收集的 Metrics 也暴露出来，让可观测性数据进黑洞的债持续不再
+            let metrics: serde_json::Value = {
+                let snap = ctx.bus.metrics().snapshot();
+                let mut map = serde_json::Map::new();
+                for (name, s) in snap {
+                    map.insert(
+                        name.to_owned(),
+                        serde_json::json!({
+                            "calls": s.calls,
+                            "ok": s.ok,
+                            "business": s.business,
+                            "internal": s.internal,
+                            "avg_latency_ms": s.avg_latency_ms,
+                        }),
+                    );
+                }
+                serde_json::Value::Object(map)
+            };
             let body = serde_json::json!({
                 "status": "ok",
                 "version": env!("CARGO_PKG_VERSION"),
                 "uptime_s": uptime_s(),
                 "connections": ctx.sink.conn_count().await,
                 "rooms": ctx.room_list.snapshot().await.len(),
+                "internal_errors": ctx.bus.metrics().internal_errors(),
+                "metrics": metrics,
             })
             .to_string();
             ("200 OK", body, "application/json; charset=utf-8")
@@ -1353,5 +1429,76 @@ async fn shutdown_signal() {
         tokio::signal::ctrl_c()
             .await
             .expect("install ctrl-c handler");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phira_api::TouchFrame;
+
+    /// ISSUE-0011：缓存条目必须持有源 `Arc` 克隆钉住地址（防分配器复用 → ABA）。
+    ///
+    /// miss 时缓存 `_pin` 持有一份 `Arc::clone(&frames)`，因此源 `Arc` 强引用数 = 2
+    /// （外层测试变量 + 缓存条目）——证明地址被钉住，不可能释放/复用。
+    #[test]
+    fn encode_cache_pins_source_arc() {
+        let cache = EncodeCache::new(64);
+        let frames = Arc::new(vec![TouchFrame {
+            time: 1.0,
+            points: vec![],
+        }]);
+        let addr = Arc::as_ptr(&frames) as usize;
+        let _ = cache.get_or_encode(addr, Box::new(Arc::clone(&frames)), || vec![0xAA]);
+        assert_eq!(Arc::strong_count(&frames), 2);
+    }
+
+    /// 同 key 命中：返回缓存字节（一次编码共享），pin 在 hit 时被丢弃（计数回到外层）。
+    #[test]
+    fn encode_cache_hit_returns_cached_bytes() {
+        let cache = EncodeCache::new(64);
+        let frames = Arc::new(vec![TouchFrame {
+            time: 1.0,
+            points: vec![],
+        }]);
+        let addr = Arc::as_ptr(&frames) as usize;
+        let first = cache.get_or_encode(addr, Box::new(Arc::clone(&frames)), || vec![0xAA, 0xBB]);
+        let second = cache.get_or_encode(addr, Box::new(Arc::new(())), || vec![0xCC]);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(&*second, &[0xAA, 0xBB]);
+    }
+
+    /// 不同 key 互不污染：两批不同内容走不同条目，各自编码结果独立。
+    #[test]
+    fn encode_cache_distinct_keys_isolate() {
+        let cache = EncodeCache::new(64);
+        let a = Arc::new(vec![1u8]);
+        let b = Arc::new(vec![2u8]);
+        let ka = Arc::as_ptr(&a) as usize;
+        let kb = Arc::as_ptr(&b) as usize;
+        let va = cache.get_or_encode(ka, Box::new(Arc::clone(&a)), || vec![0xA1]);
+        let vb = cache.get_or_encode(kb, Box::new(Arc::clone(&b)), || vec![0xB2]);
+        assert_eq!(&*va, &[0xA1]);
+        assert_eq!(&*vb, &[0xB2]);
+    }
+
+    /// ISSUE-0011 回归核心：地址复用模拟——两条内容不同、但构造出同 key 的源，
+    /// 第二次投递必须命中第一次的缓存（被钉住），而不是取到历史/新编码。
+    ///
+    /// 注：无法在测试里确定性诱导分配器真实复用地址，这里用「同 addr 人工复现」
+    /// 验证缓存正确性（命中旧条目则返回旧字节，绝不重编）。真正防复用靠 `_pin` 钉住。
+    #[test]
+    fn encode_cache_same_addr_reuses_pinned_entry() {
+        let cache = EncodeCache::new(64);
+        let frames = Arc::new(vec![TouchFrame {
+            time: 1.0,
+            points: vec![],
+        }]);
+        let addr = Arc::as_ptr(&frames) as usize;
+        let first = cache.get_or_encode(addr, Box::new(Arc::clone(&frames)), || vec![0x11]);
+        // 同地址（模拟分配器复用），但内容不同：应命中缓存返回旧字节，而非重新编码
+        let second = cache.get_or_encode(addr, Box::new(Arc::clone(&frames)), || vec![0x22]);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(&*second, &[0x11]);
     }
 }

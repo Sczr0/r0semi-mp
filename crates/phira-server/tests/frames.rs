@@ -289,9 +289,13 @@ async fn pre_auth_4k_frame_rejected() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
 }
 
-/// 握手版本宽容（原版语义 + §6.1 只读不校验）：任意版本字节仍可通信。
+/// 握手版本校验（D2）：非 v1 版本握手后应立即断开——不再宽容任意版本（§6.1）。
+///
+/// 原语义「版本只读不校验」已被技术债 D2 推翻：不匹配的客户端（旧/新）拒绝比
+/// 容忍安全，避免旧客户端发 v2 帧被误解析。
 #[tokio::test]
-async fn handshake_any_version_accepted() {
+async fn handshake_rejects_wrong_version_then_accepts_v1() {
+    // 用例 1：非法版本（0x63 ≠ PROTOCOL_VERSION=1）→ 握手即断开，Ping 无应答。
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -301,12 +305,42 @@ async fn handshake_any_version_accepted() {
     });
 
     let mut sock = TcpStream::connect(addr).await.unwrap();
-    sock.write_all(&[0x63]).await.unwrap(); // 任意版本字节（非 v1）
+    sock.write_all(&[0x63]).await.unwrap(); // 非 v1 版本字节
+    sock.write_all(&frame(&[0x00])).await.unwrap();
+    // 服务端校验拒绝 → 关闭连接：读首字节应为 EOF（0）或错误，而非超时等待。
+    let answered = tokio::time::timeout(Duration::from_millis(300), sock.read_u8()).await;
+    // 超时（挂死没断）= 服务端未按 D2 拒绝 → 失败
+    let Ok(byte) = answered else {
+        panic!("非法版本握手后连接未被服务端断开");
+    };
+    match byte {
+        Ok(0) => {}
+        // 读到数据 = 服务端仍响应（未拒绝）→ 失败
+        Ok(_) => panic!("非法版本握手后不应收到数据"),
+        // IO 错误（连接 reset 等）= 连接已关（拒绝成功）
+        Err(e) => {
+            assert!(
+                e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.kind() == std::io::ErrorKind::ConnectionReset,
+                "非法版本握手后连接关闭异常: {e}"
+            );
+        }
+    }
+    drop(sock);
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
 
-    // 仍能 Ping → Pong（版本不校验，§6.1）
+    // 用例 2：合法版本（PROTOCOL_VERSION=1）→ 握手成功，Ping → Pong 正常。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_done = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = handle_connection(stream, addr, test_ctx()).await;
+    });
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(&[PROTOCOL_VERSION]).await.unwrap();
     sock.write_all(&frame(&[0x00])).await.unwrap();
     let payload = read_frame(&mut sock).await;
-    assert_eq!(payload, vec![0x00], "任意版本握手后 Ping 仍应答");
+    assert_eq!(payload, vec![0x00], "合法版本握手后 Ping → Pong");
     drop(sock);
     let _ = tokio::time::timeout(Duration::from_secs(2), server_done).await;
 }
