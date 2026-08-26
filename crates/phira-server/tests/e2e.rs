@@ -43,11 +43,16 @@ async fn mock_api(addr: std::net::SocketAddr) {
             }
             let text = String::from_utf8_lossy(&head);
             let body = if text.contains("Bearer tok1") {
-                r#"{"id": 1, "name": "p1", "language": "zh"}"#
+                r#"{"id": 1, "name": "p1", "language": "en-US"}"#
             } else if text.contains("Bearer tok2") {
-                r#"{"id": 2, "name": "p2", "language": "zh"}"#
+                r#"{"id": 2, "name": "p2", "language": "en-US"}"#
             } else if text.contains("Bearer tok3") {
-                r#"{"id": 3, "name": "p3", "language": "zh"}"#
+                r#"{"id": 3, "name": "p3", "language": "en-US"}"#
+            } else if text.contains("Bearer tokzh1") {
+                // B2 i18n：中文用户（验收：错误文案按 lang 本地化）
+                r#"{"id": 11, "name": "房子主", "language": "zh-CN"}"#
+            } else if text.contains("Bearer tokzh2") {
+                r#"{"id": 12, "name": "房客", "language": "zh-TW"}"#
             } else if text.contains("GET /chart/1 ") {
                 r#"{"id": 1, "name": "Test Chart"}"#
             } else {
@@ -1625,4 +1630,97 @@ async fn hotpath_touches_broadcast_memory() {
 /// 等写任务清账回落（连接关闭 → MemoryReleaser → in_flight 递减）。
 async fn sleep_to_release() {
     tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// B2 i18n 验收：错误文案按用户 `language` 本地化（对齐原版 per-user 三语）。
+///
+/// zh-CN 房主建房 + 锁房 → zh-TW 用户 JoinRoom 被 RoomLocked 拒绝 →
+/// 断言收到**繁体**文案「房間已鎖定」（同时覆盖 zh-CN 房主的简洁侧解析）。
+#[tokio::test]
+async fn error_messages_localized_by_user_language() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx(mock_addr);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    // zh-CN 房主（id=11）鉴权 + 建房 + 锁房
+    let mut host = client_connect(server_addr).await;
+    send_cmd(
+        &mut host,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tokzh1".into()).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_cmd(&mut host).await,
+        ServerCommand::Authenticate(Ok(_))
+    ));
+    send_cmd(
+        &mut host,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("i18n".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut host).await; // CreateRoom 广播
+    assert!(matches!(
+        recv_cmd(&mut host).await,
+        ServerCommand::CreateRoom(Ok(()))
+    ));
+
+    // zh-TW 客人（id=12）先加入（未锁，成功）→ 房主锁房 → 再离开后重进被拒？
+    // 简化：客人先不动，直接让房主锁房；再让一个**新** zh-TW 连接尝试加入 →
+    // RoomLocked 中文（繁体）文案。
+    send_cmd(&mut host, &ClientCommand::LockRoom { lock: true }).await;
+    let _ = recv_cmd(&mut host).await; // Message(LockRoom) 广播
+    assert!(matches!(
+        recv_cmd(&mut host).await,
+        ServerCommand::LockRoom(Ok(()))
+    ));
+
+    // zh-TW 客人鉴权 + 加入已锁房间 → 应收**繁体**错误
+    let mut guest = client_connect(server_addr).await;
+    send_cmd(
+        &mut guest,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tokzh2".into()).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_cmd(&mut guest).await,
+        ServerCommand::Authenticate(Ok(_))
+    ));
+    send_cmd(
+        &mut guest,
+        &ClientCommand::JoinRoom {
+            id: phira_api::RoomId::new("i18n".into()).unwrap(),
+            monitor: false,
+        },
+    )
+    .await;
+    let resp = recv_cmd(&mut guest).await;
+    match resp {
+        ServerCommand::JoinRoom(Err(msg)) => {
+            assert_eq!(msg, "房間已鎖定", "zh-TW 用户应收到繁体本地化文案: {msg}");
+        }
+        other => panic!("锁定房间的加入应失败: {other:?}"),
+    }
+
+    drop(host);
+    drop(guest);
 }

@@ -45,6 +45,7 @@ async fn deliver_drops_when_queue_full_without_blocking() {
         Arc::new(tx),
         Arc::clone(&bp),
         Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        phira_server::l10n::Locale::default(),
     )
     .await;
 
@@ -71,6 +72,7 @@ async fn backpressure_clears_when_queue_drains() {
         Arc::new(tx),
         Arc::clone(&bp),
         Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        phira_server::l10n::Locale::default(),
     )
     .await;
 

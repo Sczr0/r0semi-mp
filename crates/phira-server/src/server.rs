@@ -580,6 +580,48 @@ impl Default for EncodeCache {
     }
 }
 
+/// 错误码 → 本地化 key 映射（B2 i18n）：仅对齐原版 ftl 覆盖的 6 条；
+/// 未映射的错误码返回 None → 保留 impl 原文（优雅降级，不丢信息）。
+const fn localize_key(code: RoomErrorCode) -> Option<crate::l10n::Key> {
+    match code {
+        RoomErrorCode::RoomIdOccupied => Some(crate::l10n::Key::CreateIdOccupied),
+        RoomErrorCode::RoomLocked => Some(crate::l10n::Key::JoinRoomLocked),
+        RoomErrorCode::GameOngoing => Some(crate::l10n::Key::JoinGameOngoing),
+        RoomErrorCode::CannotMonitor => Some(crate::l10n::Key::JoinCantMonitor),
+        RoomErrorCode::RoomFull => Some(crate::l10n::Key::JoinRoomFull),
+        RoomErrorCode::NoChartSelected => Some(crate::l10n::Key::StartNoChartSelected),
+        _ => None,
+    }
+}
+
+/// 按发起者语言本地化 Failure 文案（B2 i18n 出口点，见 [`localize_key`]）。
+///
+/// `Ok(Failure(Business))` 与 `Err(Business)` 双形态都处理（`response_to_server`
+/// 对二者同归一为 Err 文案——翻译须在归一化之前拦截）。
+fn localize_failure(
+    resp: Result<RoomResponse, RoomError>,
+    lang: crate::l10n::Locale,
+) -> Result<RoomResponse, RoomError> {
+    let translate = |code: RoomErrorCode, msg: &mut String| {
+        if let Some(key) = localize_key(code) {
+            key.localized(lang).clone_into(msg);
+        }
+    };
+    match resp {
+        Ok(RoomResponse::Failure(RoomError::Business { code, msg })) => {
+            let mut m = msg;
+            translate(code, &mut m);
+            Ok(RoomResponse::Failure(RoomError::Business { code, msg: m }))
+        }
+        Err(RoomError::Business { code, msg }) => {
+            let mut m = msg;
+            translate(code, &mut m);
+            Err(RoomError::Business { code, msg: m })
+        }
+        other => other,
+    }
+}
+
 /// 受限命令的限速键 + 最小间隔（ISSUE-0006：只限"贵"命令，资源成本驱动）。
 ///
 /// - `CreateRoom`：spawn actor + channel（最贵）→ 1/s
@@ -610,6 +652,9 @@ struct SendSlot {
     backpressure: Arc<Backpressure>,
     /// 本连接 send 队列在途字节（安全锁 A：写任务消费时经同一 Arc 递减）。
     queue_bytes: Arc<AtomicUsize>,
+    /// 用户语言（B2 i18n：鉴权响应的 `language` 字段解析结果）——错误响应本地化用；
+    /// 随会话生灭（unregister 释放），无影子表驻留（C2 同款纪律）。
+    lang: crate::l10n::Locale,
 }
 
 pub struct SessionSink {
@@ -641,6 +686,7 @@ impl SessionSink {
         tx: Arc<mpsc::Sender<Outbound>>,
         backpressure: Arc<Backpressure>,
         queue_bytes: Arc<AtomicUsize>,
+        lang: crate::l10n::Locale,
     ) {
         self.sessions.write().await.insert(
             user_id,
@@ -648,8 +694,18 @@ impl SessionSink {
                 tx,
                 backpressure,
                 queue_bytes,
+                lang,
             }),
         );
+    }
+
+    /// 查询用户语言（B2 i18n：错误响应出口本地化用；未注册回落默认 en-US）。
+    async fn locale_of(&self, user_id: i32) -> crate::l10n::Locale {
+        self.sessions
+            .read()
+            .await
+            .get(&user_id)
+            .map_or_else(crate::l10n::Locale::default, |slot| slot.lang)
     }
 
     /// 找出 send 队列在途字节最大的会话（安全锁 A：全局超限时断最重）。
@@ -1267,11 +1323,12 @@ async fn handle_frame(
     if let Some((key, interval)) = rate_limit(&cmd)
         && !state.limiter.allow(key, interval)
     {
+        let lang = ctx.sink.locale_of(user_id).await;
         let sc = response_to_server(
             &cmd,
             Ok(RoomResponse::Failure(RoomError::Business {
                 code: RoomErrorCode::TooManyRequests,
-                msg: "too many requests".to_owned(),
+                msg: crate::l10n::Key::TooManyRequests.localized(lang).to_owned(),
             })),
         );
         let _ = send_tx.try_send(Outbound::Command(sc));
@@ -1303,7 +1360,11 @@ async fn handle_frame(
     // 热路径（Touches/Judges）只转发给 monitor，不回答发者（§6.5-17）
     let server_cmd = match &cmd {
         ClientCommand::Touches { .. } | ClientCommand::Judges { .. } => None,
-        _ => Some(response_to_server(&cmd, resp)),
+        // B2 i18n：Failure 响应按发起者语言本地化（出口点唯一，与 impl 解耦）
+        _ => {
+            let lang = ctx.sink.locale_of(user_id).await;
+            Some(response_to_server(&cmd, localize_failure(resp, lang)))
+        }
     };
     if let Some(sc) = server_cmd {
         // ISSUE-0004：命令响应走 try_send——满则丢 + 标记积压（不阻塞本连接 recv 任务；
@@ -1351,6 +1412,7 @@ async fn authenticate_flow(
                     Arc::clone(send_tx),
                     Arc::clone(&state.backpressure),
                     Arc::clone(&state.queue_bytes),
+                    crate::l10n::Locale::from_lang_str(&identity.lang),
                 )
                 .await;
             let _ = ctx

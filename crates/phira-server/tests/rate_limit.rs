@@ -65,7 +65,7 @@ impl AuthHandler for AuthOk {
         Ok(UserIdentity {
             user_id: 1,
             name: "limiter".to_owned(),
-            lang: "zh".to_owned(),
+            lang: "en-US".to_owned(), // 行为测试与语言无关：固定 en，断言英文文案（zh 链路见 e2e i18n 专项）
         })
     }
 }
