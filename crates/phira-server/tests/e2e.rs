@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use phira_api::{
-    ClientCommand, JoinRoomResponse, RoomConfig, RoomDeps, RoomResponse, ServerCommand, UserInfo,
-    Varchar,
+    ClientCommand, JoinRoomResponse, RoomConfig, RoomDeps, RoomResponse, ServerCommand, TouchFrame,
+    UserInfo, Varchar,
 };
 use phira_core::{Bus, lifecycle::LifecycleTask};
 use phira_server::http::{HttpApiClient, HttpAuth, ThreadRngSource};
-use phira_server::server::{ConnContext, SessionSink, handle_connection};
+use phira_server::server::{ConnContext, SessionSink, handle_connection, in_flight_bytes};
 use phira_server::stream::PROTOCOL_VERSION;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1431,4 +1431,198 @@ async fn join_during_game_rejected_with_hint() {
     drop(c1);
     drop(c2);
     drop(c3);
+}
+
+/// 热路径内存压测（§6.5-17 编码一次共享 + §10.4 记账平衡）：完整对局进入 Playing，
+/// 多 monitor 在线，房主发 N 次大 Touches 帧 → 广播给全部 monitor → EncodeCache 编码一次共享。
+/// 量 `in_flight_bytes` 峰值（必须 ≤ 64MiB 守卫）与压测后回落（无泄漏）。
+#[allow(clippy::too_many_lines)] // 完整对局脚本长是验收场景需求（同 monitor 流程）
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hotpath_touches_broadcast_memory() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    // monitor 白名单 = [2, 3]（两个观战者，验证同一帧编码一次共享）
+    let ctx = setup_ctx_with_monitors(mock_addr, vec![2, 3]);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    // 房主（tok1）鉴权 + 建房
+    let mut c1 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c1,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok1".into()).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::Authenticate(Ok(_))
+    ));
+    send_cmd(
+        &mut c1,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("hp".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c1).await; // CreateRoom 广播
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::CreateRoom(Ok(()))
+    ));
+
+    // 两个 monitor（tok2/tok3）加入（白名单 [2,3]）
+    let mut c2 = client_connect(server_addr).await;
+    let mut c3 = client_connect(server_addr).await;
+    for (c, tok) in [(&mut c2, "tok2"), (&mut c3, "tok3")] {
+        send_cmd(
+            c,
+            &ClientCommand::Authenticate {
+                token: Varchar::new(tok.into()).unwrap(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_cmd(c).await,
+            ServerCommand::Authenticate(Ok(_))
+        ));
+        send_cmd(
+            c,
+            &ClientCommand::JoinRoom {
+                id: phira_api::RoomId::new("hp".into()).unwrap(),
+                monitor: true,
+            },
+        )
+        .await;
+        for _ in 0..2 {
+            let _ = recv_cmd(&mut c1).await; // c1: OnJoinRoom + Message(JoinRoom)
+        }
+        for _ in 0..3 {
+            let _ = recv_cmd(c).await; // monitor: OnJoinRoom + Message(JoinRoom) + JoinRoom 响应
+        }
+    }
+
+    // 选图 + RequestStart → WaitForReady
+    send_cmd(&mut c1, &ClientCommand::SelectChart { id: 1 }).await;
+    for _ in 0..3 {
+        let _ = recv_cmd(&mut c1).await; // Message(SelectChart) + ChangeState + SelectChart(Ok)
+    }
+    send_cmd(&mut c1, &ClientCommand::RequestStart).await;
+    for _ in 0..3 {
+        let _ = recv_cmd(&mut c1).await; // Message(GameStart) + ChangeState(WaitingForReady) + Ok
+    }
+    let _ = recv_cmd(&mut c2).await;
+    let _ = recv_cmd(&mut c2).await;
+    let _ = recv_cmd(&mut c3).await;
+    let _ = recv_cmd(&mut c3).await;
+
+    // monitor ready → 全员（房主默认 + 2 monitor）→ StartPlaying（live）
+    // ready 是 All 广播：每次 ready 都广播给全部在线者，帧序难精确推演——
+    // 稳健做法是循环读直到收到 StartPlaying（读定匹配判定，带超时兜底）。
+    for c in [&mut c2, &mut c3] {
+        send_cmd(c, &ClientCommand::Ready).await;
+    }
+    // 三个连接都循环读直到各自看到 StartPlaying
+    let mut got_start = false;
+    'drain: for c in [&mut c1, &mut c2, &mut c3] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let f = recv_cmd(c).await;
+            if matches!(f, ServerCommand::Message(phira_api::Message::StartPlaying)) {
+                got_start = true;
+                continue 'drain;
+            }
+        }
+    }
+    assert!(got_start, "全员 ready 应 StartPlaying");
+
+    // —— 热路径：房主发 N 次大 Touches 帧 → 广播给 2 个 monitor ——
+    // 每帧 ~1MiB 编码（8 万 TouchFrame），N 次连续；monitor 只读不消费 → 队列积压记账
+    let baseline = in_flight_bytes();
+    let big_frames: Vec<TouchFrame> = (0..80_000)
+        .map(|i| TouchFrame {
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            time: i as f32 * 0.001,
+            points: vec![],
+        })
+        .collect();
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // 监控峰值
+    let peak_watch = Arc::clone(&peak);
+    let monitor_task = tokio::spawn(async move {
+        let end = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < end {
+            let v = in_flight_bytes();
+            if v > peak_watch.load(std::sync::atomic::Ordering::SeqCst) {
+                peak_watch.store(v, std::sync::atomic::Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    for _ in 0..10 {
+        send_cmd(
+            &mut c1,
+            &ClientCommand::Touches {
+                frames: Arc::new(big_frames.clone()),
+            },
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    monitor_task.await.unwrap();
+    let peak_v = peak.load(std::sync::atomic::Ordering::SeqCst);
+
+    eprintln!(
+        "== 热路径压测 ==\nbaseline={} peak={} (MiB: {})",
+        baseline,
+        peak_v,
+        peak_v / 1_048_576
+    );
+
+    assert!(
+        peak_v <= 64 * 1024 * 1024,
+        "热路径在途字节峰值 {} MiB 超 64 MiB 守卫",
+        peak_v / 1_048_576
+    );
+    assert!(
+        peak_v > baseline,
+        "热路径应产生在途记账增长: baseline={baseline} peak={peak_v}"
+    );
+
+    // 回落：断开 monitor（慢消费者积压场景，§10.4）——连接关闭后写任务清账（MemoryReleaser）
+    // 前提：monitor 未消费的积压字节仍记账；断开后写任务退出应释放。
+    drop(c2);
+    drop(c3);
+    sleep_to_release().await;
+    let after = in_flight_bytes();
+    eprintln!(
+        "断开 monitor 后 after={} (MiB: {})",
+        after,
+        after / 1_048_576
+    );
+    assert!(
+        after <= baseline + 64 * 1024,
+        "断开慢消费者后记账应回落（无泄漏）: baseline={baseline} after={after}"
+    );
+
+    drop(c1);
+}
+
+/// 等写任务清账回落（连接关闭 → MemoryReleaser → in_flight 递减）。
+async fn sleep_to_release() {
+    tokio::time::sleep(Duration::from_millis(500)).await;
 }
