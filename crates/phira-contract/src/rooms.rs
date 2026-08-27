@@ -215,6 +215,7 @@ pub async fn room_contract_suite<F: RoomFactory>(factory: &F) {
     game_flow(factory).await;
     record_fetch_failure_settles(factory).await;
     record_chart_mismatch_settles(factory).await;
+    admin_management(factory).await;
     disconnect_reconnect(factory).await;
     monitor_and_relay(factory).await;
     config_and_client_state(factory).await;
@@ -861,6 +862,92 @@ async fn record_chart_mismatch_settles<F: RoomFactory>(factory: &F) {
             .iter()
             .any(|e| matches!(e, RoomEvent::GameEnd { room_id, .. } if room_id == &rid())),
         "全员结算应 GameEnd（fail-open 成绩照常收尾）: {events:?}"
+    );
+}
+
+/// 管理动作（阶段 2，docs/admin-api.md §4）：AdminKick/AdminBroadcast——仅系统 origin，
+/// 复用 evict（UserLeft+迁移+空房自毁）与系统 Chat（user=0）语义；不在房 → NotInRoom。
+#[allow(clippy::too_many_lines)] // 场景脚本多段断言一体
+async fn admin_management<F: RoomFactory>(factory: &F) {
+    let mut room = factory.create(rid());
+    setup_playing(&mut room).await; // 房主 1 + 玩家 2/3，Playing 态
+
+    // —— AdminBroadcast：系统 Chat（user=0）房内广播 ——
+    let (resp, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::AdminBroadcast {
+                content: "维护通知".to_owned(),
+            },
+        )
+        .await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    assert!(
+        events.contains(&RoomEvent::Chat {
+            room_id: rid(),
+            user: 0,
+            content: "维护通知".to_owned(),
+        }),
+        "公告应产系统 Chat: {events:?}"
+    );
+
+    // —— AdminKick 普通玩家：UserLeft + Playing 下触发结算检查（2 被踢 → 剩 1/3，未全结算）——
+    let (resp, events) = room
+        .handle(sys_ctx(), RoomCommand::AdminKick { user_id: 2 })
+        .await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    assert!(
+        events.contains(&RoomEvent::UserLeft {
+            room_id: rid(),
+            user: 2,
+            name: "user2".to_owned(),
+        }),
+        "踢出应广播 UserLeft: {events:?}"
+    );
+    // 被踢者不在房：GetClientState 查不到
+    let (resp, _) = room
+        .handle(sys_ctx(), RoomCommand::GetClientState { user_id: 2 })
+        .await;
+    assert!(matches!(resp, Some(RoomResponse::ClientState(None))));
+
+    // —— AdminKick 房主：NewHost 迁移（新 host 在剩余玩家中；房间不空）——
+    let (resp, events) = room
+        .handle(sys_ctx(), RoomCommand::AdminKick { user_id: 1 })
+        .await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        RoomEvent::UserLeft {
+            room_id,
+            user: 1,
+            ..
+        } if room_id == &rid()
+    )));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            RoomEvent::NewHost {
+                room_id,
+                new_host: 3,
+                old_host: 1,
+            } if room_id == &rid()
+        )),
+        "房主被踢应迁移给剩余玩家: {events:?}"
+    );
+
+    // —— 不在房用户 → NotInRoom（管理面拿到精确失败）——
+    let (resp, _) = room
+        .handle(sys_ctx(), RoomCommand::AdminKick { user_id: 2 })
+        .await;
+    assert_business(resp.as_ref().unwrap(), RoomErrorCode::NotInRoom);
+
+    // —— 非 System origin（客户端伪装）：静默忽略（无响应无事件）——
+    let (resp, events) = room
+        .handle(ctx(3), RoomCommand::AdminKick { user_id: 3 })
+        .await;
+    assert!(
+        resp.is_none() && events.is_empty(),
+        "客户端 origin 的管理命令应被忽略"
     );
 }
 

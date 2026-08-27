@@ -1,18 +1,25 @@
 //! 管理 HTTP 面（§运营，独立端口 `http_port`；docs/admin-api.md 设计定稿）。
 //!
-//! **C1 拆分第 1 步（2026-08）**：`http_serve`/`http_accept_loop` 从 server.rs（1594 行
-//! 上帝文件）抽出到本模块。角色 = 组合根旁的无状态翻译层：只读查询全部走既有快照
-//! （RoomListSink / SessionSink / Metrics），零写风险；写面（系统命令族）留阶段 2。
+//! **C1 拆分第 1 步（2026-08）**：`http_serve`/`http_accept_loop` 从 server.rs 上帝文件
+//! 抽出。角色 = 组合根旁的无状态翻译层：读查询走既有快照，写动作翻译成**系统命令族**
+//! （`AdminKick`/`AdminBroadcast`，§4.4 薄缝）——管理 API 不认识 impl、不持有状态。
 //!
-//! 端点（阶段 1）：`/` 端点清单 · `/rooms` 公开列表（隐私过滤）· `/healthz` 测活 +
-//! Metrics（B3）· `/admin/rooms[?state=]` · `/admin/rooms/{id}` · `/admin/users` ·
-//! `/admin/metrics`。
+//! 阶段 1（只读）：`/` `/rooms` `/healthz` + `/admin/rooms[?state=]` `/admin/rooms/{id}`
+//! `/admin/users` `/admin/metrics`。
+//! 阶段 2（写面 + 审计 + 认证，docs/admin-api.md §3 四件套）：`POST /admin/rooms/{id}/kick`、
+//! `POST /admin/rooms/{id}/broadcast`、`POST /admin/users/{id}/ban`、
+//! `POST /admin/users/{id}/disconnect`、`GET /admin/audit`；**全部 `/admin/*` 需要
+//! `Authorization: Bearer <admin_token>`**（token 未配置 = 管理面整体 401 禁用）。
 //!
-//! 健壮性继承（防御哲学与回源侧一致，§10.4/C3）：头 ≤4KiB、体经 serde_json 自限、
-//! 端口隔离（管理面挂掉不影响 MP 入口）、`Connection: close` 无长连接面。
+//! 健壮性继承：头 ≤4KiB、POST 体 ≤1KiB、端口隔离（管理面挂掉不影响 MP 入口）、
+//! `Connection: close`。
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use phira_api::{RoomCommand, RoomError, RoomErrorCode, RoomResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
@@ -48,6 +55,98 @@ pub async fn http_accept_loop(listener: Option<TcpListener>, ctx: Arc<ConnContex
     }
 }
 
+// —— 审计（docs/admin-api.md §3 四件套之魂） ——
+
+/// 管理写操作审计条目。
+#[derive(Clone, serde::Serialize)]
+pub struct AuditEntry {
+    /// 操作时间（unix 秒）。
+    pub at: u64,
+    /// 动作（如 `admin.kick` / `admin.ban`）。
+    pub action: String,
+    /// 目标（人类可读，如 `room:r1 user:42`）。
+    pub target: String,
+    /// 结果摘要（`ok` / 错误信息）。
+    pub result: String,
+}
+
+/// 审计环（有界 256 条，内存可控；组合根注入 ConnContext.admin_audit）。
+#[derive(Default)]
+pub struct AuditLog {
+    inner: Mutex<VecDeque<AuditEntry>>,
+}
+
+impl AuditLog {
+    /// 新建（空环）。返回 Arc 便于组合根注入。
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// 记录一条（超限丢最旧）。
+    pub fn record(&self, action: &str, target: &str, result: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.len() >= 256 {
+            inner.pop_front();
+        }
+        inner.push_back(AuditEntry {
+            at: now,
+            action: action.to_owned(),
+            target: target.to_owned(),
+            result: result.to_owned(),
+        });
+    }
+
+    /// 快照（时间倒序——最新在前，面板按此渲染）。
+    pub fn snapshot(&self) -> Vec<AuditEntry> {
+        let mut list: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.action.cmp(&b.action)));
+        list
+    }
+}
+
+// —— 响应与认证 ——
+
+/// 解析请求头里的字段（小写键，去空白）。
+fn header_of(head: &str, key: &str) -> Option<String> {
+    head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        if k.trim().eq_ignore_ascii_case(key) {
+            Some(v.trim().to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+/// 管理面认证：`Authorization: Bearer <token>` 且 `admin_token` 已配置且相等。
+/// token 未配置 = 管理面禁用（一律拒绝）。回话：`Ok(())` 或拒绝原因。
+fn authorize(ctx: &ConnContext, head: &str) -> Result<(), (&'static str, &'static str)> {
+    let Some(expect) = &ctx.admin_token else {
+        return Err((
+            "403 Forbidden",
+            "admin api disabled (no admin_token configured)",
+        ));
+    };
+    match header_of(head, "authorization") {
+        Some(v) if v == format!("Bearer {expect}") => Ok(()),
+        Some(_) => Err(("401 Unauthorized", "invalid token")),
+        None => Err(("401 Unauthorized", "missing bearer token")),
+    }
+}
+
 /// bus 的 Metrics 快照转 JSON 对象（`/healthz` 与 `/admin/metrics` 共用）。
 fn metrics_json(ctx: &ConnContext) -> serde_json::Value {
     let snap = ctx.bus.metrics().snapshot();
@@ -67,8 +166,7 @@ fn metrics_json(ctx: &ConnContext) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-/// 单请求处理：读头（≤4KiB）→ 路由 → 手写响应（`Connection: close`）。
-/// 路由表按阶段分层（docs/admin-api.md §4）：公共面 + 阶段 1 只读管理面。
+/// 单请求处理：读头（≤4KiB）+ 读体（≤1KiB，POST）→ 认证 → 路由 → 手写响应。
 ///
 /// # Errors
 ///
@@ -93,85 +191,162 @@ pub async fn http_serve(
         }
     }
     let text = String::from_utf8_lossy(&head);
-    let target = text
-        .lines()
-        .next()
-        .and_then(|l| l.split(' ').nth(1))
-        .unwrap_or("/");
-    // 分离路径与查询串（`/admin/rooms?state=playing`）
+    let request_line = text.lines().next().unwrap_or("");
+    let mut parts = request_line.split(' ');
+    let method = parts.next().unwrap_or("GET");
+    let target = parts.next().unwrap_or("/");
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p, q),
         None => (target, ""),
     };
     let query = query.to_ascii_lowercase();
 
-    let (status, body, ctype) = match path {
-        "/" => (
+    // POST 体：提取头内已读部分 + 按 Content-Length 补读（管理 JSON ≤1KiB，超限拒读
+    // ——防御哲学同 §10.4）。头体同包时 body 已在 head 尾部，不能丢。
+    let body = if method == "POST" {
+        let clen: usize = header_of(&text, "content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if clen > 1024 {
+            let resp = http_resp("413 Payload Too Large", "body too large", "text/plain");
+            stream.write_all(resp.as_bytes()).await?;
+            return Ok(());
+        }
+        let body_start = head
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(0, |i| i + 4);
+        let mut body = head[body_start..].to_vec();
+        if body.len() < clen {
+            let mut rest = vec![0u8; clen - body.len()];
+            stream.read_exact(&mut rest).await?;
+            body.extend_from_slice(&rest);
+        }
+        body
+    } else {
+        Vec::new()
+    };
+    let body_json: Option<serde_json::Value> = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice(&body).ok()
+    };
+
+    // —— 路由 ——
+    let (status, resp_body, ctype) =
+        route(method, path, &query, &text, body_json.as_ref(), &ctx).await;
+
+    let resp = http_resp(status, &resp_body, ctype);
+    stream.write_all(resp.as_bytes()).await?;
+    info!("http {method} {path} from {addr} -> {status}");
+    Ok(())
+}
+
+fn http_resp(status: &str, body: &str, ctype: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+async fn route(
+    method: &str,
+    path: &str,
+    query: &str,
+    head: &str,
+    body: Option<&serde_json::Value>,
+    ctx: &ConnContext,
+) -> (&'static str, String, &'static str) {
+    if !path.starts_with("/admin/") {
+        // 公共面（无需认证）：服务盘点/公开房间列表/测活
+        return route_public(method, path, ctx).await;
+    }
+    // 管理面：先认证（token 未配置 = 整体禁用 403）
+    if let Err((status, msg)) = authorize(ctx, head) {
+        return (status, msg.to_owned(), "text/plain");
+    }
+    if method == "GET" {
+        route_admin_read(path, query, ctx).await
+    } else {
+        route_admin_write(method, path, body, ctx).await
+    }
+}
+
+/// 公共面（`/` `/rooms` `/healthz`）。
+async fn route_public(
+    method: &str,
+    path: &str,
+    ctx: &ConnContext,
+) -> (&'static str, String, &'static str) {
+    match (method, path) {
+        ("GET", "/") => (
             "200 OK",
             serde_json::json!({
                 "service": "r0semi-mp",
-                "endpoints": ["/rooms", "/healthz", "/admin/rooms", "/admin/rooms/{id}", "/admin/users", "/admin/metrics"],
+                "endpoints": ["/rooms", "/healthz", "/admin/rooms", "/admin/rooms/{id}", "/admin/users", "/admin/metrics", "/admin/audit", "POST /admin/rooms/{id}/kick", "POST /admin/rooms/{id}/broadcast", "POST /admin/users/{id}/ban", "POST /admin/users/{id}/disconnect"],
             })
             .to_string(),
             "application/json; charset=utf-8",
         ),
-        "/rooms" => {
+        ("GET", "/rooms") => {
             let rooms = ctx.room_list.snapshot().await;
-            let body = serde_json::to_string(&rooms).unwrap_or_else(|_| "[]".to_owned());
-            ("200 OK", body, "application/json; charset=utf-8")
+            (
+                "200 OK",
+                serde_json::to_string(&rooms).unwrap_or_else(|_| "[]".to_owned()),
+                "application/json; charset=utf-8",
+            )
         }
-        "/healthz" => {
-            // §11.1 方案 B：测活 + 测健康一步到位；不依赖官方 API（官方挂掉不影响测活）
-            // B3（技术债）：把 bus 收集的 Metrics 也暴露出来
-            let body = serde_json::json!({
+        ("GET", "/healthz") => (
+            "200 OK",
+            serde_json::json!({
                 "status": "ok",
                 "version": env!("CARGO_PKG_VERSION"),
                 "uptime_s": uptime_s(),
                 "connections": ctx.sink.conn_count().await,
                 "rooms": ctx.room_list.snapshot().await.len(),
                 "internal_errors": ctx.bus.metrics().internal_errors(),
-                "metrics": metrics_json(&ctx),
+                "metrics": metrics_json(ctx),
             })
-            .to_string();
-            ("200 OK", body, "application/json; charset=utf-8")
-        }
-        // —— 阶段 1：只读管理面（docs/admin-api.md §4） ——
-        "/admin/metrics" => {
-            let body = serde_json::json!({
+            .to_string(),
+            "application/json; charset=utf-8",
+        ),
+        _ => ("404 Not Found", "not found".to_owned(), "text/plain"),
+    }
+}
+
+/// 管理读面（认证后）：metrics / rooms(过滤) / rooms/{id} / users / audit。
+async fn route_admin_read(
+    path: &str,
+    query: &str,
+    ctx: &ConnContext,
+) -> (&'static str, String, &'static str) {
+    match path {
+        "/admin/metrics" => (
+            "200 OK",
+            serde_json::json!({
                 "internal_errors": ctx.bus.metrics().internal_errors(),
-                "metrics": metrics_json(&ctx),
+                "metrics": metrics_json(ctx),
             })
-            .to_string();
-            ("200 OK", body, "application/json; charset=utf-8")
-        }
+            .to_string(),
+            "application/json; charset=utf-8",
+        ),
         "/admin/rooms" => {
-            // 状态过滤：`?state=` 子串匹配（大小写不敏感；RoomListSink 状态字符串
-            // 如 "Playing"/"WaitingForReady"/"SelectChart(1)"）；不传 = 全部。
             let rooms = ctx.room_list.snapshot().await;
-            let body = if let Some(st) = query.strip_prefix("state=") {
-                let rooms: Vec<_> = rooms
+            let rooms = if let Some(st) = query.strip_prefix("state=") {
+                rooms
                     .into_iter()
                     .filter(|r| r.state.to_ascii_lowercase().contains(st))
-                    .collect();
-                serde_json::to_string(&rooms).unwrap_or_else(|_| "[]".to_owned())
+                    .collect::<Vec<_>>()
             } else {
-                serde_json::to_string(&rooms).unwrap_or_else(|_| "[]".to_owned())
+                rooms
             };
-            ("200 OK", body, "application/json; charset=utf-8")
-        }
-        target if target.starts_with("/admin/rooms/") => {
-            let id = &target["/admin/rooms/".len()..];
-            let rooms = ctx.room_list.snapshot().await;
-            match rooms.into_iter().find(|r| r.id == id) {
-                Some(room) => {
-                    let body = serde_json::to_string(&room).unwrap_or_else(|_| "{}".to_owned());
-                    ("200 OK", body, "application/json; charset=utf-8")
-                }
-                None => ("404 Not Found", "room not found".to_owned(), "text/plain"),
-            }
+            (
+                "200 OK",
+                serde_json::to_string(&rooms).unwrap_or_else(|_| "[]".to_owned()),
+                "application/json; charset=utf-8",
+            )
         }
         "/admin/users" => {
-            // 在线用户：SessionSink 会话表 + 注册表名字 + 路由表房间归属（组合根视角拼装）
             let mut users = Vec::new();
             for user_id in ctx.sink.online().await {
                 let name = ctx.registry.name_of(user_id);
@@ -182,19 +357,208 @@ pub async fn http_serve(
                     "room_id": room_id.map(|r| r.as_str().to_owned()),
                 }));
             }
-            let body = serde_json::to_string(&users).unwrap_or_else(|_| "[]".to_owned());
-            ("200 OK", body, "application/json; charset=utf-8")
+            (
+                "200 OK",
+                serde_json::to_string(&users).unwrap_or_else(|_| "[]".to_owned()),
+                "application/json; charset=utf-8",
+            )
+        }
+        "/admin/audit" => (
+            "200 OK",
+            serde_json::to_string(&ctx.admin_audit.snapshot()).unwrap_or_else(|_| "[]".to_owned()),
+            "application/json; charset=utf-8",
+        ),
+        path if path.starts_with("/admin/rooms/") => {
+            let id = &path["/admin/rooms/".len()..];
+            let rooms = ctx.room_list.snapshot().await;
+            match rooms.into_iter().find(|r| r.id == id) {
+                Some(room) => (
+                    "200 OK",
+                    serde_json::to_string(&room).unwrap_or_else(|_| "{}".to_owned()),
+                    "application/json; charset=utf-8",
+                ),
+                None => ("404 Not Found", "room not found".to_owned(), "text/plain"),
+            }
         }
         _ => ("404 Not Found", "not found".to_owned(), "text/plain"),
-    };
-
-    let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(resp.as_bytes()).await?;
-    info!("http {path} from {addr} -> {status}");
-    Ok(())
+    }
 }
 
-// —— 本模块仅做读查询；写面（POST /admin/...）留阶段 2，届时走系统命令族 ——
+/// 管理写面（认证后，阶段 2）：系统命令族 + 审计。写操作无论成败都落审计。
+async fn route_admin_write(
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    ctx: &ConnContext,
+) -> (&'static str, String, &'static str) {
+    match (method, path) {
+        (m, path)
+            if path.starts_with("/admin/rooms/") && path.ends_with("/kick") && m == "POST" =>
+        {
+            let room_id = path["/admin/rooms/".len()..path.len() - "/kick".len()].to_owned();
+            let Some(user_id) = body
+                .and_then(|b| b["user_id"].as_i64())
+                .and_then(|v| i32::try_from(v).ok())
+            else {
+                return (
+                    "400 Bad Request",
+                    "missing user_id".to_owned(),
+                    "text/plain",
+                );
+            };
+            let result = admin_kick(ctx, &room_id, user_id).await;
+            ctx.admin_audit.record(
+                "admin.kick",
+                &format!("room:{room_id} user:{user_id}"),
+                &result.1,
+            );
+            (result.0, result.1, "application/json; charset=utf-8")
+        }
+        (m, path)
+            if path.starts_with("/admin/rooms/") && path.ends_with("/broadcast") && m == "POST" =>
+        {
+            let room_id = path["/admin/rooms/".len()..path.len() - "/broadcast".len()].to_owned();
+            let Some(content) = body.and_then(|b| b["content"].as_str()) else {
+                return (
+                    "400 Bad Request",
+                    "missing content".to_owned(),
+                    "text/plain",
+                );
+            };
+            // 截断至协议 Chat 上限类似量级（防超长公告）；user=0 系统约定
+            let content = content.chars().take(200).collect::<String>();
+            let result = admin_broadcast(ctx, &room_id, &content).await;
+            ctx.admin_audit
+                .record("admin.broadcast", &format!("room:{room_id}"), &result.1);
+            (result.0, result.1, "application/json; charset=utf-8")
+        }
+        (m, path) if path.starts_with("/admin/users/") && path.ends_with("/ban") && m == "POST" => {
+            let user_id = &path["/admin/users/".len()..path.len() - "/ban".len()];
+            let Ok(user_id) = user_id.parse::<i32>() else {
+                return ("400 Bad Request", "bad user_id".to_owned(), "text/plain");
+            };
+            let result = admin_ban(ctx, user_id).await;
+            ctx.admin_audit
+                .record("admin.ban", &format!("user:{user_id}"), &result.1);
+            (result.0, result.1, "application/json; charset=utf-8")
+        }
+        (m, path)
+            if path.starts_with("/admin/users/")
+                && path.ends_with("/disconnect")
+                && m == "POST" =>
+        {
+            let user_id = &path["/admin/users/".len()..path.len() - "/disconnect".len()];
+            let Ok(user_id) = user_id.parse::<i32>() else {
+                return ("400 Bad Request", "bad user_id".to_owned(), "text/plain");
+            };
+            let result = admin_disconnect(ctx, user_id).await;
+            ctx.admin_audit
+                .record("admin.disconnect", &format!("user:{user_id}"), &result.1);
+            (result.0, result.1, "application/json; charset=utf-8")
+        }
+        _ => (
+            "405 Method Not Allowed",
+            "unsupported admin endpoint".to_owned(),
+            "text/plain",
+        ),
+    }
+}
+
+/// 踢人：翻译成 `RoomCommand::AdminKick` 系统命令（房间 actor 串行通道执行，无需锁）。
+async fn admin_kick(ctx: &ConnContext, room_id: &str, user_id: i32) -> (&'static str, String) {
+    let Ok(room_id) = phira_api::RoomId::new(room_id.to_owned()) else {
+        return ("400 Bad Request", "bad room id".to_owned());
+    };
+    match ctx
+        .bus
+        .dispatch_system(room_id, RoomCommand::AdminKick { user_id })
+        .await
+    {
+        Ok(RoomResponse::Ok) => ("200 OK", serde_json::json!({"ok": true}).to_string()),
+        Ok(RoomResponse::Failure(RoomError::Business {
+            code: RoomErrorCode::NotInRoom,
+            ..
+        })) => (
+            "409 Conflict",
+            serde_json::json!({"ok": false, "error": "not_in_room"}).to_string(),
+        ),
+        Ok(_) => (
+            "500 Internal Server Error",
+            serde_json::json!({"ok": false, "error": "unexpected"}).to_string(),
+        ),
+        Err(e) => (
+            "404 Not Found",
+            serde_json::json!({"ok": false, "error": format!("{e}")}).to_string(),
+        ),
+    }
+}
+
+/// 公告：`RoomCommand::AdminBroadcast` 系统命令（房内系统 Chat，user=0）。
+async fn admin_broadcast(
+    ctx: &ConnContext,
+    room_id: &str,
+    content: &str,
+) -> (&'static str, String) {
+    let Ok(room_id) = phira_api::RoomId::new(room_id.to_owned()) else {
+        return ("400 Bad Request", "bad room id".to_owned());
+    };
+    match ctx
+        .bus
+        .dispatch_system(
+            room_id,
+            RoomCommand::AdminBroadcast {
+                content: content.to_owned(),
+            },
+        )
+        .await
+    {
+        Ok(RoomResponse::Ok) => ("200 OK", serde_json::json!({"ok": true}).to_string()),
+        Err(e) => (
+            "404 Not Found",
+            serde_json::json!({"ok": false, "error": format!("{e}")}).to_string(),
+        ),
+        _ => (
+            "500 Internal Server Error",
+            serde_json::json!({"ok": false, "error": "unexpected"}).to_string(),
+        ),
+    }
+}
+
+/// 封禁（阶段 2 语义）：踢出当前房间（若有）+ 断 TCP（kicker force_close）+ 审计。
+/// 注：重连后可再进——真正的名单拦截依赖 P2 Moderator + 阶段 4 鉴权拦截（文档 §1/§6）。
+async fn admin_ban(ctx: &ConnContext, user_id: i32) -> (&'static str, String) {
+    let mut parts = Vec::new();
+    if let Some(room_id) = ctx.bus.room_of(user_id).await {
+        match ctx
+            .bus
+            .dispatch_system(room_id.clone(), RoomCommand::AdminKick { user_id })
+            .await
+        {
+            Ok(RoomResponse::Ok) => parts.push("kicked".to_owned()),
+            other => parts.push(format!("kick:{other:?}")),
+        }
+    } else {
+        parts.push("not_in_room".to_owned());
+    }
+    if ctx.sink.force_disconnect(user_id).await {
+        parts.push("disconnected".to_owned());
+    } else {
+        parts.push("offline".to_owned());
+    }
+    (
+        "200 OK",
+        serde_json::json!({ "ok": true, "actions": parts }).to_string(),
+    )
+}
+
+/// 断连：仅 TCP 断开（连接收尾流程发生命周期事实），不出房。
+async fn admin_disconnect(ctx: &ConnContext, user_id: i32) -> (&'static str, String) {
+    if ctx.sink.force_disconnect(user_id).await {
+        ("200 OK", serde_json::json!({"ok": true}).to_string())
+    } else {
+        (
+            "404 Not Found",
+            serde_json::json!({"ok": false, "error": "user offline"}).to_string(),
+        )
+    }
+}

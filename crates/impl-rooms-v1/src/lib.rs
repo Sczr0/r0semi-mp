@@ -1035,6 +1035,37 @@ impl RoomActor for RoomV1 {
                 record_id,
                 record,
             } => self.handle_record_fetched(ctx, user_id, record_id, record),
+            // 管理动作（阶段 2，docs/admin-api.md §4）：仅系统 origin；非 System = 静默忽略
+            RoomCommand::AdminKick { user_id } => {
+                if !matches!(ctx.origin, Origin::System) {
+                    return (None, Vec::new());
+                }
+                if self.in_room(user_id) {
+                    // 复用 evict：UserLeft 广播 + 房主迁移 + 空房自毁（不断 TCP）
+                    (Some(RoomResponse::Ok), self.evict(user_id))
+                } else {
+                    (
+                        Some(RoomResponse::Failure(RoomError::Business {
+                            code: RoomErrorCode::NotInRoom,
+                            msg: "not in room".to_owned(),
+                        })),
+                        Vec::new(),
+                    )
+                }
+            }
+            RoomCommand::AdminBroadcast { content } => {
+                if !matches!(ctx.origin, Origin::System) {
+                    return (None, Vec::new());
+                }
+                (
+                    Some(RoomResponse::Ok),
+                    vec![RoomEvent::Chat {
+                        room_id: self.id.clone(),
+                        user: 0, // 系统约定（welcome 同源，§运营）
+                        content,
+                    }],
+                )
+            }
             RoomCommand::Abort => self.handle_abort(ctx),
             RoomCommand::LockRoom { lock } => self.handle_lock(ctx, lock),
             RoomCommand::CycleRoom { cycle } => self.handle_cycle(ctx, cycle),

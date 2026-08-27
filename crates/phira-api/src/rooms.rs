@@ -664,6 +664,19 @@ pub enum RoomCommand {
         /// 新配置（Arc 共享）。
         config: Arc<RoomConfig>,
     },
+    /// 管理踢出（阶段 2，docs/admin-api.md §4）：系统 origin 专用——把指定用户移出
+    /// 本房间（复用 evict 语义：UserLeft 广播 + 房主迁移 + 空房自毁；**不断 TCP**，
+    /// 断连是 ban 的独立动作）。回话：Ok / 用户不在房 → `NotInRoom`。
+    AdminKick {
+        /// 被踢用户 id。
+        user_id: i32,
+    },
+    /// 管理公告（阶段 2）：系统 origin 专用——向本房间广播系统 Chat（user=0 约定，
+    /// 与进服欢迎语同源）。回话恒 Ok。
+    AdminBroadcast {
+        /// 公告内容。
+        content: String,
+    },
 }
 
 /// 随机源（§4.9-6）：房主随机选择（§6.5-5），测试可注入 fake。

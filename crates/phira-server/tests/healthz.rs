@@ -75,11 +75,35 @@ fn test_ctx() -> Arc<ConnContext> {
         welcome_message: None,
         room_list: Arc::new(phira_server::server::RoomListSink::new(Vec::new())),
         proxy_protocol: false,
+        admin_token: Some("test-token".to_owned()),
+        admin_audit: phira_server::admin::AuditLog::new(),
     })
 }
 
 /// 向 http_serve 发一个 GET 请求，返回完整 HTTP 响应文本。
 async fn http_get(ctx: Arc<ConnContext>, path: &str) -> String {
+    http_request(ctx, "GET", path, &[], None).await
+}
+
+/// 带管理 Bearer 认证的请求（/admin/* 全部端点需要）。
+async fn http_admin(ctx: Arc<ConnContext>, method: &str, path: &str, body: &str) -> String {
+    http_request(
+        ctx,
+        method,
+        path,
+        body.as_bytes(),
+        Some("Bearer test-token"),
+    )
+    .await
+}
+
+async fn http_request(
+    ctx: Arc<ConnContext>,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    auth: Option<&str>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -87,10 +111,22 @@ async fn http_get(ctx: Arc<ConnContext>, path: &str) -> String {
         http_serve(stream, addr, ctx).await.unwrap();
     });
     let mut client = TcpStream::connect(addr).await.unwrap();
-    client
-        .write_all(format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes())
-        .await
-        .unwrap();
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: test\r\n");
+    if method == "POST" {
+        req = format!(
+            "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+    }
+    if let Some(auth) = auth {
+        use std::fmt::Write;
+        let _ = write!(req, "Authorization: {auth}\r\n");
+    }
+    req.push_str("\r\n");
+    client.write_all(req.as_bytes()).await.unwrap();
+    if !body.is_empty() {
+        client.write_all(body).await.unwrap();
+    }
     let mut resp = Vec::new();
     client.read_to_end(&mut resp).await.unwrap();
     String::from_utf8_lossy(&resp).into_owned()
@@ -208,20 +244,26 @@ async fn admin_rooms_list_with_state_filter() {
     .await;
 
     // 全量列表：两房都在，含 cycle 字段（阶段 1 详情字段）
-    let resp = http_get(Arc::clone(&ctx), "/admin/rooms").await;
+    let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/rooms", "").await;
     assert!(resp.contains("200 OK"), "状态行: {resp}");
     assert!(resp.contains("\"r1\""), "r1 在列表: {resp}");
     assert!(resp.contains("\"r2\""), "r2 在列表: {resp}");
     assert!(resp.contains("\"cycle\":false"), "cycle 字段存在: {resp}");
 
     // state 过滤：play 只留 r2（子串 + 大小写不敏感）
-    let resp = http_get(Arc::clone(&ctx), "/admin/rooms?state=play").await;
+    let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/rooms?state=play", "").await;
     assert!(
         resp.contains("\"r2\"") && !resp.contains("\"r1\""),
         "playing 过滤: {resp}"
     );
 
-    let resp = http_get(Arc::clone(&ctx), "/admin/rooms?state=selectchart").await;
+    let resp = http_admin(
+        Arc::clone(&ctx),
+        "GET",
+        "/admin/rooms?state=selectchart",
+        "",
+    )
+    .await;
     assert!(
         resp.contains("\"r1\"") && !resp.contains("\"r2\""),
         "selectchart 过滤: {resp}"
@@ -240,12 +282,12 @@ async fn admin_room_detail_and_404() {
     )
     .await;
 
-    let resp = http_get(Arc::clone(&ctx), "/admin/rooms/solo-1").await;
+    let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/rooms/solo-1", "").await;
     assert!(resp.contains("200 OK"), "状态行: {resp}");
     assert!(resp.contains("\"id\":\"solo-1\""), "id: {resp}");
     assert!(resp.contains("\"host\":7"), "host: {resp}");
 
-    let resp = http_get(Arc::clone(&ctx), "/admin/rooms/nope").await;
+    let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/rooms/nope", "").await;
     assert!(resp.contains("404 Not Found"), "不存在应 404: {resp}");
 }
 
@@ -265,7 +307,7 @@ async fn admin_users_online_with_name() {
         .await;
     let _ = ctx.registry.register(42, "admin-tester".to_owned());
 
-    let resp = http_get(Arc::clone(&ctx), "/admin/users").await;
+    let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/users", "").await;
     assert!(resp.contains("200 OK"), "状态行: {resp}");
     assert!(resp.contains("\"user_id\":42"), "在线用户 42: {resp}");
     assert!(
@@ -292,11 +334,92 @@ async fn admin_metrics_exposes_bus_statistics() {
         )
         .await
         .ok();
-    let resp = http_get(Arc::clone(&ctx), "/admin/metrics").await;
+    let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/metrics", "").await;
     assert!(resp.contains("200 OK"), "状态行: {resp}");
     assert!(
         resp.contains("\"internal_errors\":"),
         "internal_errors 键: {resp}"
     );
     assert!(resp.contains("\"metrics\":"), "metrics 键: {resp}");
+}
+
+// —— 阶段 2：认证 + 审计（docs/admin-api.md §2/§3） ——
+
+#[tokio::test]
+async fn admin_requires_bearer_token() {
+    let ctx = test_ctx();
+    // 无 Authorization → 401
+    let resp = http_get(Arc::clone(&ctx), "/admin/rooms").await;
+    assert!(resp.contains("401 Unauthorized"), "缺 token 应 401: {resp}");
+    // 错 token → 401
+    let resp = http_request(
+        Arc::clone(&ctx),
+        "GET",
+        "/admin/rooms",
+        &[],
+        Some("Bearer wrong"),
+    )
+    .await;
+    assert!(resp.contains("401 Unauthorized"), "错 token 应 401: {resp}");
+    // 公共面不受影响
+    let resp = http_get(Arc::clone(&ctx), "/rooms").await;
+    assert!(resp.contains("200 OK"), "/rooms 公共: {resp}");
+}
+
+#[tokio::test]
+async fn admin_disabled_when_no_token_configured() {
+    // token 未配置 → 整个管理面禁用（403），哪怕带任意头也不放行
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut ctx_no_auth = test_ctx();
+    let _ = Arc::get_mut(&mut ctx_no_auth);
+    // test_ctx 配了 token；为测"未配置"，构造一个等价但 token=None 的 ctx
+    let ctx2 = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let _ = addr;
+        std::sync::Arc::new(ConnContext {
+            bus: ctx_no_auth.bus.clone(),
+            auth: ctx_no_auth.auth.clone(),
+            registry: ctx_no_auth.registry.clone(),
+            fact_tx: ctx_no_auth.fact_tx.clone(),
+            sink: ctx_no_auth.sink.clone(),
+            admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
+            welcome_message: None,
+            room_list: ctx_no_auth.room_list.clone(),
+            proxy_protocol: false,
+            admin_token: None,
+            admin_audit: phira_server::admin::AuditLog::new(),
+        })
+    };
+    let _ = addr;
+    let resp = http_get(Arc::clone(&ctx2), "/admin/rooms").await;
+    assert!(
+        resp.contains("403 Forbidden"),
+        "未配 token 管理面应禁用 403: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn admin_kick_records_audit_even_on_failure() {
+    let ctx = test_ctx();
+    // 房间不存在 → kick 404，但审计必须记录（写操作无论成败都落审计）
+    let resp = http_admin(
+        Arc::clone(&ctx),
+        "POST",
+        "/admin/rooms/nope/kick",
+        r#"{"user_id": 42}"#,
+    )
+    .await;
+    assert!(
+        resp.contains("404 Not Found"),
+        "房不存在 kick 应 404: {resp}"
+    );
+    let audit = http_admin(Arc::clone(&ctx), "GET", "/admin/audit", "").await;
+    assert!(audit.contains("admin.kick"), "失败写操作也须审计: {audit}");
+    assert!(
+        audit.contains("nope") || audit.contains("user:42"),
+        "审计带目标: {audit}"
+    );
 }

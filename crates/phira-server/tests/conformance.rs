@@ -128,6 +128,8 @@ async fn spawn_server() -> std::net::SocketAddr {
         welcome_message: None,
         room_list,
         proxy_protocol: false,
+        admin_token: None,
+        admin_audit: phira_server::admin::AuditLog::new(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

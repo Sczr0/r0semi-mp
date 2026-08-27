@@ -60,10 +60,13 @@
 | `GET /admin/rooms/{id}` | 1 | ✅ 本轮 | 单房详情（RoomInfo + cycle）；不存在 → 404 |
 | `GET /admin/users` | 1 | ✅ 本轮 | 在线用户（id + name + room_id）；name 缺失（未注册）→ null |
 | `GET /admin/metrics` | 1 | ✅ 本轮 | bus Metrics 快照（与 /healthz.metrics 同构） |
-| `POST /admin/...`（写面） | 2 | ⬜ | 系统命令族 + 认证 + 审计 |
+| `POST /admin/rooms/{id}/kick` | 2 | ✅ 本轮 | 系统命令 `AdminKick`（复用 evict；不断 TCP）+ 审计 |
+| `POST /admin/rooms/{id}/broadcast` | 2 | ✅ 本轮 | 系统命令 `AdminBroadcast`（房内系统 Chat user=0）+ 审计 |
+| `POST /admin/users/{id}/ban` | 2 | ✅ 本轮 | kick（若有房）+ 断 TCP（kicker force_close）+ 审计；**名单拦截依赖 P2** |
+| `POST /admin/users/{id}/disconnect` | 2 | ✅ 本轮 | 仅断连（连接收尾发生命周期事实）+ 审计 |
+| `GET /admin/audit` | 2 | ✅ 本轮 | 审计环（有界 256，时间倒序） |
 | `POST /admin/config`、`/rollback` | 3 | ⬜ | runtime-config 热更 + 一步回滚 |
 | `POST /admin/observers` | 3 | ⬜ | observer 热插拔（§7.3 预留） |
-| `GET /admin/audit` | 2 | ⬜ | 操作审计查询 |
 
 **阶段 1 已知限制（诚实记录）**：
 - `/admin/rooms/{id}` 详情目前 = RoomInfo（id/host/users/state/locked/cycle）；
@@ -78,7 +81,7 @@
 |---|---|---|---|
 | 0 | 设计定稿（本文档） | — | — |
 | 1 ✅ | 只读管理面（/admin/rooms、rooms/{id}、users、metrics） | 零写风险、原 /rooms /healthz 回归不动 | **C1 拆分触发**（http_serve/http_accept_loop 从 server.rs → admin.rs） |
-| 2 | 写面系统命令族 + 认证 + 审计 | 每种干预一条 e2e + 审计可查 | C3 二次加固（管理面借机验上游 302：不动，管理面独立实现可免受影响） |
+| 2 ✅ | 写面系统命令族（AdminKick/AdminBroadcast）+ Bearer 认证 + 审计环 | kick e2e 全链路（含被踢者本人收 LeaveRoom）+ 401/403 + 审计 4 端点 | `/admin/*` 全认证（读面收紧）；AdminBan 名单拦截留 P2 |
 | 3 | runtime-config + rollback + observer 热插拔 | 回滚演练 + 热插拔 e2e | observer 热插拔（§7.3 预留） |
 | 4 | Web 面板 | 消费已稳定 API，不改服务端 | 反作弊 P2 的运营观察台顺手长在面板上 |
 

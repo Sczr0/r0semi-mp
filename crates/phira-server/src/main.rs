@@ -93,6 +93,9 @@ async fn main() -> Result<()> {
         proxy_protocol: config.proxy_protocol,
         // 进服欢迎语（yml welcome_message，None = 不发）
         welcome_message: config.welcome_message.clone(),
+        // 管理面（阶段 2）：Bearer token（None = 禁用）+ 写操作审计环
+        admin_token: config.admin_token.clone(),
+        admin_audit: phira_server::admin::AuditLog::new(),
         room_list,
     };
     let server = Server::new(

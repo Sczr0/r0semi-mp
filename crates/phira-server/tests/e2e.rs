@@ -70,7 +70,7 @@ async fn mock_api(addr: std::net::SocketAddr) {
 
 /// 真实组合（与 main.rs 同构，base = mock API）。
 fn setup_ctx(mock_addr: std::net::SocketAddr) -> Arc<ConnContext> {
-    setup_ctx_custom(mock_addr, vec![], None, vec![], vec![])
+    setup_ctx_custom(mock_addr, vec![], None, vec![], vec![], None)
 }
 
 /// 指定 monitor 白名单的测试上下文（§6.5-4：monitor 需权限）。
@@ -78,7 +78,7 @@ fn setup_ctx_with_monitors(
     mock_addr: std::net::SocketAddr,
     monitors: Vec<i32>,
 ) -> Arc<ConnContext> {
-    setup_ctx_custom(mock_addr, monitors, None, vec![], vec![])
+    setup_ctx_custom(mock_addr, monitors, None, vec![], vec![], None)
 }
 
 /// 注入观察者/拦截者（§7.3）的测试上下文。
@@ -86,7 +86,7 @@ fn setup_ctx_with_moderators(
     mock_addr: std::net::SocketAddr,
     moderators: Vec<Arc<dyn phira_api::Moderator>>,
 ) -> Arc<ConnContext> {
-    setup_ctx_custom(mock_addr, vec![], None, vec![], moderators)
+    setup_ctx_custom(mock_addr, vec![], None, vec![], moderators, None)
 }
 
 /// 完整参数化上下文（欢迎语 + 私密房间前缀 + 观察者，§运营）。
@@ -96,6 +96,7 @@ fn setup_ctx_custom(
     welcome: Option<&str>,
     hidden_prefixes: Vec<&str>,
     moderators: Vec<Arc<dyn phira_api::Moderator>>,
+    admin_token: Option<&str>,
 ) -> Arc<ConnContext> {
     let base = format!("http://{mock_addr}");
     let http = Arc::new(HttpApiClient::new(base.clone()));
@@ -145,6 +146,8 @@ fn setup_ctx_custom(
         welcome_message: welcome.map(str::to_owned),
         room_list,
         proxy_protocol: false,
+        admin_token: admin_token.map(str::to_owned),
+        admin_audit: phira_server::admin::AuditLog::new(),
     })
 }
 
@@ -1186,7 +1189,7 @@ async fn http_rooms_endpoint_with_private_filter() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
-    let ctx = setup_ctx_custom(mock_addr, vec![], None, vec!["solo"], vec![]);
+    let ctx = setup_ctx_custom(mock_addr, vec![], None, vec!["solo"], vec![], None);
 
     // 管理 HTTP 端点（独立端口，§运营）
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1288,7 +1291,14 @@ async fn welcome_message_sent_after_auth() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
-    let ctx = setup_ctx_custom(mock_addr, vec![], Some("欢迎来到 r0semi"), vec![], vec![]);
+    let ctx = setup_ctx_custom(
+        mock_addr,
+        vec![],
+        Some("欢迎来到 r0semi"),
+        vec![],
+        vec![],
+        None,
+    );
     tokio::spawn(async move {
         loop {
             let (stream, addr) = listener.accept().await.unwrap();
@@ -1842,4 +1852,173 @@ impl phira_api::Moderator for BlockUser1 {
     }
 
     async fn on_event(&self, _ev: &RoomEvent) {}
+}
+
+/// 手写 HTTP 请求（管理端点测试用；头体一次写入，服务端容忍同包）。
+#[allow(clippy::too_many_lines)] // 手写 HTTP 客户端全流程，测试专用
+async fn http_raw(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: &str,
+    auth: Option<&str>,
+) -> String {
+    use std::fmt::Write;
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: test\r\n");
+    if method == "POST" {
+        let _ = write!(req, "Content-Length: {}\r\n", body.len());
+    }
+    if let Some(auth) = auth {
+        let _ = write!(req, "Authorization: {auth}\r\n");
+    }
+    req.push_str("\r\n");
+    client.write_all(req.as_bytes()).await.unwrap();
+    if !body.is_empty() {
+        client.write_all(body.as_bytes()).await.unwrap();
+    }
+    let mut resp = Vec::new();
+    client.read_to_end(&mut resp).await.unwrap();
+    String::from_utf8_lossy(&resp).into_owned()
+}
+
+/// 写面全链路（阶段 2，docs/admin-api.md §4）：管理员 HTTP POST kick → 系统命令族 →
+/// 房内广播 LeaveRoom（含被踢者本人，先解析后应用 §4.9-4）；审计可查；无 token 401。
+#[allow(clippy::too_many_lines)] // 端到端剧本：步骤长是验收场景需求
+#[tokio::test]
+async fn admin_kick_roundtrip_via_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx_custom(mock_addr, vec![], None, vec![], vec![], Some("admin-token"));
+
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let http_ctx = Arc::clone(&ctx);
+    tokio::spawn(async move {
+        phira_server::admin::http_accept_loop(Some(http_listener), http_ctx).await;
+    });
+    let mp_ctx = Arc::clone(&ctx);
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&mp_ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    // 用户 1 建房 + 用户 2 入房
+    let mut c1 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c1,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok1".into()).unwrap(),
+        },
+    )
+    .await;
+    recv_cmd(&mut c1).await; // Authenticate(Ok)
+    send_cmd(
+        &mut c1,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("adm-r1".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c1).await; // Message::CreateRoom 广播
+    let _ = recv_cmd(&mut c1).await; // CreateRoom(Ok)
+
+    let mut c2 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c2,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok2".into()).unwrap(),
+        },
+    )
+    .await;
+    recv_cmd(&mut c2).await; // Authenticate(Ok)
+    send_cmd(
+        &mut c2,
+        &ClientCommand::JoinRoom {
+            id: phira_api::RoomId::new("adm-r1".into()).unwrap(),
+            monitor: false,
+        },
+    )
+    .await;
+    // c2 收到 JoinRoom 响应（此前可能有 OnJoinRoom 广播）
+    let mut joined = false;
+    for _ in 0..4 {
+        if matches!(recv_cmd(&mut c2).await, ServerCommand::JoinRoom(Ok(_))) {
+            joined = true;
+            break;
+        }
+    }
+    assert!(joined, "user2 应入房");
+
+    // —— 管理员踢 user2 ——
+    let resp = http_raw(
+        http_addr,
+        "POST",
+        "/admin/rooms/adm-r1/kick",
+        r#"{"user_id": 2}"#,
+        Some("Bearer admin-token"),
+    )
+    .await;
+    assert!(
+        resp.contains("200 OK") && resp.contains("\"ok\":true"),
+        "kick 应成功: {resp}"
+    );
+
+    // 房内广播 LeaveRoom(user:2)：c1 和 c2（被踢者本人）都收到
+    let mut left_for_c1 = false;
+    let mut left_for_c2 = false;
+    for _ in 0..4 {
+        if matches!(
+            recv_cmd(&mut c1).await,
+            ServerCommand::Message(phira_api::Message::LeaveRoom { user: 2, .. })
+        ) {
+            left_for_c1 = true;
+            break;
+        }
+    }
+    for _ in 0..4 {
+        if matches!(
+            recv_cmd(&mut c2).await,
+            ServerCommand::Message(phira_api::Message::LeaveRoom { user: 2, .. })
+        ) {
+            left_for_c2 = true;
+            break;
+        }
+    }
+    assert!(left_for_c1, "c1 应收到 user2 被踢的 LeaveRoom");
+    assert!(left_for_c2, "被踢者本人也应收到 LeaveRoom（先解析后应用）");
+
+    // 审计可查 + 无 token 401
+    let audit = http_raw(
+        http_addr,
+        "GET",
+        "/admin/audit",
+        "",
+        Some("Bearer admin-token"),
+    )
+    .await;
+    assert!(audit.contains("admin.kick"), "审计应含 kick: {audit}");
+    assert!(audit.contains("adm-r1"), "审计带目标房: {audit}");
+    let noauth = http_raw(
+        http_addr,
+        "POST",
+        "/admin/rooms/adm-r1/kick",
+        r#"{"user_id": 2}"#,
+        None,
+    )
+    .await;
+    assert!(
+        noauth.contains("401 Unauthorized"),
+        "无 token 应 401: {noauth}"
+    );
 }

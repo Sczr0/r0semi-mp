@@ -33,6 +33,9 @@ pub struct Config {
     pub hidden_room_prefixes: Vec<String>,
     /// 管理 HTTP 端口（§运营：`/rooms` 房间列表；None = 不开启）。
     pub http_port: Option<u16>,
+    /// 管理 API Bearer token（阶段 2，docs/admin-api.md §2）：`/admin/*` 全部端点
+    /// 需要 `Authorization: Bearer <token>`；None = 管理面（含读）一律 401 禁用。
+    pub admin_token: Option<String>,
     /// PROXY protocol（§前置层：反代后真实 IP，每 IP 限额才有效）。
     ///
     /// true = 所有连接必须先发 PROXY 头（HAProxy `send-proxy` / nginx `proxy_protocol on`），
@@ -58,6 +61,7 @@ impl Default for Config {
             hidden_room_prefixes: Vec::new(),
             http_port: None,
             proxy_protocol: false,
+            admin_token: None,
         }
     }
 }
@@ -155,6 +159,9 @@ impl Config {
         if let Ok(base) = env("R0SEMI_MP_API_BASE") {
             config.api_base = base;
         }
+        if let Ok(token) = env("R0SEMI_MP_ADMIN_TOKEN") {
+            config.admin_token = Some(token);
+        }
         Ok(config)
     }
 
@@ -208,6 +215,9 @@ impl Config {
         if let Some(proxy) = yaml.proxy_protocol {
             self.proxy_protocol = proxy;
         }
+        if let Some(token) = yaml.admin_token {
+            self.admin_token = Some(token);
+        }
         Ok(())
     }
 }
@@ -244,4 +254,6 @@ struct YamlConfig {
     http_port: Option<u16>,
     /// PROXY protocol（反代真实 IP）。
     proxy_protocol: Option<bool>,
+    /// 管理 API Bearer token（None = 管理面禁用）。
+    admin_token: Option<String>,
 }

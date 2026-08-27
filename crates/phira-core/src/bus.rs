@@ -571,7 +571,9 @@ fn queue_policy(cmd: &RoomCommand) -> QueuePolicy {
         | RoomCommand::UserReconnected { .. }
         | RoomCommand::UserDangleExpired { .. }
         | RoomCommand::GetClientState { .. }
-        | RoomCommand::RecordFetched { .. } => QueuePolicy::Wait,
+        | RoomCommand::RecordFetched { .. }
+        | RoomCommand::AdminKick { .. }
+        | RoomCommand::AdminBroadcast { .. } => QueuePolicy::Wait,
         // §5.6：新增命令默认按客户端命令处理（满则拒）
         _ => QueuePolicy::Reject,
     }
@@ -592,7 +594,9 @@ fn command_needs_response(cmd: &RoomCommand) -> bool {
         | RoomCommand::Played { .. }
         | RoomCommand::LockRoom { .. }
         | RoomCommand::CycleRoom { .. }
-        | RoomCommand::GetClientState { .. } => true,
+        | RoomCommand::GetClientState { .. }
+        | RoomCommand::AdminKick { .. }
+        | RoomCommand::AdminBroadcast { .. } => true,
         // RecordFetched 是回注型系统命令：结果经后续事件投递体现，本身无回话（§4.4）
         // §5.6：新增命令默认无回话，core 按 Ok 映射
         _ => false,
@@ -622,6 +626,8 @@ fn command_name(cmd: &RoomCommand) -> &'static str {
         RoomCommand::UserDangleExpired { .. } => "user_dangle_expired",
         RoomCommand::GetClientState { .. } => "get_client_state",
         RoomCommand::RecordFetched { .. } => "record_fetched",
+        RoomCommand::AdminKick { .. } => "admin_kick",
+        RoomCommand::AdminBroadcast { .. } => "admin_broadcast",
         RoomCommand::UpdateConfig { .. } => "update_config",
         // §5.6：api 枚举 non_exhaustive，追加变体时必须留通配
         _ => "unknown",

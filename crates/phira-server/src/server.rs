@@ -339,6 +339,10 @@ pub struct ConnContext {
     pub room_list: Arc<RoomListSink>,
     /// PROXY protocol 开关（§前置层：反代后真实 IP；yml `proxy_protocol`）。
     pub proxy_protocol: bool,
+    /// 管理 API Bearer token（阶段 2；None = 管理面禁用，见 admin.rs）。
+    pub admin_token: Option<String>,
+    /// 管理写操作审计（docs/admin-api.md §3 四件套之一；组合根注入）。
+    pub admin_audit: Arc<crate::admin::AuditLog>,
 }
 
 /// 事件投递：`user_id → 会话发送通道`映射 + 转换层目标过滤。
@@ -715,6 +719,19 @@ impl SessionSink {
         let mut ids: Vec<i32> = self.sessions.read().await.keys().copied().collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// 管理断连（阶段 2，docs/admin-api.md：ban/disconnect）：借 kicker 的
+    /// `force_close` 拆掉该用户连接（kicker 1s 轮询执行，连接收尾流程发
+    /// 生命周期事实）；**不删会话映射**（断连是连接层事实）。返回该用户是否在线。
+    pub async fn force_disconnect(&self, user_id: i32) -> bool {
+        let slot = self.sessions.read().await.get(&user_id).cloned();
+        if let Some(slot) = slot {
+            slot.backpressure.force_close();
+            true
+        } else {
+            false
+        }
     }
 
     /// 注销会话：仅当当前映射仍是本连接（重连后旧连接断开不误删新连接，§4.9-3）。

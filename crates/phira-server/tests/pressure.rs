@@ -81,6 +81,8 @@ fn test_ctx() -> Arc<ConnContext> {
         welcome_message: None,
         room_list: Arc::new(phira_server::server::RoomListSink::new(Vec::new())),
         proxy_protocol: false,
+        admin_token: None,
+        admin_audit: phira_server::admin::AuditLog::new(),
     })
 }
 
