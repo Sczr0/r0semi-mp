@@ -85,6 +85,11 @@ pub const PRE_AUTH_MAX_PACKET: u32 = 4 * 1024;
 /// 握手超时（§10.4：peek/读首字节 ≤5s——半开连接（connect 后不发版本）不占资源）。
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 写批处理上限（docs/performance-cpu.md §6）：一次 `recv_many` 至多攒这么多帧
+/// 合并为一次 `write_all`——Windows IOCP 下每次写 = 一次完成端口唤醒，1500 连接
+/// 高频小包场景直接减系统调用量。低流量时 `recv_many` 至少等一帧即返回，延迟不增。
+pub const WRITE_BATCH_MAX: usize = 64;
+
 /// 双向帧流：发送载荷固定为 [`Outbound`]（服务端侧——命令或共享编码帧），
 /// `R` = 接收载荷类型（`ClientCommand`）。
 ///
@@ -152,44 +157,57 @@ where
             async move {
                 // 安全锁 A：Drop guard——任务结束（含 abort）释放剩余记账（无泄漏）
                 let _releaser = MemoryReleaser(Arc::clone(&queue_bytes));
-                let mut buffer = Vec::new();
+                // 写批处理（实测淬取，docs/performance-cpu.md §6）：Windows IOCP 每次 write
+                // 一次完成端口唤醒——1500 连接高频小包下合并帧一次写，系统调用量直接减半量级。
+                // `recv_many` 队列空时至少等一帧即返回（低流量下延迟不增）；
+                // 批内帧共享一处 output——每帧编出后拼接。
+                let mut batch: Vec<Outbound> = Vec::with_capacity(crate::stream::WRITE_BATCH_MAX);
+                let mut frame = Vec::new();
+                let mut out = Vec::new();
                 let mut len_buf = [0u8; 5];
-                while let Some(payload) = send_rx.recv().await {
-                    buffer.clear();
-                    match payload {
-                        Outbound::Command(cmd) => {
-                            encode_packet(&cmd, &mut buffer);
-                            trace!("sending {} bytes ({cmd:?}): {buffer:?}", buffer.len());
+                loop {
+                    batch.clear();
+                    frame.clear();
+                    out.clear();
+                    let got = send_rx
+                        .recv_many(&mut batch, crate::stream::WRITE_BATCH_MAX)
+                        .await;
+                    if got == 0 {
+                        break; // 通道关闭 = 连接收尾
+                    }
+                    for payload in batch.drain(..) {
+                        frame.clear();
+                        match &payload {
+                            Outbound::Command(cmd) => {
+                                encode_packet(cmd, &mut frame);
+                                trace!("sending {} bytes ({cmd:?})", frame.len());
+                            }
+                            // 热路径共享编码帧（ISSUE-0003 方案 2）：直写缓存字节，零序列化
+                            Outbound::Encoded(bytes) => {
+                                // 安全锁 A：消费后释放记账（queue_bytes 减 + 全局在途字节减）
+                                queue_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
+                                crate::server::release_memory(bytes.len());
+                                frame.extend_from_slice(bytes);
+                            }
                         }
-                        // 热路径共享编码帧（ISSUE-0003 方案 2）：直写缓存字节，零序列化
-                        Outbound::Encoded(bytes) => {
-                            // 安全锁 A：消费后释放记账（queue_bytes 减 + 全局在途字节减）
-                            queue_bytes.fetch_sub(bytes.len(), Ordering::SeqCst);
-                            crate::server::release_memory(bytes.len());
-                            buffer.extend_from_slice(&bytes);
+
+                        // ULEB128 长度前缀（§6.1）：载荷 ≤ 2 MiB → 最多 3 字节，缓冲 5 够用
+                        let mut x = u32::try_from(frame.len()).expect("payload ≤ 2MiB fits u32");
+                        let mut n = 0;
+                        loop {
+                            len_buf[n] = (x & 0x7f) as u8;
+                            n += 1;
+                            x >>= 7;
+                            if x == 0 {
+                                break;
+                            }
+                            len_buf[n - 1] |= 0x80;
                         }
+                        out.extend_from_slice(&len_buf[..n]);
+                        out.extend_from_slice(&frame);
                     }
 
-                    // ULEB128 长度前缀（§6.1）：载荷 ≤ 2 MiB → 最多 3 字节，缓冲 5 够用
-                    let mut x = u32::try_from(buffer.len()).expect("payload ≤ 2MiB fits u32");
-                    let mut n = 0;
-                    loop {
-                        len_buf[n] = (x & 0x7f) as u8;
-                        n += 1;
-                        x >>= 7;
-                        if x == 0 {
-                            break;
-                        }
-                        len_buf[n - 1] |= 0x80;
-                    }
-
-                    if let Err(err) = async {
-                        write.write_all(&len_buf[..n]).await?;
-                        write.write_all(&buffer).await?;
-                        Ok::<_, anyhow::Error>(())
-                    }
-                    .await
-                    {
+                    if let Err(err) = write.write_all(&out).await {
                         error!("failed to send: {err:?}");
                     }
                 }

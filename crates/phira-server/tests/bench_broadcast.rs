@@ -220,16 +220,11 @@ async fn broadcast_fanout_bench() {
     let addr = listener.local_addr().unwrap();
     let accept_ctx = Arc::clone(&ctx);
     let accept = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    let ctx = Arc::clone(&accept_ctx);
-                    tokio::spawn(async move {
-                        let _ = handle_connection(stream, addr, ctx).await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, addr)) = listener.accept().await {
+            let ctx = Arc::clone(&accept_ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
         }
     });
 
@@ -238,7 +233,7 @@ async fn broadcast_fanout_bench() {
     let room = phira_api::RoomId::new("r1".to_owned()).unwrap();
     let mut socks = Vec::with_capacity(n);
     for i in 0..n {
-        let id = i as i32 + 1;
+        let id = i32::try_from(i).unwrap_or(i32::MAX) + 1;
         socks.push(connect_player(addr, id, room.clone(), i == 0).await);
     }
     let frames = Arc::new(vec![phira_api::TouchFrame {

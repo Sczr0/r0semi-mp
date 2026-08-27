@@ -34,11 +34,31 @@ R0SEMI_BENCH_N=300 R0SEMI_BENCH_SECS=8 cargo test -p phira-server --test bench_b
 load 29 与这个量级吻合——**扇出放大就是瓶颈本体**，单点优化（编码一次等 ADR-0009）
 已被放大率吃光。
 
-## 3. 采样探路记录（samply on Windows）
+## 3. 实测采样（2026-08-28，Windows ETW：samply record + Firefox profiler UI 导出）
 
-`samply record`（v0.13.1，ETW）对 8s 压测仅采到每线程 6 个样本（>90s 窗口），
-火焰图不可信。Windows 采样受限；**未来在 Linux CI 用 `perf record` 复核**
-（bench 保持 `#[ignore]` + 环境变量化，可挂到任何平台）。
+**样本 15162，模块归属**（frameTable → nativeSymbol → lib）：
+
+| 模块 | 占比 | 代表函数 | 语义 |
+|---|---|---|---|
+| ntdll.dll | 70% | `NtWaitForAlertByThreadId` 6690 / `NtRemoveIoCompletionEx` 3122 / `NtRemoveIoCompletion` 531 | **IOCP 完成端口循环 + 等待**—— 每包一次完成唤醒 |
+| ntoskrnl.exe | 11% | 内核 | 系统调用底 |
+| 用户态算法（未符号化 fun_*） | <5% | 合计 ~700 | 房间 deliver/转换 **不是大头** |
+| 用户态可见 | 1.4% | atomic_load / CAS / RtlLookupEntryHashTable | 记账/队列 |
+
+**结论修正**：静态假设（§2）预测用户态放大（event_to_server 重转）为瓶颈——**实测推翻**：
+Windows 上 1500 连接双向高频小包，CPU 主体是**每包一次 IO 完成端口唤醒/系统调用**
+（`NtRemoveIoCompletionEx` 系列 + 写侧每帧 2 次 `write_all` syscall）。
+优化重心应放在**系统调用面**（批处理合并 IO），而非用户态算法去重。
+
+**已落地（同轮）**：写侧批处理（`stream.rs` WRITE_BATCH_MAX=64：`recv_many`
+攒帧一次 `write_all`，低流量延迟不增）——回归绿（memory_guard 账目平衡/healthz）。
+**量化复核路径**：非管理员 ETW 采样 + samply save-only 无符号（函数名是地址、
+lib 归属缺失）——对比分析以 Firefox profiler UI 导出（compact，含符号+libs）为准；
+**效果量化建议在 Linux CI 用 `perf record` 复核**（bench 可移植）。
+
+**备选后续**：读侧长度前缀逐字节 `read_u8`（每字节 poll）可改为带用户缓冲的合读
+（需 pending 缓冲，防吞后续帧载荷——本轮未动）；`tokio` multi_thread 单 IO driver
+为架构级约束（1500 连接高频双向 → driver 单线程），缓解靠减少 IO 事件数。
 
 ## 4. 优化候选（按 ROI 排序，均需拍板后实施）
 
