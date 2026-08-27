@@ -42,4 +42,9 @@ sd-notify = "0.4"
 [dev-dependencies]
 # 测试专用：本地 TLS 服务器自签证书生成（§10.3 测试覆盖 TLS 握手路径）
 # 证书直接用 rcgen 的 der()，无需 pemfile（2026-08 删：未使用且被 RUSTSEC-2025-0134 标记 unmaintained）
-rcgen = "0.13" 
+rcgen = "0.13"
+# 崩溃猎手 conformance（client-behavior-review §8）：真客户端在用的 SDK（Apache-2.0，
+# rev 对齐 C:/git/Phira 游戏客户端 Cargo.toml 锁定）。注意 GPL 的是游戏客户端仓库本体，
+# 本 SDK 是独立的 Apache-2.0 协议仓库，dev-dependency 引入无许可证污染。
+phira-mp-client = { git = "https://github.com/TeamFlos/phira-mp", rev = "cc822df" }
+phira-mp-common = { git = "https://github.com/TeamFlos/phira-mp", rev = "cc822df" }
