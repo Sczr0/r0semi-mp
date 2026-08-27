@@ -311,7 +311,34 @@ pub struct AntiCheatObserver {
     fingerprints: std::sync::Mutex<std::collections::HashMap<(i32, i32), phira_api::RoomId>>,
     /// 拒绝记录环形（有界 256，`/admin/anticheat` 展示；不落盘——P2 审计面后续接 storage）。
     rejects: std::sync::Mutex<std::collections::VecDeque<AntiCheatReject>>,
+    /// 成绩历史（R2 频率规则）：`user → 最近成绩 (at 秒, accuracy)`，环形 64/用户。
+    history:
+        std::sync::Mutex<std::collections::HashMap<i32, std::collections::VecDeque<(u64, f32)>>>,
+    /// 观测 flag 环形（有界 256；R2 高频打谱标记，管理面展示——不自动拦，防误伤）。
+    flags: std::sync::Mutex<std::collections::VecDeque<AntiCheatFlag>>,
 }
+
+/// 观测标记（R2 高频打谱等，环形时间倒序展示）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AntiCheatFlag {
+    /// 标记时间（unix 秒）。
+    pub at: u64,
+    /// 用户 id。
+    pub user: i32,
+    /// 原因（如 `high_frequency`）。
+    pub reason: &'static str,
+    /// 窗口内成绩数（判据值）。
+    pub hits: usize,
+    /// 窗口秒数（判据）。
+    pub window_secs: u64,
+}
+
+/// R2 判据：成绩频率规则（on_event 面，纯观测不自动拦——防误伤）。
+/// 60 秒窗口内同用户完成 ≥10 局 = 平均 ~6s/局——3 分钟谱面不可能，
+/// 对机器人/脚本/录播重放具区分度；阈值保守 + 仅 flag（管理端人工/后续 enforce）。
+const HIT_WINDOW_SECS: u64 = 60;
+const HIT_LIMIT: usize = 10;
+const HISTORY_PER_USER: usize = 64;
 
 /// 反作弊拒绝条目（环形，时间倒序展示）。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -373,6 +400,66 @@ impl AntiCheatObserver {
         list.sort_by_key(|r| std::cmp::Reverse(r.at));
         list
     }
+
+    /// 观测 flag 快照（时间倒序；R2 高频打谱等）。
+    pub fn flags_snapshot(&self) -> Vec<AntiCheatFlag> {
+        let mut list: Vec<_> = self
+            .flags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        list.sort_by_key(|f| std::cmp::Reverse(f.at));
+        list
+    }
+
+    /// 记录一次成绩（R2 数据面；`at` 可注入便于测试窗口裁剪）。
+    ///
+    /// 维护每用户环形历史（≤64 条，窗口外旧记时装不进则裁），命中频率判据 → flag。
+    pub fn record_play_at(&self, at: u64, user: i32, _score: i32, accuracy: f32) {
+        let mut hist = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let q = hist.entry(user).or_default();
+        q.push_back((at, accuracy));
+        if q.len() > HISTORY_PER_USER {
+            q.pop_front();
+        }
+        // 裁出窗口内计数：栈尾是最近，向前回退至窗口边界
+        let count = q
+            .iter()
+            .rev()
+            .take_while(|(t, _)| at - *t <= HIT_WINDOW_SECS)
+            .count();
+        if count >= HIT_LIMIT {
+            let mut flags = self
+                .flags
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if flags.len() >= 256 {
+                flags.pop_front();
+            }
+            flags.push_back(AntiCheatFlag {
+                at,
+                user,
+                reason: "high_frequency",
+                hits: count,
+                window_secs: HIT_WINDOW_SECS,
+            });
+        }
+        // 总量兜底（防内存暴涨）：超出则淘汰全表最旧用户
+        if hist.len() * HISTORY_PER_USER > 64 * HISTORY_PER_USER {
+            if let Some(earliest) = hist
+                .iter()
+                .min_by_key(|(_, q)| q.front().map_or(u64::MAX, |(t, _)| *t))
+            {
+                let u = *earliest.0;
+                hist.remove(&u);
+            }
+        }
+    }
 }
 
 /// 指纹上限（防内存暴涨；超限清空——重放检测短暂失效可接受，文档注明）。
@@ -420,8 +507,24 @@ impl phira_api::Moderator for AntiCheatObserver {
         Ok(())
     }
 
-    async fn on_event(&self, _ev: &RoomEvent) {
-        // P2 v1：判定全在同步拦截路径（intercept）；事件面留给后续规则（节奏/成绩分布）。
+    async fn on_event(&self, ev: &RoomEvent) {
+        // R2 成绩频率规则（领域事件面）：Played 广播携带 user/score/accuracy
+        // （A2 回源成功后广播——数据可信；热路径已由 core 过滤不送达）。
+        if let RoomEvent::Played {
+            user,
+            score,
+            accuracy,
+            ..
+        } = ev
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            self.record_play_at(now, *user, *score, *accuracy);
+            return;
+        }
+        // P2 v2：拦截判定仍在同步 intercept（R1）；on_event 已用于观测规则 R2。
+        // 后续可加：成绩分布（score/accuracy 异常）、同图多次结算节奏。
     }
 }
 /// 封禁名单观察者（阶段 3 首个真实 Moderator，docs/admin-api.md §4）：

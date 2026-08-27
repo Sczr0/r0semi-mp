@@ -367,7 +367,44 @@ async fn anticheat_hotplug_and_admin_view() {
     );
 }
 
-/// Pure admin plane: GET /admin/anticheat returns 200 + serialized data (healthz-style).
+/// R2 频率规则：60s 窗口 ≥10 局 → flag（纯观测不拦）；窗口裁剪（旧记录不计）+ 环形上限。
+#[tokio::test]
+async fn anticheat_high_frequency_flag() {
+    let anti = AntiCheatObserver::new();
+
+    // 9 局（窗口内）不触发
+    for i in 0..9 {
+        anti.record_play_at(1000 + i * 5, 1, 900_000, 99.0);
+    }
+    assert!(anti.flags_snapshot().is_empty(), "9 局不应 flag");
+
+    // 第 10 局（窗口内）触发
+    anti.record_play_at(1045, 1, 900_000, 99.0);
+    let flags = anti.flags_snapshot();
+    assert_eq!(flags.len(), 1, "应 flag 1 条: {flags:?}");
+    assert_eq!(flags[0].user, 1);
+    assert_eq!(flags[0].reason, "high_frequency");
+    assert_eq!(flags[0].hits, 10);
+
+    // 窗口裁剪：窗口外的旧记录不计数——远窗外 10 条（间隔 1s，at 互距小但整块离上一块 >60s）
+    for i in 0..10 {
+        anti.record_play_at(100_000 + i, 1, 900_000, 99.0);
+    }
+    let flags2 = anti.flags_snapshot();
+    assert_eq!(
+        flags2.len(),
+        2,
+        "新窗口命中 → 第 2 条; 旧窗口不再重复 flag: {flags2:?}"
+    );
+    assert_eq!(flags2[0].hits, 10);
+
+    // 总量兜底（多用户防内存暴涨）：批次写入不 panic 即可（环形上限在实现内保证）
+    for i in 0..40 {
+        anti.record_play_at(300_000 + i, i32::try_from(i).unwrap_or(0) + 3, 1, 0.0);
+    }
+}
+
+/// 纯管理面：GET /admin/anticheat 返回 200 + serialized data (healthz-style).
 #[tokio::test]
 async fn anticheat_admin_endpoint() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -433,6 +433,7 @@ async fn route_admin_read(
             serde_json::json!({
                 "fingerprints": ctx.admin_anticheat.fingerprint_len(),
                 "rejects": ctx.admin_anticheat.rejects_snapshot(),
+                "flags": ctx.admin_anticheat.flags_snapshot(),
             })
             .to_string(),
             "application/json; charset=utf-8",
