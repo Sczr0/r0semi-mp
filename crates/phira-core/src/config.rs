@@ -36,6 +36,9 @@ pub struct Config {
     /// 管理 API Bearer token（阶段 2，docs/admin-api.md §2）：`/admin/*` 全部端点
     /// 需要 `Authorization: Bearer <token>`；None = 管理面（含读）一律 401 禁用。
     pub admin_token: Option<String>,
+    /// 管理面持久化目录（组合根 storage：bans.json / audit.jsonl / config.current|last.json；
+    /// 默认 `./data`，None = 仅内存）。
+    pub persist_dir: String,
     /// PROXY protocol（§前置层：反代后真实 IP，每 IP 限额才有效）。
     ///
     /// true = 所有连接必须先发 PROXY 头（HAProxy `send-proxy` / nginx `proxy_protocol on`），
@@ -62,6 +65,7 @@ impl Default for Config {
             http_port: None,
             proxy_protocol: false,
             admin_token: None,
+            persist_dir: "./data".to_owned(),
         }
     }
 }
@@ -162,6 +166,9 @@ impl Config {
         if let Ok(token) = env("R0SEMI_MP_ADMIN_TOKEN") {
             config.admin_token = Some(token);
         }
+        if let Ok(dir) = env("R0SEMI_MP_PERSIST_DIR") {
+            config.persist_dir = dir;
+        }
         Ok(config)
     }
 
@@ -218,6 +225,9 @@ impl Config {
         if let Some(token) = yaml.admin_token {
             self.admin_token = Some(token);
         }
+        if let Some(dir) = yaml.persist_dir {
+            self.persist_dir = dir;
+        }
         Ok(())
     }
 }
@@ -256,4 +266,6 @@ struct YamlConfig {
     proxy_protocol: Option<bool>,
     /// 管理 API Bearer token（None = 管理面禁用）。
     admin_token: Option<String>,
+    /// 管理面持久化目录（None = 仅内存）。
+    persist_dir: Option<String>,
 }

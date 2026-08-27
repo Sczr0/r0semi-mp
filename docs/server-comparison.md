@@ -156,7 +156,7 @@ commands.go   Commands.ts        jphira-mp-protocol  phira-api/src/*
 | 鉴权前降级 | ❌ 未鉴权即 2MiB | ❌ 统一 | ❌ 统一 | ? | ✅ **4KiB pre-auth** |
 | 类型级输入约束 | Varchar<20> 房间号白名单 | ParseRoomID 具名守卫 | 部分 | 外部库 | ✅ Varchar<32>/<200> + RoomId charset |
 | 模糊测试 | 无 | 无专项（有 framing bench） | protocol 相关测试 | 无 e2e pipeline 测试 | ✅ 解码器 fuzz + 真 TCP 垃圾流 |
-| 版本字节不匹配 | 断开 | 断开 | ⚠️ 仅 warn | 握手协商（外部库） | 待查证（见 §7 边界） |
+| 版本字节不匹配 | 仅记录不校验（log-only，任何字节都收） | 断开（ver != 1 即断） | ⚠️ 仅 warn | 仅记录不校验（log-only，外部库） | ✅ 拒绝不匹配（D2 已落地，回归测试） |
 | 内存兜底 | 无 | 连接上限+IP 限速 | 50 conn/IP 限流 | ReadTimeoutHandler | ✅ 64MiB 全局字节账本 + 8MiB/conn + 1000 已鉴权上限 |
 
 ### T3 断线-重连-顶号
@@ -252,4 +252,4 @@ r0semi 是唯一公开可复核运行时数据的：RSS 稳态 4.3–5.2MB（ARC
 - nodejsver 性能数据为其 README 自报，未经本审计复现；r0semi 数据出自自家压测 harness 与 ARCHITECTURE §10.1.1 实测记录，方法学为回环灌流。
 - gooophira 作者在 README 中自述项目系 AI 赶工、不建议生产使用——引用于此仅为完整性，不构成对其工程质量的全盘否定（其测试密度五家最高）。
 - 原版目录下的 `docs/ARCHITECTURE.md` 与 `docs/adr/` 为 r0semi 项目叠加的重写设计文档，并非上游产物；上游原版自身近乎零文档。
-- r0semi 的"版本字节不匹配处置"与个别 gooophira 细节（bench yml 具体阈值）未逐行核对，标注"待查证/以代码为准"，遵循 AGENTS.md 总纪律。
+- r0semi 的个别 gooophira 细节（bench yml 具体阈值）未逐行核对，标注"待查证/以代码为准"；「版本字节不匹配」行已按 2026-08-27 复核更正（原版 = log-only 不校验、jphira = log-only、r0semi = 拒绝不匹配，D2 已落地）。

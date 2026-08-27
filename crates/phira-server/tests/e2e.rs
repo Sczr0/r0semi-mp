@@ -150,6 +150,7 @@ fn setup_ctx_custom(
         admin_audit: phira_server::admin::AuditLog::new(),
         admin_config: phira_server::admin::AdminConfigState::new(),
         admin_ban_observer: phira_server::server::BanObserver::new(),
+        config_store: Arc::new(phira_server::storage::ConfigStore::disabled()),
     })
 }
 

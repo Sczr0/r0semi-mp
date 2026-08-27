@@ -25,9 +25,13 @@ http_timeout: 5                        # 回源 HTTP 超时（秒）
 maintenance_grace: 10                  # 停机宽限窗口（秒）
 config_poll_interval: 2                # 配置文件轮询（秒）
 maintenance_notice: "服务器维护中，房间即将关闭，请稍后再来"
+persist_dir: "./data"                 # 管理面持久化目录（bans/audit/config 快照，自动创建）
+admin_token: "changeme"               # 管理面 Bearer token（不配 = 管理面整体禁用）
+http_port: 8080                        # 管理 HTTP 端口（/healthz + /rooms + /admin/*）
 ```
 
 > 环境变量覆盖文件：`R0SEMI_MP_PORT` / `R0SEMI_MP_API_BASE` / `R0SEMI_MP_CONFIG`（文件路径）
+> / `R0SEMI_MP_ADMIN_TOKEN` / `R0SEMI_MP_PERSIST_DIR`
 
 ## 3. systemd 服务（Linux）
 

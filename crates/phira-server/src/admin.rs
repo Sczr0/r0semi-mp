@@ -58,7 +58,7 @@ pub async fn http_accept_loop(listener: Option<TcpListener>, ctx: Arc<ConnContex
 // —— 审计（docs/admin-api.md §3 四件套之魂） ——
 
 /// 管理写操作审计条目。
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuditEntry {
     /// 操作时间（unix 秒）。
     pub at: u64,
@@ -103,19 +103,40 @@ impl AdminConfigState {
 }
 
 /// 审计环（有界 256 条，内存可控；组合根注入 ConnContext.admin_audit）。
+///
+/// 持久化（组合根 `storage` 模块契约）：`file` = 归档 JSONL——`record` 同步 append
+/// （fail soft：写失败仅日志，环照记）；启动时 `new_with_file` 回填尾部至多 256 行，
+/// 重启不丢历史。环 = 内存检索面（`GET /admin/audit`），文件 = 归档面。
 #[derive(Default)]
 pub struct AuditLog {
     inner: Mutex<VecDeque<AuditEntry>>,
+    /// 归档文件（None = 仅内存；测试默认）。
+    file: Option<std::path::PathBuf>,
 }
 
 impl AuditLog {
-    /// 新建（空环）。返回 Arc 便于组合根注入。
+    /// 新建（仅内存）。返回 Arc 便于组合根注入。
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    /// 记录一条（超限丢最旧）。
+    /// 新建并启用归档（`persist_dir` 下 `audit.jsonl`；启动回填至多 256 行）。
+    #[must_use]
+    pub fn new_with_file(dir: &std::path::Path) -> Arc<Self> {
+        crate::storage::ensure_dir(dir);
+        let path = dir.join("audit.jsonl");
+        let inner = crate::storage::audit_read_tail(&path, crate::storage::AUDIT_BACKFILL_MAX)
+            .into_iter()
+            .filter_map(|line| serde_json::from_str::<AuditEntry>(&line).ok())
+            .collect::<VecDeque<_>>();
+        Arc::new(Self {
+            inner: Mutex::new(inner),
+            file: Some(path),
+        })
+    }
+
+    /// 记录一条（超限丢最旧；同步追加到归档文件，失败仅日志）。
     pub fn record(&self, action: &str, target: &str, result: &str) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -127,12 +148,19 @@ impl AuditLog {
         if inner.len() >= 256 {
             inner.pop_front();
         }
-        inner.push_back(AuditEntry {
+        let entry = AuditEntry {
             at: now,
             action: action.to_owned(),
             target: target.to_owned(),
             result: result.to_owned(),
-        });
+        };
+        inner.push_back(entry.clone());
+        // 归档：仅在找到文件后追加（首次失败不重试刷日志，下条操作自然重试）
+        if let (Some(path), Ok(line)) = (&self.file, serde_json::to_string(&entry))
+            && let Err(e) = crate::storage::audit_append(path, &line)
+        {
+            tracing::error!("audit archive append {path:?}: {e}");
+        }
     }
 
     /// 快照（时间倒序——最新在前，面板按此渲染）。
@@ -510,12 +538,22 @@ async fn route_admin_write(
             let result = admin_set_config(ctx, RoomConfig { monitors }).await;
             ctx.admin_audit
                 .record("admin.config", "rooms.monitors", &result.1);
+            if result.0 == "200 OK" {
+                // 持久化（组合根 storage）：旧 current → last，新原文 → current
+                if let Some(b) = body {
+                    ctx.config_store.record_success(b);
+                }
+            }
             (result.0, result.1, "application/json; charset=utf-8")
         }
         (m, path) if path == "/admin/config/rollback" && m == "POST" => {
             let result = admin_rollback_config(ctx).await;
             ctx.admin_audit
                 .record("admin.config.rollback", "", &result.1);
+            if result.0 == "200 OK" {
+                // 持久化：last → current；清 last（与内存 take_last 取走即清空一致）
+                ctx.config_store.record_rollback();
+            }
             (result.0, result.1, "application/json; charset=utf-8")
         }
         (m, path) if path == "/admin/observers" && m == "POST" => {

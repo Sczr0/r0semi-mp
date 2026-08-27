@@ -84,7 +84,34 @@
 | 1 ✅ | 只读管理面（/admin/rooms、rooms/{id}、users、metrics） | 零写风险、原 /rooms /healthz 回归不动 | **C1 拆分触发**（http_serve/http_accept_loop 从 server.rs → admin.rs） |
 | 2 ✅ | 写面系统命令族（AdminKick/AdminBroadcast）+ Bearer 认证 + 审计环 | kick e2e 全链路（含被踢者本人收 LeaveRoom）+ 401/403 + 审计 4 端点 | `/admin/*` 全认证（读面收紧）；AdminBan 名单拦截留 P2 |
 | 3 ✅ | runtime-config（存"上一份"+一步回滚）+ observer 热插拔（ban） | config 回滚 409/审计 + 热插拔生效失效/幂等 + 名单拦命令 | **§7.3 定形实锤**：Moderator 加 `kind()`（type_name_of_val 对 &dyn 返回 dyn 名不可作身份键） |
+| 3.5 ✅ | 管理面持久化（ban / audit / config 快照） | 重启后名单拦截生效、审计历史可查、rollback 跨重启仍可用；损坏文件 fail soft | 组合根 storage 模块，契约/core 零改动 |
 | 4 | Web 面板 | 消费已稳定 API，不改服务端 | 反作弊 P2 的运营观察台顺手长在面板上 |
+
+## 5.5 持久化（组合根 storage 模块，阶段 3.5 落地）
+
+**只持久化管理事实**（决策与记录），不持久化状态（房间/会话内存态模型不变，关服清空是特性）。
+实现全部落在 `phira-server/src/storage.rs`（组合根独占）：phira-api/core/impl/契约零感知，
+无新 `RoomCommand`、无新 `Moderator`、零新依赖（std::fs + serde_json）。
+
+文件布局（`persist_dir` 配置项 / `R0SEMI_MP_PERSIST_DIR` 环境变量，默认 `./data`）：
+
+```text
+data/
+├── audit.jsonl          # 审计归档（追加；AuditEntry 一行一条）——启动回填至多 256 行进内存环
+├── bans.json            # 封禁名单（全量原子写 tmp+rename）——启动加载，重启拦截生效
+├── config.current.json  # 生效配置原文（POST /admin/config 请求体 rooms 子对象）
+└── config.last.json     # 上一份（rollback 源）——启动回填 AdminConfigState，重启后仍可回滚
+```
+
+语义：
+- **触发点全在既有写路径同步执行**（管理低频 <1ms，无后台任务/定时器，§4.6 事实命令化不违背）；
+- **fail soft**：写失败仅日志、内存态继续；读损坏回退空态/默认（bans 损坏 = 按空名单启动并告警——名单只是反作弊工具）；
+- **原子性**：config/bans 走 tmp+rename，半写文件永不落地；audit 追加天然可截断恢复（`fsync` 每行）；
+- **安全**：文件不含 admin_token（审计只记 action/target/result）；production 建议目录权限 600；
+- config 落盘存**请求体原文 JSON**（`{"rooms":{...}}` 的 rooms 子对象）而非反序列化结构——
+  `monitors` 之外的未来字段演进自动跟随，不依赖新增 serde derive。
+- **SQLite 门**：现不引。出现"面板过滤/搜索审计、多实例共享名单"需求才评估（那才是 C 库成本换查询收益的时刻）；
+  单实例文件层与 SQLite 语义同构（都是事实持久化），换时只动 storage.rs。
 
 ## 6. 决策点结论（2026-08 拍板）
 

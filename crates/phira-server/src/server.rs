@@ -297,9 +297,14 @@ impl EventSink for RoomListSink {
 /// （`CreateRoom`/`JoinRoom`/`Chat`…）；`Authenticate` 不经 `RoomCommand` 流，机制上
 /// 拦不到鉴权（§7.3 已注明），属已知边界。组合根持有单例；管理 API 热插拔挂载 +
 /// `AdminBan` 写入名单。
+///
+/// 持久化（组合根 `storage` 模块契约）：`file` = `bans.json`——`ban` 同步全量原子写
+/// （fail soft），启动时 `new_with_file` 加载，名单跨重启生效。
 #[derive(Default)]
 pub struct BanObserver {
     banned: std::sync::Mutex<std::collections::HashSet<i32>>,
+    /// 名单文件（None = 仅内存；测试默认）。
+    file: Option<std::path::PathBuf>,
 }
 
 impl BanObserver {
@@ -309,12 +314,32 @@ impl BanObserver {
         Arc::new(Self::default())
     }
 
-    /// 加入名单（幂等）。
+    /// 新名单并启用持久化（`persist_dir` 下 `bans.json`；启动加载现有名单）。
+    #[must_use]
+    pub fn new_with_file(dir: &std::path::Path) -> Arc<Self> {
+        crate::storage::ensure_dir(dir);
+        let path = dir.join("bans.json");
+        let banned = crate::storage::bans_read(&path)
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        Arc::new(Self {
+            banned: std::sync::Mutex::new(banned),
+            file: Some(path),
+        })
+    }
+
+    /// 加入名单（幂等；启用持久化时同步全量写盘，失败仅日志）。
     pub fn ban(&self, user_id: i32) {
         self.banned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(user_id);
+        if let Some(path) = &self.file {
+            let list = self.banned_users();
+            if let Err(e) = crate::storage::bans_write(path, &list) {
+                tracing::error!("bans persist {path:?}: {e}");
+            }
+        }
     }
 
     /// 当前名单（管理面展示/审计）。
@@ -411,6 +436,8 @@ pub struct ConnContext {
     pub admin_config: Arc<crate::admin::AdminConfigState>,
     /// 封禁名单观察者单例（阶段 3 首个真实 Moderator；对象插拔 clone，ban 名单本体）。
     pub admin_ban_observer: Arc<BanObserver>,
+    /// 管理持久化（组合根 storage：config 快照 current/last；`disabled` = 仅内存）。
+    pub config_store: Arc<crate::storage::ConfigStore>,
 }
 
 /// 事件投递：`user_id → 会话发送通道`映射 + 转换层目标过滤。

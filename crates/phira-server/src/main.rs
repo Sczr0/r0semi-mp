@@ -81,6 +81,28 @@ async fn main() -> Result<()> {
         config.config_poll_interval,
     );
 
+    // 管理面持久化（组合根 storage，docs/admin-api.md §持久化）：
+    // - 启动加载生效配置原文（config.current.json）→ 覆盖初始配置；
+    // - 上一份（config.last.json）回填 AdminConfigState->重启后仍可 rollback；
+    // - ban/audit 由 BanObserver/AuditLog 带文件构造时自动加载（同目录）。
+    let persist_dir = std::path::PathBuf::from(&config.persist_dir);
+    phira_server::storage::ensure_dir(&persist_dir);
+    let config_store = phira_server::storage::ConfigStore::new(&persist_dir);
+    let (saved_config, saved_last) = config_store.load();
+    if let Some(cfg) = saved_config {
+        match phira_server::storage::config_from_json(&cfg) {
+            Ok(rc) => bus.update_config(Arc::new(rc)).await,
+            Err(msg) => eprintln!("[boot] persist config.current ignored: {msg}"),
+        }
+    }
+    let admin_config = phira_server::admin::AdminConfigState::new();
+    if let Some(last) = saved_last {
+        match phira_server::storage::config_from_json(&last) {
+            Ok(rc) => admin_config.stash(Arc::new(rc)),
+            Err(msg) => eprintln!("[boot] persist config.last ignored: {msg}"),
+        }
+    }
+
     let ctx = ConnContext {
         bus,
         auth,
@@ -93,11 +115,12 @@ async fn main() -> Result<()> {
         proxy_protocol: config.proxy_protocol,
         // 进服欢迎语（yml welcome_message，None = 不发）
         welcome_message: config.welcome_message.clone(),
-        // 管理面（阶段 2）：Bearer token（None = 禁用）+ 写操作审计环
+        // 管理面（阶段 2）：Bearer token（None = 禁用）+ 写操作审计环（持久化归档）
         admin_token: config.admin_token.clone(),
-        admin_audit: phira_server::admin::AuditLog::new(),
-        admin_config: phira_server::admin::AdminConfigState::new(),
-        admin_ban_observer: phira_server::server::BanObserver::new(),
+        admin_audit: phira_server::admin::AuditLog::new_with_file(&persist_dir),
+        admin_config,
+        admin_ban_observer: phira_server::server::BanObserver::new_with_file(&persist_dir),
+        config_store: Arc::new(config_store),
         room_list,
     };
     let server = Server::new(

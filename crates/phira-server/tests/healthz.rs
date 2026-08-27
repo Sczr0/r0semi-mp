@@ -79,6 +79,7 @@ fn test_ctx() -> Arc<ConnContext> {
         admin_audit: phira_server::admin::AuditLog::new(),
         admin_config: phira_server::admin::AdminConfigState::new(),
         admin_ban_observer: phira_server::server::BanObserver::new(),
+        config_store: Arc::new(phira_server::storage::ConfigStore::disabled()),
     })
 }
 
@@ -395,6 +396,7 @@ async fn admin_disabled_when_no_token_configured() {
             admin_audit: phira_server::admin::AuditLog::new(),
             admin_config: phira_server::admin::AdminConfigState::new(),
             admin_ban_observer: phira_server::server::BanObserver::new(),
+            config_store: Arc::new(phira_server::storage::ConfigStore::disabled()),
         })
     };
     let _ = addr;
