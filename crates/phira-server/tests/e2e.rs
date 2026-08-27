@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use phira_api::{
-    ClientCommand, JoinRoomResponse, RoomConfig, RoomDeps, RoomResponse, ServerCommand, TouchFrame,
-    UserInfo, Varchar,
+    ClientCommand, CmdCtx, JoinRoomResponse, Origin, RoomCommand, RoomConfig, RoomDeps, RoomError,
+    RoomErrorCode, RoomEvent, RoomResponse, ServerCommand, TouchFrame, UserInfo, Varchar,
 };
 use phira_core::{Bus, lifecycle::LifecycleTask};
 use phira_server::http::{HttpApiClient, HttpAuth, ThreadRngSource};
@@ -70,7 +70,7 @@ async fn mock_api(addr: std::net::SocketAddr) {
 
 /// 真实组合（与 main.rs 同构，base = mock API）。
 fn setup_ctx(mock_addr: std::net::SocketAddr) -> Arc<ConnContext> {
-    setup_ctx_custom(mock_addr, vec![], None, vec![])
+    setup_ctx_custom(mock_addr, vec![], None, vec![], vec![])
 }
 
 /// 指定 monitor 白名单的测试上下文（§6.5-4：monitor 需权限）。
@@ -78,15 +78,24 @@ fn setup_ctx_with_monitors(
     mock_addr: std::net::SocketAddr,
     monitors: Vec<i32>,
 ) -> Arc<ConnContext> {
-    setup_ctx_custom(mock_addr, monitors, None, vec![])
+    setup_ctx_custom(mock_addr, monitors, None, vec![], vec![])
 }
 
-/// 完整参数化上下文（欢迎语 + 私密房间前缀，§运营）。
+/// 注入观察者/拦截者（§7.3）的测试上下文。
+fn setup_ctx_with_moderators(
+    mock_addr: std::net::SocketAddr,
+    moderators: Vec<Arc<dyn phira_api::Moderator>>,
+) -> Arc<ConnContext> {
+    setup_ctx_custom(mock_addr, vec![], None, vec![], moderators)
+}
+
+/// 完整参数化上下文（欢迎语 + 私密房间前缀 + 观察者，§运营）。
 fn setup_ctx_custom(
     mock_addr: std::net::SocketAddr,
     monitors: Vec<i32>,
     welcome: Option<&str>,
     hidden_prefixes: Vec<&str>,
+    moderators: Vec<Arc<dyn phira_api::Moderator>>,
 ) -> Arc<ConnContext> {
     let base = format!("http://{mock_addr}");
     let http = Arc::new(HttpApiClient::new(base.clone()));
@@ -105,7 +114,8 @@ fn setup_ctx_custom(
         Arc::new(rooms) as Arc<dyn phira_api::RoomFactory>,
         Arc::clone(&config),
     )
-    .with_api(Arc::clone(&http) as Arc<dyn phira_api::ApiClient>);
+    .with_api(Arc::clone(&http) as Arc<dyn phira_api::ApiClient>)
+    .with_moderators(moderators);
 
     let (task, registry, fact_tx) = LifecycleTask::new(
         bus.clone(),
@@ -1176,7 +1186,7 @@ async fn http_rooms_endpoint_with_private_filter() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
-    let ctx = setup_ctx_custom(mock_addr, vec![], None, vec!["solo"]);
+    let ctx = setup_ctx_custom(mock_addr, vec![], None, vec!["solo"], vec![]);
 
     // 管理 HTTP 端点（独立端口，§运营）
     let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1278,7 +1288,7 @@ async fn welcome_message_sent_after_auth() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
-    let ctx = setup_ctx_custom(mock_addr, vec![], Some("欢迎来到 r0semi"), vec![]);
+    let ctx = setup_ctx_custom(mock_addr, vec![], Some("欢迎来到 r0semi"), vec![], vec![]);
     tokio::spawn(async move {
         loop {
             let (stream, addr) = listener.accept().await.unwrap();
@@ -1728,4 +1738,108 @@ async fn error_messages_localized_by_user_language() {
 
     drop(host);
     drop(guest);
+}
+
+// —— §7.3 观察者拦截：core 到协议出口全链路 ——
+
+/// 被拦截命令到达真连接：Failure(Moderated)（code 无 l10n 映射 → 回落观察者英文文案），
+/// 非目标用户不受影响，连接保持健康（Ping→Pong 通）。
+#[tokio::test]
+async fn moderator_intercept_reaches_client_as_failure() {
+    // mock API
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx_with_moderators(
+        mock_addr,
+        vec![Arc::new(BlockUser1) as Arc<dyn phira_api::Moderator>],
+    );
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    // 目标用户 1（tok1）：CreateRoom → Failure(Moderated)（文案透传），连接仍健康
+    let mut c = client_connect(server_addr).await;
+    send_cmd(
+        &mut c,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok1".into()).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_cmd(&mut c).await,
+        ServerCommand::Authenticate(Ok((_, None)))
+    ));
+    send_cmd(
+        &mut c,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("mod-e2e".into()).unwrap(),
+        },
+    )
+    .await;
+    match recv_cmd(&mut c).await {
+        ServerCommand::CreateRoom(Err(msg)) => {
+            assert_eq!(msg, "blocked by e2e moderator", "拦截文案应透传到客户端");
+        }
+        other => panic!("被拦命令应回 Failure(Moderated)，got {other:?}"),
+    }
+    // 连接健康：Ping → Pong
+    send_cmd(&mut c, &ClientCommand::Ping).await;
+    assert!(matches!(recv_cmd(&mut c).await, ServerCommand::Pong));
+
+    // 非目标用户 2（tok2）：正常建房
+    let mut c2 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c2,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok2".into()).unwrap(),
+        },
+    )
+    .await;
+    recv_cmd(&mut c2).await; // Authenticate(Ok)
+    send_cmd(
+        &mut c2,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("mod-ok".into()).unwrap(),
+        },
+    )
+    .await;
+    // 未受影响用户：广播先于响应（原版语义，与 full_flow 一致）
+    assert!(matches!(
+        recv_cmd(&mut c2).await,
+        ServerCommand::Message(phira_api::Message::CreateRoom { user: 2 })
+    ));
+    assert!(
+        matches!(recv_cmd(&mut c2).await, ServerCommand::CreateRoom(Ok(()))),
+        "非目标用户不得被拦"
+    );
+}
+
+/// 拦 user 1 的全部客户端命令（e2e 用替身，§7.3）。
+struct BlockUser1;
+
+#[async_trait::async_trait]
+impl phira_api::Moderator for BlockUser1 {
+    async fn intercept(&self, _cmd: &RoomCommand, ctx: &CmdCtx) -> Result<(), RoomError> {
+        if let Origin::Client { user_id: 1 } = ctx.origin {
+            return Err(RoomError::Business {
+                code: RoomErrorCode::Moderated,
+                msg: "blocked by e2e moderator".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn on_event(&self, _ev: &RoomEvent) {}
 }

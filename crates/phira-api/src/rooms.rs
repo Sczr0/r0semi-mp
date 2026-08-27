@@ -736,9 +736,14 @@ pub trait Moderator: Send + Sync {
     /// [`RoomErrorCode::Moderated`] 作为业务拒绝码）。
     ///
     /// 调用时机与范围：仅**客户端命令**（`Origin::Client`）在**路由之前**被调用
-    /// （拦住的命令不产生任何房间副作用）；系统命令（生命周期事实/回注/配置热更）
-    /// 不可被拦截（core 保证，bus 侧过滤）。多个观察者按注入顺序串行执行，
-    /// 任一拒绝即拒绝——观察者应快速返回（不能做长等待 IO）。
+    /// （拦住的命令不产生任何房间副作用）；**热路径 `Touches`/`Judges` 不经过**
+    /// （core 过滤，慢观察者不得拖垮 60Hz 转发，§4.9-9）；系统命令（生命周期事实/
+    /// 回注/配置热更）不可被拦截。多个观察者按注入顺序串行执行，任一拒绝即拒绝。
+    ///
+    /// 三条实现契约：① 观察者应快速返回（不能做长等待 IO）；② **不得 panic**——
+    /// panic 会传播到调用它的连接任务使其死亡（拒绝一次判定应是 `Err(Business)`，
+    /// 不是 unwind）；③ `ctx.room_id` 对 `CreateRoom`/`JoinRoom` 是客户端载荷 id
+    /// （未盖章，§4.9-4），不得当作权威房间标识。
     async fn intercept(&self, cmd: &RoomCommand, ctx: &CmdCtx) -> Result<(), RoomError>;
 
     /// 领域事件通知（尽力而为，fire-and-forget——不阻塞房间投递/串行位）。

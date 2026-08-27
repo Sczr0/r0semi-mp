@@ -1823,3 +1823,56 @@ async fn moderator_receives_domain_events_only() {
         "热路径事件不得通知观察者: {seen:?}"
     );
 }
+
+/// 热路径豁免：Touches/Judges 不经过拦截（慢观察者不得拖垮 60Hz 转发路径，
+/// DropIfFull 哲学，§4.9-9；与 on_event 过滤 Relay* 同分类，§4.4）。
+#[tokio::test]
+async fn moderator_skips_hotpath_commands() {
+    let moderator = RecordingModerator::new(i32::MAX); // 若被调用即拦截——但不应被调用
+    let factory = ScriptedFactory::default();
+    factory.push(
+        &rid(),
+        vec![
+            (
+                Some(RoomResponse::Ok),
+                vec![RoomEvent::RoomCreated {
+                    room_id: rid(),
+                    host: 1,
+                }],
+            ),
+            (None, Vec::new()), // Touches 热路径（DropIfFull，无回话）
+        ],
+    );
+    let bus = Bus::new(
+        Arc::new(factory.clone()) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    )
+    .with_moderators(vec![Arc::clone(&moderator) as Arc<dyn phira_api::Moderator>]);
+
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "u1".into(),
+        },
+    )
+    .await
+    .unwrap();
+    // Touches 应正常投递（不被拦、不回 Moderated）
+    let resp = bus
+        .dispatch(
+            client_ctx(1),
+            RoomCommand::Touches {
+                frames: Arc::new(Vec::new()),
+            },
+        )
+        .await;
+    assert!(
+        matches!(resp, Ok(RoomResponse::Ok)),
+        "热路径应正常: {resp:?}"
+    );
+    // 拦截记录只有 CreateRoom，无 Touches
+    let intercepted = moderator.intercepted.lock().unwrap().clone();
+    assert_eq!(intercepted.len(), 1, "仅业务命令经过拦截: {intercepted:?}");
+    assert!(intercepted[0].1.contains("CreateRoom"));
+}

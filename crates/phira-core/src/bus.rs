@@ -251,9 +251,16 @@ impl Bus {
     pub async fn dispatch(&self, ctx: CmdCtx, cmd: RoomCommand) -> Result<RoomResponse, RoomError> {
         let name = command_name(&cmd);
         let started = Instant::now();
-        // §7.3：观察者拦截——仅客户端命令；系统命令（生命周期事实/回注/配置热更）不可被拦
-        // （core 保证）。拦截点在路由之前：拒收的命令不产生任何房间副作用。
-        let result = if matches!(ctx.origin, Origin::Client { .. }) {
+        // §7.3：观察者拦截——仅客户端命令且**非热路径**（Touches/Judges 是 DropIfFull
+        // 转发指令，观察者面不覆盖：慢观察者不得拖垮 60Hz 热路径，与 on_event 过滤
+        // Relay* 同分类，§4.4/§4.9-9）；系统命令（生命周期/回注/配置）不可被拦。
+        // 拦截点在路由之前：拒收的命令不产生任何房间副作用。
+        let interceptable = matches!(ctx.origin, Origin::Client { .. })
+            && !matches!(
+                cmd,
+                RoomCommand::Touches { .. } | RoomCommand::Judges { .. }
+            );
+        let result = if interceptable {
             match self.intercept_observers(&ctx, &cmd).await {
                 Ok(()) => self.route(ctx, cmd).await,
                 Err(e) => Err(e),
