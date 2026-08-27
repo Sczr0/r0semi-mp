@@ -18,6 +18,8 @@
 //!    随机整体僵死——进程 CPU 总计 ~0.016s、所有任务 park（tokio 唤醒丢失，
 //!    非协议问题：同样的 2 线程跑"最小协议正确服务器 + 真 SDK"完全正常）。
 //!    取 4 与 e2e.rs 的 `worker_threads = 4` 对齐，连续多跑稳定。
+//! 3. **禁止** `std::net::TcpStream::connect + from_std`：tokio 1.43+ Linux 拒绝
+//!    注册阻塞 fd（issue 7172）→ CI 红本地绿；用 tokio 原生 connect。
 //!
 //! 许可证：SDK 为 Apache-2.0（与 GPL-3.0 的游戏客户端仓库是两个仓库），dev-dependency
 //! 引入无污染（client-behavior-review §9）。
@@ -153,12 +155,15 @@ fn rid_ok(s: &str) -> phira_mp_common::RoomId {
 }
 
 /// 真客户端持有形态：`Arc<Client>`（panel.rs:60 同款）。
+///
+/// 2026 修：**不用** `std::net::TcpStream::connect + TcpStream::from_std`——tokio
+/// 1.43+ 在 Linux 拒绝把阻塞 fd 注册进运行时（`tokio_allow_from_blocking_fd` 检查，
+/// github.com/tokio-rs/tokio/issues/7172）；Windows 无此检查所以本地绿、CI 红。
+/// 直接 tokio 原生 connect（SDK 的 `Client::new` 收 tokio stream）。
 async fn sdk_connect(addr: std::net::SocketAddr) -> Arc<Client> {
-    let std_stream = std::net::TcpStream::connect(addr).unwrap();
-    std_stream.set_nodelay(true).unwrap();
-    let client = Client::new(TcpStream::from_std(std_stream).unwrap())
-        .await
-        .expect("Client::new 握手");
+    let stream = TcpStream::connect(addr).await.unwrap();
+    stream.set_nodelay(true).unwrap();
+    let client = Client::new(stream).await.expect("Client::new 握手");
     Arc::new(client)
 }
 
