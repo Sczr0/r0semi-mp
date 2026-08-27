@@ -450,14 +450,13 @@ impl AntiCheatObserver {
             });
         }
         // 总量兜底（防内存暴涨）：超出则淘汰全表最旧用户
-        if hist.len() * HISTORY_PER_USER > 64 * HISTORY_PER_USER {
-            if let Some(earliest) = hist
+        if hist.len() * HISTORY_PER_USER > 64 * HISTORY_PER_USER
+            && let Some(earliest) = hist
                 .iter()
                 .min_by_key(|(_, q)| q.front().map_or(u64::MAX, |(t, _)| *t))
-            {
-                let u = *earliest.0;
-                hist.remove(&u);
-            }
+        {
+            let u = *earliest.0;
+            hist.remove(&u);
         }
     }
 }
