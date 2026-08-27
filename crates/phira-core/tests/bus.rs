@@ -1615,6 +1615,10 @@ struct RecordingModerator {
 
 #[async_trait::async_trait]
 impl phira_api::Moderator for RecordingModerator {
+    fn kind(&self) -> &'static str {
+        "recording"
+    }
+
     async fn intercept(&self, cmd: &RoomCommand, ctx: &CmdCtx) -> Result<(), RoomError> {
         let Origin::Client { user_id } = ctx.origin else {
             // 系统命令理论上不可达（bus 过滤）；若到达即记录并放行
@@ -1876,4 +1880,78 @@ async fn moderator_skips_hotpath_commands() {
     let intercepted = moderator.intercepted.lock().unwrap().clone();
     assert_eq!(intercepted.len(), 1, "仅业务命令经过拦截: {intercepted:?}");
     assert!(intercepted[0].1.contains("CreateRoom"));
+}
+
+/// 运行期热插拔（§7.3 兑现，阶段 3）：`add_moderator` 后拦截立即生效；
+/// `remove_moderator`（按 type_name）后失效；重复 add 幂等。
+#[tokio::test]
+async fn moderator_hotplug_add_remove() {
+    let factory = ScriptedFactory::default();
+    factory.push(&rid(), vec![(Some(RoomResponse::Ok), Vec::new())]);
+    let bus = Bus::new(
+        Arc::new(factory.clone()) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    );
+
+    // 初始无观察者：user 1 建房正常
+    let r1 = bus
+        .dispatch(
+            client_ctx(1),
+            RoomCommand::CreateRoom {
+                id: rid(),
+                name: "u1".into(),
+            },
+        )
+        .await;
+    assert!(matches!(r1, Ok(RoomResponse::Ok)), "初始应无拦截: {r1:?}");
+
+    // 热挂载（拦 user 1）
+    let m = RecordingModerator::new(1);
+    bus.add_moderator(Arc::clone(&m) as Arc<dyn phira_api::Moderator>);
+    let r2 = bus
+        .dispatch(
+            client_ctx(1),
+            RoomCommand::Tick { now: 0 }, // 系统命令不经过拦截——用客户端命令
+        )
+        .await;
+    // Tick 是系统命令源，但 client_ctx 是 Client origin → 会过拦截
+    assert!(
+        matches!(
+            r2,
+            Err(RoomError::Business {
+                code: RoomErrorCode::Moderated,
+                ..
+            })
+        ),
+        "热挂载后应拦截: {r2:?}"
+    );
+
+    // 幂等：重复 add 不叠加（同一 type_name 只挂一份）。若幂等失效（两份实例），
+    // 一次 dispatch 会命中两次 intercept → 记录数 3 而非 2。
+    bus.add_moderator(Arc::clone(&m) as Arc<dyn phira_api::Moderator>);
+    let _ = bus
+        .dispatch(client_ctx(1), RoomCommand::Tick { now: 0 })
+        .await;
+    let intercepted = m.intercepted.lock().unwrap().len();
+    assert_eq!(
+        intercepted, 2,
+        "重复挂载不叠加（两实例会记 3 次）: {intercepted}"
+    );
+
+    // 热卸载：按 type_name 移除后拦截失效
+    assert!(bus.remove_moderator("recording"), "卸载应移除 >=1");
+    assert!(!bus.remove_moderator("recording"), "重复卸载应为 false");
+    let r3 = bus
+        .dispatch(client_ctx(1), RoomCommand::Tick { now: 0 })
+        .await;
+    assert!(
+        !matches!(
+            r3,
+            Err(RoomError::Business {
+                code: RoomErrorCode::Moderated,
+                ..
+            })
+        ),
+        "卸载后不再拦截: {r3:?}"
+    );
 }

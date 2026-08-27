@@ -292,6 +292,70 @@ impl EventSink for RoomListSink {
     }
 }
 
+/// 封禁名单观察者（阶段 3 首个真实 Moderator，docs/admin-api.md §4）：
+/// 名单内用户的一切客户端命令被 `intercept` 拒绝（`Moderated`）——覆盖在入房类命令
+/// （`CreateRoom`/`JoinRoom`/`Chat`…）；`Authenticate` 不经 `RoomCommand` 流，机制上
+/// 拦不到鉴权（§7.3 已注明），属已知边界。组合根持有单例；管理 API 热插拔挂载 +
+/// `AdminBan` 写入名单。
+#[derive(Default)]
+pub struct BanObserver {
+    banned: std::sync::Mutex<std::collections::HashSet<i32>>,
+}
+
+impl BanObserver {
+    /// 新名单（组合根持有；热插拔时 clone 进 bus）。
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// 加入名单（幂等）。
+    pub fn ban(&self, user_id: i32) {
+        self.banned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(user_id);
+    }
+
+    /// 当前名单（管理面展示/审计）。
+    pub fn banned_users(&self) -> Vec<i32> {
+        let mut list: Vec<_> = self
+            .banned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
+        list.sort_unstable();
+        list
+    }
+}
+
+#[async_trait::async_trait]
+impl phira_api::Moderator for BanObserver {
+    fn kind(&self) -> &'static str {
+        "ban"
+    }
+
+    async fn intercept(&self, _cmd: &RoomCommand, ctx: &CmdCtx) -> Result<(), RoomError> {
+        if let Origin::Client { user_id } = ctx.origin
+            && self
+                .banned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&user_id)
+        {
+            return Err(RoomError::Business {
+                code: RoomErrorCode::Moderated,
+                msg: "banned by admin".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn on_event(&self, _ev: &RoomEvent) {}
+}
+
 /// 组合投递目标：多个 EventSink 的扇出（§4.9-5 观察者组合，bus 零改动）。
 #[derive(Default)]
 pub struct CompositeSink {
@@ -343,6 +407,10 @@ pub struct ConnContext {
     pub admin_token: Option<String>,
     /// 管理写操作审计（docs/admin-api.md §3 四件套之一；组合根注入）。
     pub admin_audit: Arc<crate::admin::AuditLog>,
+    /// runtime-config 回滚状态（阶段 3：保留"上一份"全量快照，admin.rs）。
+    pub admin_config: Arc<crate::admin::AdminConfigState>,
+    /// 封禁名单观察者单例（阶段 3 首个真实 Moderator；对象插拔 clone，ban 名单本体）。
+    pub admin_ban_observer: Arc<BanObserver>,
 }
 
 /// 事件投递：`user_id → 会话发送通道`映射 + 转换层目标过滤。

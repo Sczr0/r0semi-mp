@@ -751,6 +751,12 @@ pub trait RoomActor: Send {
 /// 回流（组合根编排），不自行派发房内副作用。
 #[async_trait::async_trait]
 pub trait Moderator: Send + Sync {
+    /// 策略类型名（热插拔增删/审计展示用；实现者自报，如 `"ban"`）。
+    ///
+    /// 2026-08 定形（阶段 3 热插拔实锤）：不用 `type_name_of_val`——它对 `&dyn`
+    /// 返回 `dyn Moderator` 名而非具体类型，无法作为身份键；显式自报最可控。
+    fn kind(&self) -> &'static str;
+
     /// 命令处理前拦截：返回 `Err` 则拒绝该命令（客户端可见；推荐用
     /// [`RoomErrorCode::Moderated`] 作为业务拒绝码）。
     ///

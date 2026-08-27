@@ -96,6 +96,8 @@ async fn main() -> Result<()> {
         // 管理面（阶段 2）：Bearer token（None = 禁用）+ 写操作审计环
         admin_token: config.admin_token.clone(),
         admin_audit: phira_server::admin::AuditLog::new(),
+        admin_config: phira_server::admin::AdminConfigState::new(),
+        admin_ban_observer: phira_server::server::BanObserver::new(),
         room_list,
     };
     let server = Server::new(

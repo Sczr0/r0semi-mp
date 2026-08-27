@@ -118,6 +118,8 @@ fn limiter_ctx() -> Arc<ConnContext> {
         proxy_protocol: false,
         admin_token: None,
         admin_audit: phira_server::admin::AuditLog::new(),
+        admin_config: phira_server::admin::AdminConfigState::new(),
+        admin_ban_observer: phira_server::server::BanObserver::new(),
     })
 }
 

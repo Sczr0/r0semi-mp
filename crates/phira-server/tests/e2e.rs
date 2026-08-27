@@ -148,6 +148,8 @@ fn setup_ctx_custom(
         proxy_protocol: false,
         admin_token: admin_token.map(str::to_owned),
         admin_audit: phira_server::admin::AuditLog::new(),
+        admin_config: phira_server::admin::AdminConfigState::new(),
+        admin_ban_observer: phira_server::server::BanObserver::new(),
     })
 }
 
@@ -1841,6 +1843,10 @@ struct BlockUser1;
 
 #[async_trait::async_trait]
 impl phira_api::Moderator for BlockUser1 {
+    fn kind(&self) -> &'static str {
+        "block-user-1"
+    }
+
     async fn intercept(&self, _cmd: &RoomCommand, ctx: &CmdCtx) -> Result<(), RoomError> {
         if let Origin::Client { user_id: 1 } = ctx.origin {
             return Err(RoomError::Business {

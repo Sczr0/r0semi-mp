@@ -130,6 +130,8 @@ async fn spawn_server() -> std::net::SocketAddr {
         proxy_protocol: false,
         admin_token: None,
         admin_audit: phira_server::admin::AuditLog::new(),
+        admin_config: phira_server::admin::AdminConfigState::new(),
+        admin_ban_observer: phira_server::server::BanObserver::new(),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

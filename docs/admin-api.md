@@ -65,8 +65,9 @@
 | `POST /admin/users/{id}/ban` | 2 | ✅ 本轮 | kick（若有房）+ 断 TCP（kicker force_close）+ 审计；**名单拦截依赖 P2** |
 | `POST /admin/users/{id}/disconnect` | 2 | ✅ 本轮 | 仅断连（连接收尾发生命周期事实）+ 审计 |
 | `GET /admin/audit` | 2 | ✅ 本轮 | 审计环（有界 256，时间倒序） |
-| `POST /admin/config`、`/rollback` | 3 | ⬜ | runtime-config 热更 + 一步回滚 |
-| `POST /admin/observers` | 3 | ⬜ | observer 热插拔（§7.3 预留） |
+| `POST /admin/config` | 3 | ✅ 本轮 | runtime-config 热更（先存"上一份"→广播）+ 审计 |
+| `POST /admin/config/rollback` | 3 | ✅ 本轮 | 一步回切上一份（取走即清空，二次回滚 409）+ 审计 |
+| `POST /admin/observers {kind,op}` | 3 | ✅ 本轮 | observer 热插拔：`kind:"ban"`（BanObserver）add/remove 幂等；其它 kind 400 + 审计 |
 
 **阶段 1 已知限制（诚实记录）**：
 - `/admin/rooms/{id}` 详情目前 = RoomInfo（id/host/users/state/locked/cycle）；
@@ -82,7 +83,7 @@
 | 0 | 设计定稿（本文档） | — | — |
 | 1 ✅ | 只读管理面（/admin/rooms、rooms/{id}、users、metrics） | 零写风险、原 /rooms /healthz 回归不动 | **C1 拆分触发**（http_serve/http_accept_loop 从 server.rs → admin.rs） |
 | 2 ✅ | 写面系统命令族（AdminKick/AdminBroadcast）+ Bearer 认证 + 审计环 | kick e2e 全链路（含被踢者本人收 LeaveRoom）+ 401/403 + 审计 4 端点 | `/admin/*` 全认证（读面收紧）；AdminBan 名单拦截留 P2 |
-| 3 | runtime-config + rollback + observer 热插拔 | 回滚演练 + 热插拔 e2e | observer 热插拔（§7.3 预留） |
+| 3 ✅ | runtime-config（存"上一份"+一步回滚）+ observer 热插拔（ban） | config 回滚 409/审计 + 热插拔生效失效/幂等 + 名单拦命令 | **§7.3 定形实锤**：Moderator 加 `kind()`（type_name_of_val 对 &dyn 返回 dyn 名不可作身份键） |
 | 4 | Web 面板 | 消费已稳定 API，不改服务端 | 反作弊 P2 的运营观察台顺手长在面板上 |
 
 ## 6. 决策点结论（2026-08 拍板）

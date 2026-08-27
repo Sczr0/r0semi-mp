@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use phira_api::{RoomCommand, RoomError, RoomErrorCode, RoomResponse};
+use phira_api::{RoomCommand, RoomConfig, RoomError, RoomErrorCode, RoomResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
@@ -68,6 +68,38 @@ pub struct AuditEntry {
     pub target: String,
     /// 结果摘要（`ok` / 错误信息）。
     pub result: String,
+}
+
+/// runtime-config 回滚状态（阶段 3，docs/admin-api.md §3-3）：保留"上一份"全量
+/// 快照（gooophira rollback 概念，v1 做"上一份"不做版本栈）。组合根注入。
+#[derive(Default)]
+pub struct AdminConfigState {
+    /// 上次 `POST /admin/config` 成功前的生效配置；rollback 消费后清空。
+    last: Mutex<Option<Arc<RoomConfig>>>,
+}
+
+impl AdminConfigState {
+    /// 新建（空）。返回 Arc 便于组合根注入。
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// 保存"本次更新前的配置"（覆盖）。
+    pub fn stash(&self, cfg: Arc<RoomConfig>) {
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cfg);
+    }
+
+    /// 取出上一份（rollback 用；取走即清空——只能回切一次）。
+    pub fn take_last(&self) -> Option<Arc<RoomConfig>> {
+        self.last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 /// 审计环（有界 256 条，内存可控；组合根注入 ConnContext.admin_audit）。
@@ -385,6 +417,7 @@ async fn route_admin_read(
 }
 
 /// 管理写面（认证后，阶段 2）：系统命令族 + 审计。写操作无论成败都落审计。
+#[allow(clippy::too_many_lines)] // 端点逐条可审计，拆分反而破坏一目了然
 async fn route_admin_write(
     method: &str,
     path: &str,
@@ -454,6 +487,54 @@ async fn route_admin_write(
             let result = admin_disconnect(ctx, user_id).await;
             ctx.admin_audit
                 .record("admin.disconnect", &format!("user:{user_id}"), &result.1);
+            (result.0, result.1, "application/json; charset=utf-8")
+        }
+        (m, path) if path == "/admin/config" && m == "POST" => {
+            let Some(monitors) = body
+                .and_then(|b| b["rooms"].as_object().and_then(|r| r.get("monitors")))
+                .and_then(|m| m.as_array())
+            else {
+                return (
+                    "400 Bad Request",
+                    "expected {\"rooms\":{\"monitors\":[ids]}}".to_owned(),
+                    "text/plain",
+                );
+            };
+            let Ok(monitors) = monitors
+                .iter()
+                .map(|v| v.as_i64().and_then(|v| i32::try_from(v).ok()).ok_or(()))
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                return ("400 Bad Request", "bad monitors".to_owned(), "text/plain");
+            };
+            let result = admin_set_config(ctx, RoomConfig { monitors }).await;
+            ctx.admin_audit
+                .record("admin.config", "rooms.monitors", &result.1);
+            (result.0, result.1, "application/json; charset=utf-8")
+        }
+        (m, path) if path == "/admin/config/rollback" && m == "POST" => {
+            let result = admin_rollback_config(ctx).await;
+            ctx.admin_audit
+                .record("admin.config.rollback", "", &result.1);
+            (result.0, result.1, "application/json; charset=utf-8")
+        }
+        (m, path) if path == "/admin/observers" && m == "POST" => {
+            let Some(kind) = body.and_then(|b| b["kind"].as_str()) else {
+                return ("400 Bad Request", "missing kind".to_owned(), "text/plain");
+            };
+            let Some(op) = body.and_then(|b| b["op"].as_str()) else {
+                return (
+                    "400 Bad Request",
+                    "missing op (add|remove)".to_owned(),
+                    "text/plain",
+                );
+            };
+            let result = admin_toggle_observer(ctx, kind, op);
+            ctx.admin_audit.record(
+                &format!("admin.observer.{op}"),
+                &format!("kind:{kind}"),
+                &result.1,
+            );
             (result.0, result.1, "application/json; charset=utf-8")
         }
         _ => (
@@ -528,6 +609,11 @@ async fn admin_broadcast(
 /// 注：重连后可再进——真正的名单拦截依赖 P2 Moderator + 阶段 4 鉴权拦截（文档 §1/§6）。
 async fn admin_ban(ctx: &ConnContext, user_id: i32) -> (&'static str, String) {
     let mut parts = Vec::new();
+    // 真 ban 语义第 1 步：进入封禁名单（其后的入房类命令被 intercept 拒绝）——
+    // 名单本体由组合根单例持有（热插拔挂载与否不影响自名单生效？不：名单拦截依赖
+    // BanObserver 被挂进 bus；组合根默认挂载，管理面可热卸载——文档注明）。
+    ctx.admin_ban_observer.ban(user_id);
+    parts.push("banned".to_owned());
     if let Some(room_id) = ctx.bus.room_of(user_id).await {
         match ctx
             .bus
@@ -560,5 +646,61 @@ async fn admin_disconnect(ctx: &ConnContext, user_id: i32) -> (&'static str, Str
             "404 Not Found",
             serde_json::json!({"ok": false, "error": "user offline"}).to_string(),
         )
+    }
+}
+
+/// runtime-config 热更（阶段 3）：先存"上一份"（bus 当前生效配置）→ 广播替换。
+async fn admin_set_config(ctx: &ConnContext, config: RoomConfig) -> (&'static str, String) {
+    let current = ctx.bus.current_config().await;
+    ctx.admin_config.stash(current);
+    ctx.bus.update_config(Arc::new(config)).await;
+    ("200 OK", serde_json::json!({"ok": true}).to_string())
+}
+
+/// runtime-config 一步回切（阶段 3）：恢复"上一份"，取走即清空（只可回切一次）。
+async fn admin_rollback_config(ctx: &ConnContext) -> (&'static str, String) {
+    match ctx.admin_config.take_last() {
+        Some(last) => {
+            ctx.bus.update_config(last).await;
+            ("200 OK", serde_json::json!({"ok": true}).to_string())
+        }
+        None => (
+            "409 Conflict",
+            serde_json::json!({"ok": false, "error": "nothing to rollback"}).to_string(),
+        ),
+    }
+}
+
+/// observer 热插拔（阶段 3，§7.3 预留兑现）：`kind` 目前支持 `ban`（封禁名单观察者，
+/// 组合根单例挂载/卸载——卸载后现有名单不生效，重挂恢复）。其它 kind → 400。
+fn admin_toggle_observer(ctx: &ConnContext, kind: &str, op: &str) -> (&'static str, String) {
+    if kind != "ban" {
+        return (
+            "400 Bad Request",
+            serde_json::json!({"ok": false, "error": "unsupported kind"}).to_string(),
+        );
+    }
+    let moderator = Arc::clone(&ctx.admin_ban_observer) as Arc<dyn phira_api::Moderator>;
+    match op {
+        "add" => {
+            ctx.bus.add_moderator(moderator);
+            (
+                "200 OK",
+                serde_json::json!({"ok": true, "banned": ctx.admin_ban_observer.banned_users()})
+                    .to_string(),
+            )
+        }
+        "remove" => {
+            let removed = ctx.bus.remove_moderator("ban");
+            (
+                "200 OK",
+                serde_json::json!({"ok": removed, "banned": ctx.admin_ban_observer.banned_users()})
+                    .to_string(),
+            )
+        }
+        _ => (
+            "400 Bad Request",
+            serde_json::json!({"ok": false, "error": "unsupported op"}).to_string(),
+        ),
     }
 }

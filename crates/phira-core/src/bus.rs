@@ -190,7 +190,7 @@ impl Bus {
     /// 注入观察者/拦截者（§7.3）：客户端命令路径否决 + 领域事件订阅。
     ///
     /// 必须在 spawn 任何命令派发前调用（组合根接线期）；空列表 = 现状零开销。
-    /// 运行期热插拔留给管理 API。
+    /// 运行期热插拔留给管理 API（阶段 3，`add_moderator`/`remove_moderator`）。
     #[must_use]
     pub fn with_moderators(self, moderators: Vec<Arc<dyn Moderator>>) -> Self {
         *self
@@ -199,6 +199,33 @@ impl Bus {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = moderators;
         self
+    }
+
+    /// 运行期挂载观察者（阶段 3，docs/admin-api.md §4：observer 热插拔，管理 API 用）。
+    ///
+    /// 幂等：同 `kind()` 已存在则不重复追加（同名观察者视为同一策略）。
+    pub fn add_moderator(&self, moderator: Arc<dyn Moderator>) {
+        let kind = moderator.kind();
+        let mut list = self
+            .inner
+            .moderators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !list.iter().any(|m| m.kind() == kind) {
+            list.push(moderator);
+        }
+    }
+
+    /// 运行期卸载观察者（按 `kind()` 匹配；移除 ≥1 返回 true）。
+    pub fn remove_moderator(&self, kind: &str) -> bool {
+        let mut list = self
+            .inner
+            .moderators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = list.len();
+        list.retain(|m| m.kind() != kind);
+        list.len() != before
     }
 
     /// 挂接事件投递目标（阶段 2：转换层 + session 写路径）。
@@ -311,6 +338,12 @@ impl Bus {
     /// 配置不是构造期快照——`RoomsV1::new(config)` 之后配置仍可变。
     pub async fn update_config(&self, config: Arc<RoomConfig>) {
         broadcast_config(&self.inner, config).await;
+    }
+
+    /// 当前生效配置（管理面 rollback 快照源，docs/admin-api.md §3-3）。
+    #[must_use]
+    pub async fn current_config(&self) -> Arc<RoomConfig> {
+        Arc::clone(&*self.inner.config.read().await)
     }
 
     /// 配置文件轮询监听（§4.9-8）：周期检查 `server_config.yml`（`R0SEMI_MP_CONFIG` 可改路径），

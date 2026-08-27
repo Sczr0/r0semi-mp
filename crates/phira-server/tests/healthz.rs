@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use phira_api::{
-    AuthError, AuthHandler, CmdCtx, RoomCommand, RoomConfig, RoomEvent, RoomFactory, RoomId,
-    RoomResponse, UserIdentity,
+    AuthError, AuthHandler, CmdCtx, RoomCommand, RoomConfig, RoomError, RoomErrorCode, RoomEvent,
+    RoomFactory, RoomId, RoomResponse, UserIdentity,
 };
 use phira_core::{Bus, lifecycle::LifecycleTask};
 use phira_server::admin::http_serve;
@@ -77,6 +77,8 @@ fn test_ctx() -> Arc<ConnContext> {
         proxy_protocol: false,
         admin_token: Some("test-token".to_owned()),
         admin_audit: phira_server::admin::AuditLog::new(),
+        admin_config: phira_server::admin::AdminConfigState::new(),
+        admin_ban_observer: phira_server::server::BanObserver::new(),
     })
 }
 
@@ -391,6 +393,8 @@ async fn admin_disabled_when_no_token_configured() {
             proxy_protocol: false,
             admin_token: None,
             admin_audit: phira_server::admin::AuditLog::new(),
+            admin_config: phira_server::admin::AdminConfigState::new(),
+            admin_ban_observer: phira_server::server::BanObserver::new(),
         })
     };
     let _ = addr;
@@ -421,5 +425,191 @@ async fn admin_kick_records_audit_even_on_failure() {
     assert!(
         audit.contains("nope") || audit.contains("user:42"),
         "审计带目标: {audit}"
+    );
+}
+
+// —— 阶段 3：runtime-config 回滚 + observer 热插拔（docs/admin-api.md §4/§3-3） ——
+
+#[tokio::test]
+async fn admin_config_hot_reload_and_rollback() {
+    let ctx = test_ctx();
+    // 初始 monitors = []（test_ctx 无 monitor 白名单）
+    let initial = ctx.bus.current_config().await;
+    assert!(initial.monitors.is_empty(), "初始白名单应为空");
+
+    // 热更：monitors -> [9]
+    let resp = http_admin(
+        Arc::clone(&ctx),
+        "POST",
+        "/admin/config",
+        r#"{"rooms":{"monitors":[9]}}"#,
+    )
+    .await;
+    assert!(
+        resp.contains("200 OK") && resp.contains("\"ok\":true"),
+        "config 热更: {resp}"
+    );
+    assert_eq!(
+        ctx.bus.current_config().await.monitors,
+        vec![9],
+        "生效配置已更新"
+    );
+
+    // 回滚：恢复上一份（[]）→ 再 rollback 无货 409
+    let resp = http_admin(Arc::clone(&ctx), "POST", "/admin/config/rollback", "").await;
+    assert!(resp.contains("200 OK"), "回滚应成功: {resp}");
+    assert!(
+        ctx.bus.current_config().await.monitors.is_empty(),
+        "已回滚到上一份"
+    );
+    let resp = http_admin(Arc::clone(&ctx), "POST", "/admin/config/rollback", "").await;
+    assert!(resp.contains("409 Conflict"), "二次回滚应 409: {resp}");
+
+    // 审计含 config 与 rollback
+    let audit = http_admin(Arc::clone(&ctx), "GET", "/admin/audit", "").await;
+    assert!(audit.contains("admin.config"), "审计含 config: {audit}");
+    assert!(
+        audit.contains("admin.config.rollback"),
+        "审计含 rollback: {audit}"
+    );
+
+    // 非法 body 400
+    let resp = http_admin(Arc::clone(&ctx), "POST", "/admin/config", "{}").await;
+    assert!(
+        resp.contains("400 Bad Request"),
+        "缺 monitors 应 400: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn admin_config_bad_monitors_rejected() {
+    let ctx = test_ctx();
+    let resp = http_admin(
+        Arc::clone(&ctx),
+        "POST",
+        "/admin/config",
+        r#"{"rooms":{"monitors":["x"]}}"#,
+    )
+    .await;
+    assert!(
+        resp.contains("400 Bad Request"),
+        "非整数 monitors 应 400: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn admin_observer_hotplug_ban_kind() {
+    let ctx = test_ctx();
+    // 初始未挂载：user 1 客户端命令不被拦（各次用独立房间 id 避免撞车）
+    let r = ctx
+        .bus
+        .dispatch(
+            CmdCtx {
+                origin: phira_api::Origin::Client { user_id: 1 },
+                room_id: RoomId::new("r-a".into()).unwrap(),
+            },
+            RoomCommand::CreateRoom {
+                id: RoomId::new("r-a".into()).unwrap(),
+                name: "u1".into(),
+            },
+        )
+        .await;
+    assert!(r.is_ok(), "未挂载 ban 观察者时不应拦截: {r:?}");
+
+    // 挂载 ban 观察者 + 名单写入 user 1 → 命令被拦（Moderated）
+    let resp = http_admin(
+        Arc::clone(&ctx),
+        "POST",
+        "/admin/observers",
+        r#"{"kind":"ban","op":"add"}"#,
+    )
+    .await;
+    assert!(resp.contains("200 OK"), "挂载应成功: {resp}");
+    ctx.admin_ban_observer.ban(1);
+    let r = ctx
+        .bus
+        .dispatch(
+            CmdCtx {
+                origin: phira_api::Origin::Client { user_id: 1 },
+                room_id: RoomId::new("r-b".into()).unwrap(),
+            },
+            RoomCommand::CreateRoom {
+                id: RoomId::new("r-b".into()).unwrap(),
+                name: "u1".into(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            r,
+            Err(RoomError::Business {
+                code: RoomErrorCode::Moderated,
+                ..
+            })
+        ),
+        "名单内用户应被拦: {r:?}"
+    );
+
+    // 卸载 → 拦截失效（名单还在，但策略不在路径上——热插拔语义）
+    let resp = http_admin(
+        Arc::clone(&ctx),
+        "POST",
+        "/admin/observers",
+        r#"{"kind":"ban","op":"remove"}"#,
+    )
+    .await;
+    assert!(resp.contains("\"ok\":true"), "卸载应成功: {resp}");
+    let r = ctx
+        .bus
+        .dispatch(
+            CmdCtx {
+                origin: phira_api::Origin::Client { user_id: 1 },
+                room_id: RoomId::new("r-c".into()).unwrap(),
+            },
+            RoomCommand::CreateRoom {
+                id: RoomId::new("r-c".into()).unwrap(),
+                name: "u1".into(),
+            },
+        )
+        .await;
+    assert!(r.is_ok(), "卸载后不再拦截: {r:?}");
+
+    // 不支持的 kind → 400
+    let resp = http_admin(
+        Arc::clone(&ctx),
+        "POST",
+        "/admin/observers",
+        r#"{"kind":"anti-cheat","op":"add"}"#,
+    )
+    .await;
+    assert!(resp.contains("400 Bad Request"), "未知 kind 400: {resp}");
+
+    // 审计
+    let audit = http_admin(Arc::clone(&ctx), "GET", "/admin/audit", "").await;
+    assert!(
+        audit.contains("admin.observer.add"),
+        "审计含 observer 插拔: {audit}"
+    );
+}
+
+#[tokio::test]
+async fn admin_ban_writes_observer_list() {
+    let ctx = test_ctx();
+    // 离线用户 ban：应入名单（banned 动作）+ 无房/离线动作，仍 200
+    let resp = http_admin(
+        Arc::clone(&ctx),
+        "POST",
+        "/admin/users/7/ban",
+        r#"{"reason":"spam"}"#,
+    )
+    .await;
+    assert!(
+        resp.contains("200 OK") && resp.contains("\"banned\""),
+        "ban 动作: {resp}"
+    );
+    assert!(
+        ctx.admin_ban_observer.banned_users().contains(&7),
+        "名单应含被 ban 用户: {:?}",
+        ctx.admin_ban_observer.banned_users()
     );
 }
