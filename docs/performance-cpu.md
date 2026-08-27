@@ -64,8 +64,14 @@ Windows 上 1500 连接双向高频小包，CPU 主体是**每包一次 IO 完�
 Touches/Judges 只 `fetch_add(1, Relaxed)`（触摸流无错误语义、f64 moving-avg
 无运营价值）；其余命令走原明细（低频无争）。`snapshot` 合成
 `touches.judges.hot` 条目（count 保留，明细零）。契约测试不涉及触摸流明细 ✓。
-**待复采验证**：下一轮 flamegraph workflow 应看到 Metrics 锁帧消失、epochs
-伪影帧存亡判别（若仍 7M → 纯伪影；若影减 → 伪影来源与 Metrics 相关）。
+**复采验证（flamegraph workflow 第二轮，2026-08）✅**：
+- Metrics 锁帧 0.31% → **0.00%**；CommandStats 泛型帧 0.44% → 0.03%；lock_contended
+  总帧 0.81% → 0.50%（-38%）——热路径无锁化生效，与预期一致；
+- epochs 锁帧仍稳定 ~0.30%（不随 Metrics 消失而变）+ 探针实锤 0.02% CPU → **串帧
+  伪影定性成立**（与 SessionRegistry 无关，tokio 内部栈拼接；0.3% 低价值收笔）；
+- 剩余大头不变：sendto 27% / recvfrom 21%（**读侧合读是下一只明确优化对象**——
+  带 pending 缓冲的设计已论证可防垃圾流，见 §6 备选）；
+- 记账原子 ~4.4%（SeqCst 属安全锁 A 边界，§Relaxed 结论维持：不做）。
 **已落地（同轮）**：写侧批处理（`stream.rs` WRITE_BATCH_MAX=64：`recv_many`
 攒帧一次 `write_all`，低流量延迟不增）——回归绿（memory_guard 账目平衡/healthz）。
 **量化复核路径（已自动化）**：`.github/workflows/flamegraph.yml` 手动触发——GitHub
