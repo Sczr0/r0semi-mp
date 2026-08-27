@@ -79,12 +79,14 @@ jobs:
           ls -la "$EXE"
 
       # 直接采 harness 进程（不带 cargo 包装，与 Windows 本地同口径）
+      # bench 的帧率 + 每帧 CPU 成本（帧率归一可比指标——syscall 占比受吞吐/连接期污染）
+      # 经 tee 存 bench.log 进 artifact，优化前后同参数字值对比。
       - name: perf record
         run: |
           R0SEMI_BENCH_N=${{ inputs.n_clients }} \
           R0SEMI_BENCH_SECS=${{ inputs.seconds }} \
           perf record -F ${{ inputs.sample_rate }} --call-graph fp -o perf.data -- \
-            "${{ steps.harness.outputs.harness }}" --ignored --nocapture
+            "${{ steps.harness.outputs.harness }}" --ignored --nocapture 2>&1 | tee /tmp/bench.log
 
       - name: 折叠栈 + SVG 火焰图（Brendan Gregg FlameGraph）
         run: |
@@ -103,3 +105,4 @@ jobs:
             flamegraph.svg
             collapsed.txt
             perf.data
+            /tmp/bench.log
