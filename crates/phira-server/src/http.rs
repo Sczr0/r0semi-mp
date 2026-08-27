@@ -36,6 +36,11 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
 /// 回源 HTTP 请求超时（§4.4：每次请求自带超时，评审 §8 三）。
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 响应体上限（C3 技术债清偿，2026-08）：官方 API 的 /me /chart /record 响应均为
+/// 小 JSON（KB 级）；16MiB 上限 = 恶意/异常上游不能把回源连接变成内存放大器
+/// （对照协议侧 PRE_AUTH→2MiB 同一防御哲学，§10.4）。
+const MAX_BODY_LEN: usize = 16 * 1024 * 1024;
+
 /// 回源 HTTP 客户端（§4.9-6 / §6.5-15）。
 ///
 /// 手写 HTTP/1.1 GET（§10.1，约两百行，最贴合内存目标）。
@@ -344,13 +349,21 @@ where
         // 状态行：`HTTP/1.1 200 OK`
         let status = parse_status(&head)?;
         if status != 200 {
+            // C3：30x 显式拒绝而非跟随——跟随重定向需要二次请求逻辑 + 跨域信任判断
+            // （重定向目标可能不是官方 API），而当前上游（phira.5wyxi.com）语义为直连；
+            // 显式报错让"上游加了 CDN 302"从静默失败变成可诊断日志（tech-debt-audit C3）。
             return Err(ApiError::Internal {
                 msg: format!("HTTP {status} from {path}"),
             });
         }
 
-        // Content-Length（缺失则按"无 body"处理——本实现只打自己的 mock API）
+        // Content-Length（缺失则按"无 body"处理；声明超上限直接拒绝——不读不缓冲）
         let len = content_length(&head)?;
+        if len > MAX_BODY_LEN {
+            return Err(ApiError::Internal {
+                msg: format!("response body too large ({len} bytes) from {path}"),
+            });
+        }
 
         // body：头内已读部分 + 余量
         let body_start = head
@@ -358,6 +371,13 @@ where
             .position(|w| w == b"\r\n\r\n")
             .map_or(0, |i| i + 4);
         let mut body = head[body_start..].to_vec();
+        // C3：无 Content-Length 头时的兜底——持续发数据的恶意上游不能让缓冲无界累积。
+        // 原实现"缺失=0 后循环读到断开"，上游可用无限流撑爆内存；现按上限报错。
+        if body.len() > MAX_BODY_LEN {
+            return Err(ApiError::Internal {
+                msg: format!("response body too large (>{MAX_BODY_LEN} bytes) from {path}"),
+            });
+        }
         while body.len() < len {
             let mut buf = [0u8; 2048];
             let n = read.read(&mut buf).await.map_err(|e| ApiError::Internal {
@@ -367,6 +387,13 @@ where
                 break;
             }
             body.extend_from_slice(&buf[..n]);
+            // C3：len 声明值可信（已验 ≤ 上限），但防御上游声明小、实发多——
+            // 超上限立刻断，不等 read 自然结束。
+            if body.len() > MAX_BODY_LEN {
+                return Err(ApiError::Internal {
+                    msg: format!("response body exceeded limit while reading from {path}"),
+                });
+            }
         }
         if body.len() < len {
             return Err(ApiError::Internal {

@@ -158,7 +158,8 @@ async fn auth_token_with_lf_rejected() {
 }
 
 /// Never Trust the Client（回源响应同样不可信）：Content-Length 巨大（10GB）→
-/// 渐进读不预分配、5s 超时截断 → Err（无内存放大）。
+/// 加固后（C3，2026-08）声明值超 16MiB 上限 → **不读不缓冲直接拒绝**（比旧的
+/// "渐进读 + 5s 超时"更快更省；原断言 timeout/truncated 随加固升级为 too large）。
 #[tokio::test]
 async fn huge_content_length_times_out_without_oom() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -178,9 +179,8 @@ async fn huge_content_length_times_out_without_oom() {
     let start = std::time::Instant::now();
     let err = client.fetch_chart(1).await.unwrap_err();
     assert!(
-        matches!(&err, phira_api::ApiError::Internal { msg }
-            if msg.contains("timeout") || msg.contains("truncated")),
-        "超大 Content-Length 应超时或截断报错（不 OOM）: {err:?}"
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("too large")),
+        "超大 Content-Length 应按上限拒绝（不读不 OOM）: {err:?}"
     );
     assert!(
         start.elapsed() < std::time::Duration::from_secs(8),
@@ -272,5 +272,91 @@ async fn short_timeout_still_succeeds_on_fast_path() {
     let chart = client.fetch_chart(3).await.unwrap();
     assert_eq!(chart.id, 3);
     assert_eq!(chart.name, "Fast Chart");
+    mock.await.unwrap();
+}
+
+// ===== C3 加固（2026-08）：响应体上限 + 重定向显式拒绝 =====
+
+/// Content-Length 声明超上限（>16MiB）→ 不读 body 直接拒绝。
+#[tokio::test]
+async fn oversized_content_length_rejected_without_reading() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        // 声明 64MiB body，不实际发送
+        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 67108864\r\nConnection: close\r\n\r\n";
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("too large")),
+        "超限 Content-Length 应被拒绝: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 302 重定向 → 显式拒绝（含 30x 状态码的可诊断错误），绝不跟随。
+#[tokio::test]
+async fn redirect_302_rejected_explicitly() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        let resp = "HTTP/1.1 302 Found\r\nLocation: http://evil.example/chart\r\nContent-Length: 0\r\n\r\n";
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(7).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("HTTP 302")),
+        "302 应显式报错而非跟随: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 声明长度之外的尾随数据 → 按 Content-Length 截取、余量丢弃
+/// （钉住"内存上界 = 声明值 + 一个 chunk"的读取语义；C3 后声明值本身受 16MiB 上限约束）。
+#[tokio::test]
+async fn trailing_bytes_beyond_content_length_discarded() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        // 声明 = 合法 JSON 实际长度，随后继续发垃圾——客户端只取前 len 字节
+        let body = br#"{"id": 7, "name": "T"}"#;
+        sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        sock.write_all(body).await.unwrap();
+        let chunk = [b'x'; 4096];
+        for _ in 0..1000 {
+            if sock.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let chart = client.fetch_chart(7).await.unwrap();
+    assert_eq!(chart.id, 7);
     mock.await.unwrap();
 }
