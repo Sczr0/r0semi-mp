@@ -5,6 +5,7 @@
 //!
 //! `http`（生产 HTTP/鉴权实现）也在此——唯一认识所有内部 crate 的地方。
 
+pub mod admin;
 pub mod http;
 pub mod l10n;
 pub mod proxy;

@@ -114,7 +114,10 @@ impl Server {
         // 修复前 select 任一分支完成即退出：http_port 未配置时 http_accept_loop 立即返回
         // → 默认配置下服务器启动即退出（ISSUE-0008）。
         let accept = tokio::spawn(accept_loop(listener, Arc::clone(&ctx)));
-        let http_accept = tokio::spawn(http_accept_loop(http_listener, Arc::clone(&ctx)));
+        let http_accept = tokio::spawn(crate::admin::http_accept_loop(
+            http_listener,
+            Arc::clone(&ctx),
+        ));
 
         tokio::select! {
             () = shutdown => {
@@ -158,25 +161,6 @@ async fn accept_loop(listener: TcpListener, ctx: Arc<ConnContext>) {
 }
 
 /// 管理 HTTP accept 循环（独立端口，§运营：/rooms；http_port 未配置时立即结束）。
-pub async fn http_accept_loop(listener: Option<TcpListener>, ctx: Arc<ConnContext>) {
-    let Some(listener) = listener else {
-        return;
-    };
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                let ctx = Arc::clone(&ctx);
-                tokio::spawn(async move {
-                    if let Err(err) = http_serve(stream, addr, ctx).await {
-                        warn!("http handler error from {addr}: {err:?}");
-                    }
-                });
-            }
-            Err(err) => warn!("http accept failed: {err:?}"),
-        }
-    }
-}
-
 /// 房间列表快照项（§运营：公开房间列表，`/rooms` HTTP 端点返回）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RoomInfo {
@@ -190,6 +174,8 @@ pub struct RoomInfo {
     pub state: String,
     /// 是否锁定。
     pub locked: bool,
+    /// 循环对局（admin 详情用，阶段 1：RoomListSink 维护 CycleRoom 事件）。
+    pub cycle: bool,
 }
 
 /// 房间列表观察者（§7.3 观察者模式）：订阅事件维护活动房间快照。
@@ -241,6 +227,7 @@ impl EventSink for RoomListSink {
                             users: 1,
                             state: "SelectChart".to_owned(),
                             locked: false,
+                            cycle: false,
                         },
                     );
                 }
@@ -291,6 +278,11 @@ impl EventSink for RoomListSink {
             E::LockRoom { room_id, lock } => {
                 if let Some(r) = self.rooms.write().await.get_mut(room_id) {
                     r.locked = *lock;
+                }
+            }
+            E::CycleRoom { room_id, cycle } => {
+                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
+                    r.cycle = *cycle;
                 }
             }
             // 热路径（RelayTouches/Judges）与不改变列表展示的（Chat/Ready/Played/Abort/CycleRoom）
@@ -716,6 +708,13 @@ impl SessionSink {
         s.iter()
             .max_by_key(|(_, slot)| slot.queue_bytes.load(Ordering::SeqCst))
             .map(|(id, slot)| (*id, Arc::clone(&slot.backpressure)))
+    }
+
+    /// 在线用户 id 列表（管理面只读查询，§admin；按 id 排序稳定输出）。
+    pub async fn online(&self) -> Vec<i32> {
+        let mut ids: Vec<i32> = self.sessions.read().await.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// 注销会话：仅当当前映射仍是本连接（重连后旧连接断开不误删新连接，§4.9-3）。
@@ -1172,106 +1171,6 @@ pub async fn handle_connection(
     monitor.abort();
     kicker.abort();
     info!("connection from {addr} closed");
-    Ok(())
-}
-
-/// 进程启动时刻（/healthz uptime 数据源，§11.1；OnceLock 惰性初始化）。
-static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
-/// 进程已运行秒数（§11.1 /healthz）。
-fn uptime_s() -> u64 {
-    let start = PROCESS_START.get_or_init(std::time::Instant::now);
-    start.elapsed().as_secs()
-}
-
-/// 管理 HTTP 端点（§运营，独立端口 `http_port`）：`/rooms` 房间列表 + `/healthz` 健康检查。
-///
-/// 极简 HTTP/1.1 响应（手写，与回源客户端对称）；仅读请求头（≤4KiB 防滥用）。
-///
-/// # Errors
-///
-/// 读写对端失败时返回 IO 错误。
-pub async fn http_serve(
-    mut stream: TcpStream,
-    addr: SocketAddr,
-    ctx: Arc<ConnContext>,
-) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // 读请求头（到空行，<=4KiB）
-    let mut head = Vec::new();
-    let mut buf = [0u8; 512];
-    loop {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        head.extend_from_slice(&buf[..n]);
-        if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 4096 {
-            break;
-        }
-    }
-    let text = String::from_utf8_lossy(&head);
-    let path = text
-        .lines()
-        .next()
-        .and_then(|l| l.split(' ').nth(1))
-        .unwrap_or("/");
-
-    // 路由
-    let (status, body, ctype) = match path {
-        "/rooms" => {
-            let rooms = ctx.room_list.snapshot().await;
-            let body = serde_json::to_string(&rooms).unwrap_or_else(|_| "[]".to_owned());
-            ("200 OK", body, "application/json; charset=utf-8")
-        }
-        "/healthz" => {
-            // §11.1 方案 B：测活 + 测健康一步到位；不依赖官方 API（官方挂掉不影响测活）
-            // B3（技术债）：把 bus 收集的 Metrics 也暴露出来，让可观测性数据进黑洞的债持续不再
-            let metrics: serde_json::Value = {
-                let snap = ctx.bus.metrics().snapshot();
-                let mut map = serde_json::Map::new();
-                for (name, s) in snap {
-                    map.insert(
-                        name.to_owned(),
-                        serde_json::json!({
-                            "calls": s.calls,
-                            "ok": s.ok,
-                            "business": s.business,
-                            "internal": s.internal,
-                            "avg_latency_ms": s.avg_latency_ms,
-                        }),
-                    );
-                }
-                serde_json::Value::Object(map)
-            };
-            let body = serde_json::json!({
-                "status": "ok",
-                "version": env!("CARGO_PKG_VERSION"),
-                "uptime_s": uptime_s(),
-                "connections": ctx.sink.conn_count().await,
-                "rooms": ctx.room_list.snapshot().await.len(),
-                "internal_errors": ctx.bus.metrics().internal_errors(),
-                "metrics": metrics,
-            })
-            .to_string();
-            ("200 OK", body, "application/json; charset=utf-8")
-        }
-        "/" => (
-            "200 OK",
-            r#"{"service":"r0semi-mp","endpoints":["/rooms","/healthz"]}"#.to_owned(),
-            "application/json; charset=utf-8",
-        ),
-        _ => ("404 Not Found", "not found".to_owned(), "text/plain"),
-    };
-
-    let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(resp.as_bytes()).await?;
-    // 实验：write_all 后不 shutdown，直接 return（drop 由内核收尾）——测客户端能否收到
-    info!("http {path} from {addr} -> {status}");
     Ok(())
 }
 

@@ -1193,7 +1193,7 @@ async fn http_rooms_endpoint_with_private_filter() {
     let http_addr = http_listener.local_addr().unwrap();
     let http_ctx = Arc::clone(&ctx);
     tokio::spawn(async move {
-        phira_server::server::http_accept_loop(Some(http_listener), http_ctx).await;
+        phira_server::admin::http_accept_loop(Some(http_listener), http_ctx).await;
     });
 
     let mp_ctx = Arc::clone(&ctx);

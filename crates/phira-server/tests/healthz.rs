@@ -12,7 +12,8 @@ use phira_api::{
     RoomResponse, UserIdentity,
 };
 use phira_core::{Bus, lifecycle::LifecycleTask};
-use phira_server::server::{ConnContext, SessionSink, http_serve};
+use phira_server::admin::http_serve;
+use phira_server::server::{ConnContext, SessionSink};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -168,4 +169,134 @@ async fn root_lists_endpoints() {
     let resp = http_get(test_ctx(), "/").await;
     assert!(resp.contains("\"endpoints\""), "端点列表: {resp}");
     assert!(resp.contains("/healthz"), "端点含 /healthz: {resp}");
+}
+
+// —— 阶段 1 管理面（docs/admin-api.md §4）：只读端点 ——
+
+/// 向 RoomListSink 喂一个房间事件（测试直驱 EventSink，绕过 bus）。
+async fn feed_room_event(ctx: &Arc<ConnContext>, ev: &RoomEvent) {
+    use phira_core::EventSink;
+    EventSink::deliver(&*ctx.room_list, 0, ev).await;
+}
+
+#[tokio::test]
+async fn admin_rooms_list_with_state_filter() {
+    let ctx = test_ctx();
+    // 造两房：r1（SelectChart）r2（Playing）
+    feed_room_event(
+        &ctx,
+        &RoomEvent::RoomCreated {
+            room_id: RoomId::new("r1".into()).unwrap(),
+            host: 1,
+        },
+    )
+    .await;
+    feed_room_event(
+        &ctx,
+        &RoomEvent::RoomCreated {
+            room_id: RoomId::new("r2".into()).unwrap(),
+            host: 2,
+        },
+    )
+    .await;
+    feed_room_event(
+        &ctx,
+        &RoomEvent::StartPlaying {
+            room_id: RoomId::new("r2".into()).unwrap(),
+        },
+    )
+    .await;
+
+    // 全量列表：两房都在，含 cycle 字段（阶段 1 详情字段）
+    let resp = http_get(Arc::clone(&ctx), "/admin/rooms").await;
+    assert!(resp.contains("200 OK"), "状态行: {resp}");
+    assert!(resp.contains("\"r1\""), "r1 在列表: {resp}");
+    assert!(resp.contains("\"r2\""), "r2 在列表: {resp}");
+    assert!(resp.contains("\"cycle\":false"), "cycle 字段存在: {resp}");
+
+    // state 过滤：play 只留 r2（子串 + 大小写不敏感）
+    let resp = http_get(Arc::clone(&ctx), "/admin/rooms?state=play").await;
+    assert!(
+        resp.contains("\"r2\"") && !resp.contains("\"r1\""),
+        "playing 过滤: {resp}"
+    );
+
+    let resp = http_get(Arc::clone(&ctx), "/admin/rooms?state=selectchart").await;
+    assert!(
+        resp.contains("\"r1\"") && !resp.contains("\"r2\""),
+        "selectchart 过滤: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn admin_room_detail_and_404() {
+    let ctx = test_ctx();
+    feed_room_event(
+        &ctx,
+        &RoomEvent::RoomCreated {
+            room_id: RoomId::new("solo-1".into()).unwrap(),
+            host: 7,
+        },
+    )
+    .await;
+
+    let resp = http_get(Arc::clone(&ctx), "/admin/rooms/solo-1").await;
+    assert!(resp.contains("200 OK"), "状态行: {resp}");
+    assert!(resp.contains("\"id\":\"solo-1\""), "id: {resp}");
+    assert!(resp.contains("\"host\":7"), "host: {resp}");
+
+    let resp = http_get(Arc::clone(&ctx), "/admin/rooms/nope").await;
+    assert!(resp.contains("404 Not Found"), "不存在应 404: {resp}");
+}
+
+#[tokio::test]
+async fn admin_users_online_with_name() {
+    let ctx = test_ctx();
+    // 注册在线会话（SessionSink）+ 注册表名字（组合根视角拼装 /admin/users）
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    ctx.sink
+        .register(
+            42,
+            Arc::new(tx),
+            Arc::new(phira_server::server::Backpressure::new()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            phira_server::l10n::Locale::EnUs,
+        )
+        .await;
+    let _ = ctx.registry.register(42, "admin-tester".to_owned());
+
+    let resp = http_get(Arc::clone(&ctx), "/admin/users").await;
+    assert!(resp.contains("200 OK"), "状态行: {resp}");
+    assert!(resp.contains("\"user_id\":42"), "在线用户 42: {resp}");
+    assert!(
+        resp.contains("\"name\":\"admin-tester\""),
+        "名字来自注册表: {resp}"
+    );
+    assert!(
+        resp.contains("\"room_id\":null"),
+        "无房间归属 → null: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn admin_metrics_exposes_bus_statistics() {
+    let ctx = test_ctx();
+    // 造一条命令统计（与 healthz B3 测试同构）
+    ctx.bus
+        .dispatch(
+            CmdCtx {
+                origin: phira_api::Origin::System,
+                room_id: RoomId::new("x".into()).unwrap(),
+            },
+            RoomCommand::Tick { now: 0 },
+        )
+        .await
+        .ok();
+    let resp = http_get(Arc::clone(&ctx), "/admin/metrics").await;
+    assert!(resp.contains("200 OK"), "状态行: {resp}");
+    assert!(
+        resp.contains("\"internal_errors\":"),
+        "internal_errors 键: {resp}"
+    );
+    assert!(resp.contains("\"metrics\":"), "metrics 键: {resp}");
 }
