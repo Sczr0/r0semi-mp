@@ -262,6 +262,10 @@ async fn broadcast_fanout_bench() {
 
     // 等连接收尾（写任务清账）
     tokio::time::sleep(Duration::from_millis(200)).await;
+    // epochs 锁探针（R0SEMI_EPOCHS_PROBE=1 时取数；默认关闭零开销）
+    if let Some((calls, slow, wait_us)) = ctx.registry.probe_snapshot() {
+        eprintln!("== epochs 锁探针 == 调用={calls} 慢锁(>50µs)={slow} 总等待={wait_us}µs");
+    }
     drop(ctx);
 
     eprintln!(

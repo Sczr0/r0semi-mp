@@ -19,8 +19,9 @@
 //! 红线程：phira-core 禁 unwrap/expect（柜台不 panic）；本模块只依赖 std + tokio。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use phira_api::{CmdCtx, Origin, RoomCommand, RoomId};
 use tokio::sync::mpsc;
@@ -47,11 +48,56 @@ const ROUTE_REPLAY_DELAY: Duration = Duration::from_millis(20);
 /// 不变量）与 `names`（可淘汰，仅在用户彻底离线时移除）。昵称只在
 /// `CreateRoom`/`JoinRoom` 派发时需要（§6.6 表 2），那时用户必然已重新鉴权注入 name；
 /// 而 epoch 必须单调递增不回收，否则重连回退可能撞上遗留僵尸连接复活 ISSUE-0009。
+/// epochs 锁探针（performance-cpu.md §锁竞争矩阵）：`R0SEMI_EPOCHS_PROBE=1` 启用——
+/// 计数 epochs 锁调用次数与慢锁（>50µs 等待）次数/总等待，定位锁竞争真源（低频调用
+/// 长等待 vs 隐藏高频调用）。默认关闭（零成本：仅一次 bool 分支）。
+#[derive(Default)]
+struct SessionProbe {
+    enabled: bool,
+    calls: AtomicU64,
+    slow_50us: AtomicU64,
+    wait_ns: AtomicU64,
+}
+
+impl SessionProbe {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var("R0SEMI_EPOCHS_PROBE").is_ok_and(|v| v == "1"),
+            ..Self::default()
+        }
+    }
+
+    /// 取锁并计时（关闭时退化为普通 lock）。
+    fn lock_epochs<'a>(
+        &self,
+        lock: &'a Mutex<HashMap<i32, u64>>,
+    ) -> MutexGuard<'a, HashMap<i32, u64>> {
+        let start = Instant::now();
+        let guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.enabled {
+            let el = start.elapsed();
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if el > Duration::from_micros(50) {
+                self.slow_50us.fetch_add(1, Ordering::Relaxed);
+            }
+            self.wait_ns.fetch_add(
+                u64::try_from(el.as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        guard
+    }
+}
+
 pub struct SessionRegistry {
     /// 用户当前纪元（单调递增，永不删除）：`user_id → epoch`。
     epochs: Mutex<HashMap<i32, u64>>,
     /// 用户昵称（可淘汰）：`user_id → name`；离线超时后移除，重连时由 authenticate 重注。
     names: Mutex<HashMap<i32, String>>,
+    /// 锁诊断探针（默认关闭；bench 侧 `probe_snapshot` 取数）。
+    probe: SessionProbe,
 }
 
 impl Default for SessionRegistry {
@@ -59,6 +105,7 @@ impl Default for SessionRegistry {
         Self {
             epochs: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
+            probe: SessionProbe::new(),
         }
     }
 }
@@ -76,10 +123,7 @@ impl SessionRegistry {
     /// 由 server 鉴权成功后调用。epoch 单调保留（不删除）；name 注入（覆盖旧值）。
     #[must_use]
     pub fn register(&self, user_id: i32, name: String) -> u64 {
-        let mut epochs = self
-            .epochs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut epochs = self.probe.lock_epochs(&self.epochs);
         let epoch = epochs.get(&user_id).copied().unwrap_or(0) + 1;
         epochs.insert(user_id, epoch);
         // name 独立表：覆盖注入（旧的若已被淘汰则重建，未淘汰则替换）
@@ -95,11 +139,22 @@ impl SessionRegistry {
     /// `None` = 从未注册（理论不可达——活着且已鉴权的连接必然已 `register`）。
     #[must_use]
     pub fn current_epoch(&self, user_id: i32) -> Option<u64> {
-        self.epochs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&user_id)
-            .copied()
+        self.probe.lock_epochs(&self.epochs).get(&user_id).copied()
+    }
+
+    /// 探针快照（`(调用次数, >50µs 慢锁次数, 总等待 µs)`；未启用 = None）。
+    ///
+    /// 供 bench/诊断取数（R0SEMI_EPOCHS_PROBE=1 运行后打印，performance-cpu.md §锁矩阵）。
+    #[must_use]
+    pub fn probe_snapshot(&self) -> Option<(u64, u64, u64)> {
+        if !self.probe.enabled {
+            return None;
+        }
+        Some((
+            self.probe.calls.load(Ordering::Relaxed),
+            self.probe.slow_50us.load(Ordering::Relaxed),
+            self.probe.wait_ns.load(Ordering::Relaxed) / 1000,
+        ))
     }
 
     /// 用户当前昵称（CreateRoom/JoinRoom 派发填充，§6.6 表 2）。

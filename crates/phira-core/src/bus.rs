@@ -14,6 +14,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -73,8 +74,16 @@ pub struct CommandStats {
 ///
 /// 原子计数器集合（评审 §8：不是中间件）；错误率只统计 `Internal`，
 /// 业务拒绝（房满/越权）是预期行为，混入会扭曲对比。
+///
+/// 锁优化（2026-08，performance-cpu.md §锁竞争矩阵）：热路径命令（Touches/Judges）
+/// 从明细表豁免——触摸流 24k cmd/s 全量打 `Mutex<HashMap>` = 每命令一把锁
+/// （实测指标锁占 CPU ~3.1%）；触摸流无错误语义、f64 moving-avg 无运营价值，
+/// 计数保留在**单个原子**（吞吐观测仍可得），明细留在慢路径（低频无争）。
 #[derive(Default)]
 pub struct Metrics {
+    /// 热路径命令（touches/judges）原子计数（Relaxed——单一计数无顺序需求）。
+    hot: AtomicU64,
+    /// 慢路径明细（其余命令，低频）。
     inner: std::sync::Mutex<HashMap<&'static str, CommandStats>>,
 }
 
@@ -85,6 +94,12 @@ impl Metrics {
         result: &Result<RoomResponse, RoomError>,
         elapsed: Duration,
     ) {
+        // 热路径豁免：触摸流/判定流只做原子计数（无锁、无明细、无 f64）
+        if name == "touches" || name == "judges" {
+            self.hot.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // 慢路径（其余命令，低频）：明细照旧
         // 中毒恢复（柜台不 panic）：持锁线程若 panic，取回 guard 继续（计数可能丢失，可接受）
         let mut guard = self
             .inner
@@ -109,6 +124,18 @@ impl Metrics {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut v: Vec<_> = guard.iter().map(|(k, s)| (*k, *s)).collect();
+        drop(guard);
+        // 热路径合成条目（count 保留，明细全零——触摸流不计错误率/延迟，§3.2 语义不变）
+        let hot = self.hot.load(Ordering::Relaxed);
+        if hot > 0 {
+            v.push((
+                "touches.judges.hot",
+                CommandStats {
+                    calls: hot,
+                    ..CommandStats::default()
+                },
+            ));
+        }
         v.sort_by_key(|(k, _)| *k);
         v
     }

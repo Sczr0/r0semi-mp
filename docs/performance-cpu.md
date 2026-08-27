@@ -50,6 +50,22 @@ Windows 上 1500 连接双向高频小包，CPU 主体是**每包一次 IO 完�
 （`NtRemoveIoCompletionEx` 系列 + 写侧每帧 2 次 `write_all` syscall）。
 优化重心应放在**系统调用面**（批处理合并 IO），而非用户态算法去重。
 
+### 3.1 锁竞争矩阵（Linux perf，2026-08）
+
+| 锁 | 帧样本 | 归因 | 处置 |
+|---|---|---|---|
+| tokio time driver（InnerState） | 18.0M | **bench 客户端 sleep 假象**（1500×16Hz 与服务器同 runtime 混采） | 排除 |
+| **Metrics.record**（Mutex<HashMap<&str, CommandStats>>） | 9.5M | 我们的代码：dispatch 每命令一次锁 | ✅ **已无锁化**（下述）：热路径（touches/judges）豁免为单原子计数，慢路径保留 |
+| SessionRegistry.epochs | 7.0M | **探针实锤为假**：R0SEMI_EPOCHS_PROBE=1 实测（bench N=100）调用 5705 次、慢锁(>50µs)仅 2 次、总等待 1149µs（0.02% CPU）——7M 帧是 tokio fp 采样在 async 任务边界的**串帧伪影** | 排除（探针保留为诊断工具） |
+| mpsc Waitlist semaphore | 1.5M | tokio 内部（1500 写任务等待） | 标准代价 |
+| io registration / names | <1M | 连接建立期/低频 | —— |
+
+**Metrics 无锁化**（2026-08 落地）：`bus.rs` Metrics 加 `hot: AtomicU64`——
+Touches/Judges 只 `fetch_add(1, Relaxed)`（触摸流无错误语义、f64 moving-avg
+无运营价值）；其余命令走原明细（低频无争）。`snapshot` 合成
+`touches.judges.hot` 条目（count 保留，明细零）。契约测试不涉及触摸流明细 ✓。
+**待复采验证**：下一轮 flamegraph workflow 应看到 Metrics 锁帧消失、epochs
+伪影帧存亡判别（若仍 7M → 纯伪影；若影减 → 伪影来源与 Metrics 相关）。
 **已落地（同轮）**：写侧批处理（`stream.rs` WRITE_BATCH_MAX=64：`recv_many`
 攒帧一次 `write_all`，低流量延迟不增）——回归绿（memory_guard 账目平衡/healthz）。
 **量化复核路径（已自动化）**：`.github/workflows/flamegraph.yml` 手动触发——GitHub
