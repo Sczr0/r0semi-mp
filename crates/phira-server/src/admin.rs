@@ -428,6 +428,15 @@ async fn route_admin_read(
             serde_json::to_string(&ctx.admin_audit.snapshot()).unwrap_or_else(|_| "[]".to_owned()),
             "application/json; charset=utf-8",
         ),
+        "/admin/anticheat" => (
+            "200 OK",
+            serde_json::json!({
+                "fingerprints": ctx.admin_anticheat.fingerprint_len(),
+                "rejects": ctx.admin_anticheat.rejects_snapshot(),
+            })
+            .to_string(),
+            "application/json; charset=utf-8",
+        ),
         path if path.starts_with("/admin/rooms/") => {
             let id = &path["/admin/rooms/".len()..];
             let rooms = ctx.room_list.snapshot().await;
@@ -712,13 +721,16 @@ async fn admin_rollback_config(ctx: &ConnContext) -> (&'static str, String) {
 /// observer 热插拔（阶段 3，§7.3 预留兑现）：`kind` 目前支持 `ban`（封禁名单观察者，
 /// 组合根单例挂载/卸载——卸载后现有名单不生效，重挂恢复）。其它 kind → 400。
 fn admin_toggle_observer(ctx: &ConnContext, kind: &str, op: &str) -> (&'static str, String) {
-    if kind != "ban" {
-        return (
-            "400 Bad Request",
-            serde_json::json!({"ok": false, "error": "unsupported kind"}).to_string(),
-        );
-    }
-    let moderator = Arc::clone(&ctx.admin_ban_observer) as Arc<dyn phira_api::Moderator>;
+    let moderator: Arc<dyn phira_api::Moderator> = match kind {
+        "ban" => Arc::clone(&ctx.admin_ban_observer) as Arc<dyn phira_api::Moderator>,
+        "anticheat" => Arc::clone(&ctx.admin_anticheat) as Arc<dyn phira_api::Moderator>,
+        _ => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"ok": false, "error": "unsupported kind"}).to_string(),
+            );
+        }
+    };
     match op {
         "add" => {
             ctx.bus.add_moderator(moderator);
@@ -729,7 +741,7 @@ fn admin_toggle_observer(ctx: &ConnContext, kind: &str, op: &str) -> (&'static s
             )
         }
         "remove" => {
-            let removed = ctx.bus.remove_moderator("ban");
+            let removed = ctx.bus.remove_moderator(kind);
             (
                 "200 OK",
                 serde_json::json!({"ok": removed, "banned": ctx.admin_ban_observer.banned_users()})

@@ -80,6 +80,7 @@ fn test_ctx_with_persist(dir: &std::path::Path) -> Arc<ConnContext> {
         admin_audit: phira_server::admin::AuditLog::new_with_file(dir),
         admin_config: phira_server::admin::AdminConfigState::new(),
         admin_ban_observer: phira_server::server::BanObserver::new_with_file(dir),
+        admin_anticheat: phira_server::server::AntiCheatObserver::new(),
         config_store: Arc::new(ConfigStore::new(dir)),
     })
 }

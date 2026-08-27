@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         admin_audit: phira_server::admin::AuditLog::new_with_file(&persist_dir),
         admin_config,
         admin_ban_observer: phira_server::server::BanObserver::new_with_file(&persist_dir),
+        admin_anticheat: phira_server::server::AntiCheatObserver::new(),
         config_store: Arc::new(config_store),
         room_list,
     };

@@ -292,6 +292,138 @@ impl EventSink for RoomListSink {
     }
 }
 
+/// 反作弊观察者（P2 首个运营规则 Moderator，docs/admin-api.md §4）：跨房 record 重放检测。
+///
+/// 数据面：`intercept` 可见客户端命令（`Played{id}` 受理前，自带 record id + 用户 id，
+/// `ctx.room_id` 为已接通房间）；`on_event` 收领域事件（热路径不通知）。
+///
+/// 规则 R1（首版，低误伤）：同一 `(user_id, record_id)` 已在**其他房间**结算过，
+/// 再次 Played 同 record → `Moderated` 拒绝（成绩作废 → 本局按无有效成绩 aborted，
+/// 安全线：策略错误最多使成绩变 abort，不伤房间状态）。同房重放由房间 actor 幂等
+/// 处理，观察者不栏。伪造/多号换房重放是客户端命令序列操纵的唯一入口，官方
+/// record 数据源不可伪造（A2 回源），故规则命中即拒绝、不自动禁（运营可后续升级）。
+///
+/// 保守性：观察者挂载（bus add_moderator）才拦截——热插拔卸载后仅观测失效；
+/// 指纹环形上限防内存暴涨（LRU 简易清空，文档注明）。
+#[derive(Default)]
+pub struct AntiCheatObserver {
+    /// 指纹：`(user, record_id) → 首个结算房间`（仅记录成功受理过的 Played）。
+    fingerprints: std::sync::Mutex<std::collections::HashMap<(i32, i32), phira_api::RoomId>>,
+    /// 拒绝记录环形（有界 256，`/admin/anticheat` 展示；不落盘——P2 审计面后续接 storage）。
+    rejects: std::sync::Mutex<std::collections::VecDeque<AntiCheatReject>>,
+}
+
+/// 反作弊拒绝条目（环形，时间倒序展示）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AntiCheatReject {
+    /// 拒绝时间（unix 秒）。
+    pub at: u64,
+    /// 用户 id。
+    pub user: i32,
+    /// 成绩记录 id（官方 record）。
+    pub record: i32,
+    /// 被拒绝时所处的房间。
+    pub room: String,
+    /// 首次结算房间。
+    pub first_room: String,
+}
+
+impl AntiCheatObserver {
+    /// 新观察者（组合根持有；热插拔时 clone 进 bus）。
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// 拒绝记录（环形 256，最旧丢弃）。
+    fn record_reject(&self, now: u64, user: i32, record: i32, room: &str, first_room: &str) {
+        let mut inner = self
+            .rejects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.len() >= 256 {
+            inner.pop_front();
+        }
+        inner.push_back(AntiCheatReject {
+            at: now,
+            user,
+            record,
+            room: room.to_owned(),
+            first_room: first_room.to_owned(),
+        });
+    }
+
+    /// 指纹规模（管理面/观测）。
+    pub fn fingerprint_len(&self) -> usize {
+        self.fingerprints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// 拒绝记录快照（时间倒序——最新在前）。
+    pub fn rejects_snapshot(&self) -> Vec<AntiCheatReject> {
+        let mut list: Vec<_> = self
+            .rejects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        list.sort_by_key(|r| std::cmp::Reverse(r.at));
+        list
+    }
+}
+
+/// 指纹上限（防内存暴涨；超限清空——重放检测短暂失效可接受，文档注明）。
+const ANTICHEAT_FINGERPRINT_LIMIT: usize = 4096;
+
+#[async_trait::async_trait]
+impl phira_api::Moderator for AntiCheatObserver {
+    fn kind(&self) -> &'static str {
+        "anticheat"
+    }
+
+    async fn intercept(&self, cmd: &RoomCommand, ctx: &CmdCtx) -> Result<(), RoomError> {
+        let RoomCommand::Played { id } = cmd else {
+            return Ok(());
+        };
+        let Origin::Client { user_id } = ctx.origin else {
+            return Ok(()); // 系统命令不经过本观察者（core 保证）；防御性跳过
+        };
+        let mut fp = self
+            .fingerprints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match fp.get(&(user_id, *id)) {
+            // 已授权房间 = 本房间：幂等重试（actor 处理），观察者不栏
+            Some(first_room) if first_room == &ctx.room_id => {}
+            // 已在其他房间结算过 → 跨房重放，拒绝（成绩作废 → aborted）
+            Some(first_room) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                self.record_reject(now, user_id, *id, ctx.room_id.as_str(), first_room.as_str());
+                return Err(RoomError::Business {
+                    code: RoomErrorCode::Moderated,
+                    msg: "record replay (already settled in another room)".to_owned(),
+                });
+            }
+            // 首次受理：登记（仅记录，不做判定）
+            None => {
+                fp.insert((user_id, *id), ctx.room_id.clone());
+            }
+        }
+        if fp.len() > ANTICHEAT_FINGERPRINT_LIMIT {
+            fp.clear();
+        }
+        Ok(())
+    }
+
+    async fn on_event(&self, _ev: &RoomEvent) {
+        // P2 v1：判定全在同步拦截路径（intercept）；事件面留给后续规则（节奏/成绩分布）。
+    }
+}
 /// 封禁名单观察者（阶段 3 首个真实 Moderator，docs/admin-api.md §4）：
 /// 名单内用户的一切客户端命令被 `intercept` 拒绝（`Moderated`）——覆盖在入房类命令
 /// （`CreateRoom`/`JoinRoom`/`Chat`…）；`Authenticate` 不经 `RoomCommand` 流，机制上
@@ -434,6 +566,8 @@ pub struct ConnContext {
     pub admin_audit: Arc<crate::admin::AuditLog>,
     /// runtime-config 回滚状态（阶段 3：保留"上一份"全量快照，admin.rs）。
     pub admin_config: Arc<crate::admin::AdminConfigState>,
+    /// 反作弊观察者单例（P2；热插拔挂载 kind=anticheat，跨房 record 重放检测）。
+    pub admin_anticheat: Arc<AntiCheatObserver>,
     /// 封禁名单观察者单例（阶段 3 首个真实 Moderator；对象插拔 clone，ban 名单本体）。
     pub admin_ban_observer: Arc<BanObserver>,
     /// 管理持久化（组合根 storage：config 快照 current/last；`disabled` = 仅内存）。

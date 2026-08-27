@@ -76,6 +76,7 @@ fn test_ctx() -> ConnContext {
         admin_audit: phira_server::admin::AuditLog::new(),
         admin_config: phira_server::admin::AdminConfigState::new(),
         admin_ban_observer: phira_server::server::BanObserver::new(),
+        admin_anticheat: phira_server::server::AntiCheatObserver::new(),
         config_store: Arc::new(phira_server::storage::ConfigStore::disabled()),
     }
 }

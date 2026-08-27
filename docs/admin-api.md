@@ -85,6 +85,7 @@
 | 2 ✅ | 写面系统命令族（AdminKick/AdminBroadcast）+ Bearer 认证 + 审计环 | kick e2e 全链路（含被踢者本人收 LeaveRoom）+ 401/403 + 审计 4 端点 | `/admin/*` 全认证（读面收紧）；AdminBan 名单拦截留 P2 |
 | 3 ✅ | runtime-config（存"上一份"+一步回滚）+ observer 热插拔（ban） | config 回滚 409/审计 + 热插拔生效失效/幂等 + 名单拦命令 | **§7.3 定形实锤**：Moderator 加 `kind()`（type_name_of_val 对 &dyn 返回 dyn 名不可作身份键） |
 | 3.5 ✅ | 管理面持久化（ban / audit / config 快照） | 重启后名单拦截生效、审计历史可查、rollback 跨重启仍可用；损坏文件 fail soft | 组合根 storage 模块，契约/core 零改动 |
+| 3.6 ✅ | 反作弊 P2（AntiCheatObserver，第二个真实 Moderator） | 跨房 record 重放被 Moderated 拒绝（端到端）+ /admin/anticheat 读面 + 热插拔 kind=anticheat | §7.3 观察者接口被第二个实例再次定形（intercept 同步判定 + 拒绝环形） |
 | 4 | Web 面板 | 消费已稳定 API，不改服务端 | 反作弊 P2 的运营观察台顺手长在面板上 |
 
 ## 5.5 持久化（组合根 storage 模块，阶段 3.5 落地）

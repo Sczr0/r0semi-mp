@@ -820,6 +820,8 @@ pub trait Moderator: Send + Sync {
 
 **插座已装（2026-08）**：`Moderator` 已进 `phira-api`（§4.4 薄缝）——双方法 `intercept(cmd, ctx) -> Result<(), RoomError>` + `on_event(ev)`；拒绝码新增 `RoomErrorCode::Moderated` 且 `RoomErrorCode` 已 `#[non_exhaustive]`（§5.6：拒绝码集合开放演进，外部匹配必须带通配）。**bus 接入点**：`dispatch` 路由前调用 `intercept`——仅对 `Origin::Client` 且**非热路径**（`Touches`/`Judges` 豁免：慢观察者不得拖垮 60Hz 转发，§4.9-9）的命令（系统命令/生命周期事实/回注/配置热更不可被拦，core 保证），拒收的命令**不产生任何房间副作用**；`process_events` 完成后把**领域事件**（过滤热路径 `RelayTouches/Judges` 与 core 信号 `RoomClosed`）fire-and-forget 通知各观察者（不阻塞房间投递/串行位）。**测试位置 = phira-core 集成测试 + e2e 全链路**（§4.9-3：observer 是 core 行为，契约套件直驱 actor 测不到）：拦截在路由前无副作用 / 系统命令不经过 / 热路径豁免 / 领域事件过滤 / 被拦错误到达真实客户端（Failure(Moderated)）五条已钉住。**接口仍按草案对待**：第一个真实观察者（谱面反作弊）动工时再定形——若需要"通知含 RoomClosed"或"按 user 过滤订阅面"，届时扩展，现在不承诺。
 
+**二号实例（2026-08，反作弊 P2）**：`AntiCheatObserver`（server.rs，kind=`anticheat`）——跨房 record 重放检测：`intercept`（Played{id} 受理前）首放行记录指纹 (user,record)→房间，其他房间再上报同 record → `Moderated`（成绩作废 → 结算 aborted，安全线：策略错误最多使成绩变 abort）；拒绝记录环形 256（`GET /admin/anticheat`）；指纹上限 4096 超限清空（文档注明重放检测短暂失效）。热插拔复用 `/admin/observers` + kind 白名单扩展。测试：单元三态 + 端到端（双连接隔离 settle 异步）+ 纯管理端点。
+
 封禁不是命令持有者——它订阅领域事件（如 Chat）并在命令路径上否决，不碰其它货物。**拦鉴权的通路在阶段 4 前不存在**（鉴权不经 RoomCommand 流，`intercept` 看不到 Authenticate——`AuthAttempt` 是幽灵类型，已删，评审 §8 二-5），届时再设计。
 
 ---
