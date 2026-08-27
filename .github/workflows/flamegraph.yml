@@ -1,0 +1,105 @@
+# CPU 火焰图复核（docs/performance-cpu.md §3）：GitHub Actions（Linux）上跑 bench_broadcast
+# + perf 采样 + 生成 SVG/collapsed 栈。
+#
+# 为什么在 Linux：Windows 非管理员 ETW 采样受限（samply 无数/符号化差），Linux perf
+# 对 debug 构建天然带符号（ELF + debug info，无 PDB 问题）——同一 benchmark 的权威复核面。
+# 对比方法：两次 Run 各下 artifact，collapsed.txt 直接数值对比 / SVG 目测。
+#
+# 手动触发：Actions → flamegraph → Run workflow（N/SECS/采样率可调；1500 人狂按键场景 = 300-500 客户端）。
+name: flamegraph
+
+on:
+  workflow_dispatch:
+    inputs:
+      n_clients:
+        description: 客户端数（R0SEMI_BENCH_N；越大扇出放大越明显）
+        default: "300"
+        required: false
+      seconds:
+        description: 触摸流秒数（R0SEMI_BENCH_SECS；串行连接期另计 ~70ms/连接）
+        default: "10"
+        required: false
+      sample_rate:
+        description: perf 采样率 Hz
+        default: "1999"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  flamegraph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 准备 perf（runner 镜像未必带；版本随内核）
+        run: |
+          if ! command -v perf >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y linux-tools-generic || \
+              sudo apt-get install -y linux-tools-common
+          fi
+          perf --version
+
+      - name: 放开用户态栈采样（runner 默认 paranoid 挡栈）
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=-1
+          sudo sysctl -w kernel.kptr_restrict=0
+
+      - name: 编译 bench harness（不跑，只取可执行路径）
+        run: cargo test --no-run --test bench_broadcast --message-format=json > /tmp/no_run.json
+
+      - name: 定位 harness 可执行文件
+        id: harness
+        run: |
+          EXE=$(python3 - <<'PY'
+          import json
+          exes = []
+          for line in open('/tmp/no_run.json', encoding='utf-8'):
+              line = line.strip()
+              if not line.startswith('{'):
+                  continue
+              m = json.loads(line)
+              if m.get('reason') == 'compiler-artifact' \
+                  and m.get('target', {}).get('name') == 'bench_broadcast' \
+                  and m.get('executable'):
+                  exes.append(m['executable'])
+          print(exes[-1])
+          PY
+          )
+          echo "harness=$EXE" >> "$GITHUB_OUTPUT"
+          ls -la "$EXE"
+
+      # 直接采 harness 进程（不带 cargo 包装，与 Windows 本地同口径）
+      - name: perf record
+        run: |
+          R0SEMI_BENCH_N=${{ inputs.n_clients }} \
+          R0SEMI_BENCH_SECS=${{ inputs.seconds }} \
+          perf record -F ${{ inputs.sample_rate }} --call-graph fp -o perf.data -- \
+            "${{ steps.harness.outputs.harness }}" --ignored --nocapture
+
+      - name: 折叠栈 + SVG 火焰图（Brendan Gregg FlameGraph）
+        run: |
+          git clone --depth 1 https://github.com/brendangregg/FlameGraph /tmp/FlameGraph
+          perf script -i perf.data > /tmp/out.perf-script
+          /tmp/FlameGraph/stackcollapse-perf.pl /tmp/out.perf-script > collapsed.txt
+          /tmp/FlameGraph/flamegraph.pl collapsed.txt > flamegraph.svg
+          echo "== 热点（leaf 函数按样本计数 top 12）=="
+          awk '{count=$NF; sub(/ [0-9]+$/, "", $0); n=split($0, f, ";"); print f[n], count}' \
+            collapsed.txt | awk '{s[$1] += $2} END {for (k in s) print s[k], k}' | sort -rn | head -12 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flamegraph
+          path: |
+            flamegraph.svg
+            collapsed.txt
+            perf.data

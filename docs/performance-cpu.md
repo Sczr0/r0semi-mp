@@ -52,9 +52,12 @@ Windows 上 1500 连接双向高频小包，CPU 主体是**每包一次 IO 完�
 
 **已落地（同轮）**：写侧批处理（`stream.rs` WRITE_BATCH_MAX=64：`recv_many`
 攒帧一次 `write_all`，低流量延迟不增）——回归绿（memory_guard 账目平衡/healthz）。
-**量化复核路径**：非管理员 ETW 采样 + samply save-only 无符号（函数名是地址、
-lib 归属缺失）——对比分析以 Firefox profiler UI 导出（compact，含符号+libs）为准；
-**效果量化建议在 Linux CI 用 `perf record` 复核**（bench 可移植）。
+**量化复核路径（已自动化）**：`.github/workflows/flamegraph.yml` 手动触发——GitHub
+Actions（Linux）编译 bench + `perf record` 采样 + FlameGraph 生成 SVG/collapsed 栈
+artifact。Windows 非管理员 ETW 采样 + samply save-only 无符号（函数名是地址、lib 归属
+缺失）；Linux perf 对 debug 构建天然带符号（ELF + debug info，无 PDB 问题）——这是
+**同一 benchmark 的权威复核面**。两次 Run 各下载 artifact，collapsed.txt 直接数值
+对比（写批处理前后效果在此验证）。
 
 **备选后续**：读侧长度前缀逐字节 `read_u8`（每字节 poll）可改为带用户缓冲的合读
 （需 pending 缓冲，防吞后续帧载荷——本轮未动）；`tokio` multi_thread 单 IO driver
