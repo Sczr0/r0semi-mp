@@ -116,7 +116,7 @@ const ZH_CN: [&str; KEY_COUNT] = [
 ];
 
 const ZH_TW: [&str; KEY_COUNT] = [
-    "房間 ID 已被占用",
+    "房間 ID 已被佔用",
     "房間已鎖定",
     "遊戲正在進行中",
     "權限不足，不能旁觀房間",
