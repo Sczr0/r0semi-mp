@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use phira_api::{
     ApiClient, ApiError, AuthError, AuthHandler, Chart, RandomSource, Record, RoomConfig, RoomDeps,
-    RoomEvent, RoomFactory, RoomId, UserIdentity,
+    RoomFactory, RoomId, UserIdentity,
 };
 use phira_core::{Bus, lifecycle::LifecycleTask};
 use phira_server::server::{ConnContext, SessionSink, handle_connection, in_flight_bytes};
