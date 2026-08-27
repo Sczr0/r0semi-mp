@@ -90,7 +90,12 @@ payload 读取窗口经 `ReadCharge` 入全局账（超限断连 fail closed—�
 洪水被全局 64MiB 闸住），Drop guard 兜底任何退出路径记账平衡。
 验证：242 全绿（含 frames/conformance/fuzz_frames/e2e 帧正确性 + memory_guard
 账目平衡 + pressure 灌流）；bench 帧率无回归（1369/s @ N=100，与合读前同比例）。
-**量化复核**：flamegraph workflow 复采应见 recvfrom 占比回落（21% → 更低）。
+**帧率归一母尺（v4，2026-08）**：flamegraph workflow 产出 bench.log——
+300 客户端 / 10.07s / 4739 帧/s（≡300×16 全额节奏）/ **进程 CPU 3.81s（单核
+37.8%）/ 每帧 CPU 79.9µs**。**对比协议**：workflow 手动触发时 ref 选旧提交
+（4524c14 = Metrics 无锁化后、合读前；6b00487 = 写批处理后）同参数复跑，
+bench.log 里「每帧 CPU 成本」直接对拍——低于 79.9µs 即合读净收益（syscall
+占比受吞吐/连接期污染不可比，此指标为裁决依据）。
 `tokio` multi_thread 单 IO driver 为架构级约束，缓解靠减少 IO 事件数（已做
 写批处理 + 读合读两个方向）。
 
