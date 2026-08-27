@@ -36,7 +36,8 @@ impl ApiClient for FakeApi {
     async fn fetch_record(&self, id: i32) -> Result<Record, ApiError> {
         Ok(Record {
             id,
-            player: id, // 与上报者 id 对齐（§6.5-10）
+            player: id,     // 与上报者 id 对齐（§6.5-10）
+            chart: Some(1), // 契约套件本局默认谱面 id = 1（setup_playing SelectChart{id:1}）
             score: 100,
             perfect: 1,
             good: 2,
@@ -109,11 +110,15 @@ fn sys_ctx() -> CmdCtx {
 }
 
 // 确定性回源结果（A2 回注测试用，FakeApi 同口径：`player == record.id`）。
+//
+// `record_ok_fn` 默认 `chart = Some(1)`——契约套件统一 setup_playing 选图 id=1；
+// `record_mismatch_fn`（外谱面）与 `record_no_chart_fn`（fail-open）供 P1 场景用。
 #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)] // Result 形状是 RecordFetched 载荷所需
-fn record_ok_fn(id: i32) -> Result<Record, ApiError> {
+fn record_with_chart(id: i32, chart: Option<i32>) -> Result<Record, ApiError> {
     Ok(Record {
         id,
         player: id, // FakeApi 口径：player == record.id（§6.5-10）
+        chart,
         score: 100,
         perfect: 1,
         good: 2,
@@ -125,6 +130,21 @@ fn record_ok_fn(id: i32) -> Result<Record, ApiError> {
         std: 0.1,
         std_score: 0.9,
     })
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn record_ok_fn(id: i32) -> Result<Record, ApiError> {
+    record_with_chart(id, Some(1))
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn record_mismatch_fn(id: i32) -> Result<Record, ApiError> {
+    record_with_chart(id, Some(999))
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn record_no_chart_fn(id: i32) -> Result<Record, ApiError> {
+    record_with_chart(id, None)
 }
 
 fn assert_business(resp: &RoomResponse, code: RoomErrorCode) {
@@ -194,6 +214,7 @@ pub async fn room_contract_suite<F: RoomFactory>(factory: &F) {
     permissions_and_state(factory).await;
     game_flow(factory).await;
     record_fetch_failure_settles(factory).await;
+    record_chart_mismatch_settles(factory).await;
     disconnect_reconnect(factory).await;
     monitor_and_relay(factory).await;
     config_and_client_state(factory).await;
@@ -759,6 +780,87 @@ async fn record_fetch_failure_settles<F: RoomFactory>(factory: &F) {
             .iter()
             .any(|e| matches!(e, RoomEvent::GameEnd { room_id, .. } if room_id == &rid())),
         "全员结算应 GameEnd（回注失败不影响收尾）: {events:?}"
+    );
+}
+
+/// P1 谱面反作弊（§6.5-10）：成绩谱面与本局所选不一致 → 提交者按"无有效成绩"结算；
+/// 缺省 chart（fail-open）与一致成绩照常入账；全员结算不卡房间。
+#[allow(clippy::too_many_lines)] // 场景脚本三段断言一体
+async fn record_chart_mismatch_settles<F: RoomFactory>(factory: &F) {
+    let mut room = factory.create(rid());
+    setup_playing(&mut room).await; // 本局选图 = chart 1（SelectChart { id: 1 }）
+
+    // 一致成绩（chart=1）→ 正常入账 + Played 广播
+    let (resp, _) = room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    let (_, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 1,
+                record_id: 1,
+                record: record_ok_fn(1), // chart=1 == 本局
+            },
+        )
+        .await;
+    assert!(
+        events.contains(&RoomEvent::Played {
+            room_id: rid(),
+            user: 1,
+            score: 100,
+            accuracy: 0.99,
+            full_combo: true,
+        }),
+        "一致成绩应入账: {events:?}"
+    );
+
+    // 外谱面成绩（chart=999 ≠ 1）→ 结算为 aborted：无 Played、有 Abort
+    let (resp, _) = room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    let (resp, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 2,
+                record_id: 2,
+                record: record_mismatch_fn(2), // chart=999 ≠ 本局 1
+            },
+        )
+        .await;
+    assert!(resp.is_none());
+    assert!(
+        events.contains(&RoomEvent::Abort {
+            room_id: rid(),
+            user: 2
+        }),
+        "外谱面成绩应结算为 aborted: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::Played { user: 2, .. })),
+        "外谱面成绩不得入账: {events:?}"
+    );
+
+    // fail-open：缺省 chart（None）成绩照常入账；全员结算（1 成绩 / 2 aborted /
+    // 3 fail-open 入账）→ GameEnd 必然触发（反作弊失败也绝不卡房间）
+    let (resp, _) = room.handle(ctx(3), RoomCommand::Played { id: 3 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    let (_, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 3,
+                record_id: 3,
+                record: record_no_chart_fn(3), // chart=None → fail-open
+            },
+        )
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::GameEnd { room_id, .. } if room_id == &rid())),
+        "全员结算应 GameEnd（fail-open 成绩照常收尾）: {events:?}"
     );
 }
 

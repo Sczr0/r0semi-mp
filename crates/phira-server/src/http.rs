@@ -83,6 +83,8 @@ struct ChartDto {
 struct RecordDto {
     id: i32,
     player: i32,
+    /// P1 反作弊数据口：上游缺省时 `None`（serde 白名单不解 req 缺失字段）。
+    chart: Option<i32>,
     score: i32,
     perfect: i32,
     good: i32,
@@ -118,6 +120,7 @@ impl ApiClient for HttpApiClient {
         Ok(Record {
             id: dto.id,
             player: dto.player,
+            chart: dto.chart,
             score: dto.score,
             perfect: dto.perfect,
             good: dto.good,

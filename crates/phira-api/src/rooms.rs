@@ -221,12 +221,18 @@ pub struct Chart {
 }
 
 /// 成绩记录（回源 `GET {API}/record/{id}`，§6.5-10/15）。
+///
+/// `chart` 为 P1 谱面反作弊数据口（2026-08）：上游 `/record` 响应携带成绩对应的
+/// 谱面 id（gooophira RecordData 背书）；缺失（旧 API/上游未返回）= `None` →
+/// fail-open（防误伤正常玩家，参照 gooophira 同款语义）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
     /// 记录 id。
     pub id: i32,
     /// 玩家 id（须与上报者一致，§6.5-10）。
     pub player: i32,
+    /// 成绩对应的谱面 id（P1 反作弊：与本局所选谱面比对，§6.5-10）。
+    pub chart: Option<i32>,
     /// 分数。
     pub score: i32,
     /// Perfect 数。

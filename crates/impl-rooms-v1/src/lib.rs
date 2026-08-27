@@ -794,6 +794,21 @@ impl RoomV1 {
             );
             return (None, self.settle_record_failed(user_id));
         }
+        // P1 谱面反作弊（§6.5-10）：成绩须对应本局所选谱面——双方均有值才校验，
+        // 缺省（record.chart = None 上游未返回 / 本局未选中）fail-open，
+        // 参照 gooophira（record.Chart nil 跳过）防误伤正常玩家。
+        if let (Some(record_chart), Some(chart)) = (record.chart, &self.chart)
+            && record_chart != chart.id
+        {
+            tracing::warn!(
+                user_id,
+                record_id,
+                record_chart,
+                current = chart.id,
+                "record chart mismatch — settled as aborted"
+            );
+            return (None, self.settle_record_failed(user_id));
+        }
         match &mut self.state {
             InternalState::Playing { results, .. } => {
                 if results.insert(user_id, record.clone()).is_some() {

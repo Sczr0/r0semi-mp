@@ -707,7 +707,7 @@ Playing ──全员 Played/Abort──► SelectChart（cycle 则顺延换房�
 7. `RequestStart` 前必须已选谱面；进入 WaitForReady 时 host 默认已 ready
 8. 全员（玩家+monitor）ready → `StartPlaying` → Playing
 9. host `CancelReady` → `CancelGame` + 回 SelectChart；非 host → 仅 `CancelReady`
-10. `Played`：**A2 两段式（2026-08 兑现，§4.9-2 规则 2）**——第 1 段 actor 内**受理**：幂等预检（已入账/已中止/in-flight）＋登记 in-flight，立即回 Ok；第 2 段 core 房外任务回源官方 API（有界重试）→ `RecordFetched` 回注应用：成功 → 广播 `Played` + 全员结算检查（`record.player == 用户 id` 在此校验）；**回注失败（重试耗尽 / player 不匹配）→ 提交者按"无有效成绩"结算为 aborted**（`settle_record_failed`：进 aborted 集 + 广播 Abort + 清残余缓冲 + 全员结算）——GameEnd 必然触发，房间不卡 Playing（客户端已收 Ok 不会再重试，原"只记日志"会导致永久卡死）。重复上报 → `AlreadyUploaded`
+10. `Played`：**A2 两段式（2026-08 兑现，§4.9-2 规则 2）**——第 1 段 actor 内**受理**：幂等预检（已入账/已中止/in-flight）＋登记 in-flight，立即回 Ok；第 2 段 core 房外任务回源官方 API（有界重试）→ `RecordFetched` 回注应用：成功 → 广播 `Played` + 全员结算检查（`record.player == 用户 id` 在此校验）；**回注失败（重试耗尽 / player 不匹配）→ 提交者按"无有效成绩"结算为 aborted**（`settle_record_failed`：进 aborted 集 + 广播 Abort + 清残余缓冲 + 全员结算）——GameEnd 必然触发，房间不卡 Playing（客户端已收 Ok 不会再重试，原"只记日志"会导致永久卡死）。**P1 谱面反作弊（2026-08）**：`record.chart` 与本局 `chart.id` 不一致（双方均有值才校验，缺省 fail-open 参照 gooophira 防误伤）→ 同按"无有效成绩"结算；`Record.chart` 为弱演进 Option 字段（上游 `/record` 携带，r0semi DTO 2026-08 补接）。重复上报 → `AlreadyUploaded`
 11. 全员完成/abort → `GameEnd` → 回 SelectChart；`cycle=true` 时房主顺延给下一位
 12. **断线重连总览**：Playing 中断线 → 判定断线后立即 abort；非 Playing 断线 → 10s 重连窗口（dangle），超时踢人（细节见规则 19-23）
 

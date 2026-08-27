@@ -1291,6 +1291,7 @@ impl phira_api::ApiClient for FakeFetchApi {
         Ok(phira_api::Record {
             id,
             player: id,
+            chart: None, // bus 测试无房间谱面概念（ScriptedFactory 假 actor）→ fail-open
             score: 7,
             perfect: 0,
             good: 0,
