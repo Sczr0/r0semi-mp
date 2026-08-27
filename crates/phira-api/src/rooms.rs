@@ -285,7 +285,10 @@ pub struct CmdCtx {
 /// 业务拒绝码（`RoomError::Business` 的判别，§4.4）。
 ///
 /// 业务拒绝（房满/越权）是预期行为，错误率统计只算 `Internal`（§3.2）。
+/// `#[non_exhaustive]`（§5.6）：拒绝码集合开放演进——外部匹配必须带通配，
+/// 新增变体须补契约用例。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum RoomErrorCode {
     /// 已在房间中（重复 CreateRoom/JoinRoom，§6.5-27）。
     AlreadyInRoom,
@@ -321,6 +324,8 @@ pub enum RoomErrorCode {
     AlreadyAborted,
     /// 命令频率超限（每连接限速，ISSUE-0006：滥用控制"快端"防线）。
     TooManyRequests,
+    /// 命令被观察者/管理策略拒绝（§7.3 `Moderator::intercept`；封禁/审核/反作弊的通用拒绝码）。
+    Moderated,
 }
 
 /// 内部错误：Business（业务拒绝）与 Internal（内部故障）分开（§4.4）。
@@ -716,4 +721,30 @@ pub trait RoomActor: Send {
         ctx: CmdCtx,
         cmd: RoomCommand,
     ) -> (Option<RoomResponse>, Vec<RoomEvent>);
+}
+
+/// 观察者/拦截者（§7.3）：订阅领域事件 + 在客户端命令路径上否决。
+///
+/// 形态草案：双能力（命令前拦截 + 事件订阅）——第一个真实观察者（封禁/审核/反作弊）
+/// 动工时再定形（§7.3 明示"现在不承诺它是最终接口"，原则 5：第二个复杂需求出现前
+/// 不引重抽象）。职责边界（§7.2 判定规则三）：**不拥有房间状态**——只许"看"
+/// （`on_event`）与"拦"（`intercept`）；需要改房态（踢人/封禁/移房）时经系统命令
+/// 回流（组合根编排），不自行派发房内副作用。
+#[async_trait::async_trait]
+pub trait Moderator: Send + Sync {
+    /// 命令处理前拦截：返回 `Err` 则拒绝该命令（客户端可见；推荐用
+    /// [`RoomErrorCode::Moderated`] 作为业务拒绝码）。
+    ///
+    /// 调用时机与范围：仅**客户端命令**（`Origin::Client`）在**路由之前**被调用
+    /// （拦住的命令不产生任何房间副作用）；系统命令（生命周期事实/回注/配置热更）
+    /// 不可被拦截（core 保证，bus 侧过滤）。多个观察者按注入顺序串行执行，
+    /// 任一拒绝即拒绝——观察者应快速返回（不能做长等待 IO）。
+    async fn intercept(&self, cmd: &RoomCommand, ctx: &CmdCtx) -> Result<(), RoomError>;
+
+    /// 领域事件通知（尽力而为，fire-and-forget——不阻塞房间投递/串行位）。
+    ///
+    /// 只收**领域事件**（§4.4 分类）：热路径 `RelayTouches`/`RelayJudges` 与 core 信号
+    /// `RoomClosed` 不通知。适合事后审计/统计/幂等记录；需要权威判定的逻辑应走
+    /// [`Moderator::intercept`]（同步路径），本方法用于旁路观察。
+    async fn on_event(&self, ev: &RoomEvent);
 }

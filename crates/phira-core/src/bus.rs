@@ -18,8 +18,8 @@ use std::{
 };
 
 use phira_api::{
-    ApiError, CmdCtx, Origin, RoomCommand, RoomConfig, RoomError, RoomErrorCode, RoomEvent,
-    RoomFactory, RoomId, RoomResponse, Targets,
+    ApiError, CmdCtx, Moderator, Origin, RoomCommand, RoomConfig, RoomError, RoomErrorCode,
+    RoomEvent, RoomFactory, RoomId, RoomResponse, Targets,
 };
 use tokio::sync::{RwLock, mpsc, oneshot};
 
@@ -145,6 +145,11 @@ struct BusInner {
     /// 未注入 = 纯 actor 环境如部分测试，Played 受理后无回注。
     /// OnceLock：组合根在 `Bus::new` 后 `with_api` 注入一次（运行期只读）。
     api: std::sync::OnceLock<Arc<dyn phira_api::ApiClient>>,
+    /// 观察者/拦截者（§7.3）：订阅领域事件 + 客户端命令路径否决。
+    /// v1 构造期注入（`Bus::with_moderators`）；空 = 零开销短路。
+    /// std Mutex（临界区极短，无 await——与 `sink` 同款纪律）；
+    /// 运行期热插拔（管理 API 加/移除观察者）留到管理面动工时再做。
+    moderators: std::sync::Mutex<Vec<Arc<dyn phira_api::Moderator>>>,
 }
 
 /// 柜台（§2.4）：命令路由 + 事件广播 + 房间生命周期。
@@ -168,6 +173,7 @@ impl Bus {
                 metrics: Metrics::default(),
                 config: RwLock::new(config),
                 api: std::sync::OnceLock::new(),
+                moderators: std::sync::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -178,6 +184,20 @@ impl Bus {
     #[must_use]
     pub fn with_api(self, api: Arc<dyn phira_api::ApiClient>) -> Self {
         let _ = self.inner.api.set(api);
+        self
+    }
+
+    /// 注入观察者/拦截者（§7.3）：客户端命令路径否决 + 领域事件订阅。
+    ///
+    /// 必须在 spawn 任何命令派发前调用（组合根接线期）；空列表 = 现状零开销。
+    /// 运行期热插拔留给管理 API。
+    #[must_use]
+    pub fn with_moderators(self, moderators: Vec<Arc<dyn Moderator>>) -> Self {
+        *self
+            .inner
+            .moderators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = moderators;
         self
     }
 
@@ -231,9 +251,33 @@ impl Bus {
     pub async fn dispatch(&self, ctx: CmdCtx, cmd: RoomCommand) -> Result<RoomResponse, RoomError> {
         let name = command_name(&cmd);
         let started = Instant::now();
-        let result = self.route(ctx, cmd).await;
+        // §7.3：观察者拦截——仅客户端命令；系统命令（生命周期事实/回注/配置热更）不可被拦
+        // （core 保证）。拦截点在路由之前：拒收的命令不产生任何房间副作用。
+        let result = if matches!(ctx.origin, Origin::Client { .. }) {
+            match self.intercept_observers(&ctx, &cmd).await {
+                Ok(()) => self.route(ctx, cmd).await,
+                Err(e) => Err(e),
+            }
+        } else {
+            self.route(ctx, cmd).await
+        };
         self.inner.metrics.record(name, &result, started.elapsed());
         result
+    }
+
+    /// 观察者拦截（§7.3）：按注入顺序串行调用各 `Moderator::intercept`，任一拒绝即拒绝。
+    /// 先克隆 Arc 列表再执行——不在 RwLock 读锁上跨 await（观察者实现应快速返回）。
+    async fn intercept_observers(&self, ctx: &CmdCtx, cmd: &RoomCommand) -> Result<(), RoomError> {
+        let moderators = self
+            .inner
+            .moderators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for m in moderators {
+            m.intercept(cmd, ctx).await?;
+        }
+        Ok(())
     }
 
     /// 派发系统命令（用户生命周期任务 / 定时器用，§4.6）。
@@ -612,9 +656,10 @@ async fn room_loop(
     inner.routes.write().await.retain(|_, rid| rid != &room_id);
 }
 
-/// 事件流程（§4.9-4 时序不变量）：解析 targets → 应用增量 → 响应 → 投递。
+/// 事件流程（§4.9-4 时序不变量）：解析 targets → 应用增量 → 响应 → 投递 → 观察者通知。
 ///
 /// 返回该房间是否已关闭（RoomClosed）。
+#[allow(clippy::too_many_lines)] // 五步时序完整呈现优于拆碎（§4.4/§4.9-4）
 async fn process_events(
     inner: &Arc<BusInner>,
     room_id: &RoomId,
@@ -723,6 +768,40 @@ async fn process_events(
                 },
             )
             .await;
+        }
+    }
+
+    // 5. §7.3：领域事件通知观察者（尽力而为 fire-and-forget——不阻塞房间投递/串行位）。
+    // 过滤：热路径 RelayTouches/Judges 与 core 信号 RoomClosed 不通知（§4.4 分类）；
+    // 每个观察者每批一个 spawn（内部逐事件 await）。通知丢失可接受：观察者应幂等，
+    // 权威判定走 intercept（同步路径），on_event 用于事后审计/统计。
+    let moderators = inner
+        .moderators
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if !moderators.is_empty() {
+        let domain: Vec<RoomEvent> = events
+            .iter()
+            .filter(|ev| {
+                !matches!(
+                    ev,
+                    RoomEvent::RelayTouches { .. }
+                        | RoomEvent::RelayJudges { .. }
+                        | RoomEvent::RoomClosed { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        if !domain.is_empty() {
+            for m in moderators {
+                let domain = domain.clone();
+                tokio::spawn(async move {
+                    for ev in &domain {
+                        m.on_event(ev).await;
+                    }
+                });
+            }
         }
     }
 

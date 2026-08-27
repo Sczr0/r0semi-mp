@@ -1599,3 +1599,227 @@ async fn played_fetch_persistent_failure_redelivers_err_bounded_retries() {
     let calls = api.calls.load(Ordering::SeqCst);
     assert_eq!(calls, 3, "持续失败应恰重试到上限（实际 {calls} 次）");
 }
+
+// ===== §7.3 Moderator 插座（2026-08 契约） =====
+
+/// Moderator 测试替身：记录 intercept/on_event 调用 + 可配置拦截目标。
+struct RecordingModerator {
+    /// 拦截该 user_id 的一切命令；`i32::MIN` = 不拦任何人。
+    block_user: std::sync::atomic::AtomicI32,
+    /// 拦截调用记录（user_id, cmd Debug）。
+    intercepted: Mutex<Vec<(i32, String)>>,
+    /// on_event 收到的领域事件。
+    seen: Mutex<Vec<RoomEvent>>,
+}
+
+#[async_trait::async_trait]
+impl phira_api::Moderator for RecordingModerator {
+    async fn intercept(&self, cmd: &RoomCommand, ctx: &CmdCtx) -> Result<(), RoomError> {
+        let Origin::Client { user_id } = ctx.origin else {
+            // 系统命令理论上不可达（bus 过滤）；若到达即记录并放行
+            self.intercepted
+                .lock()
+                .unwrap()
+                .push((-1, format!("{cmd:?}")));
+            return Ok(());
+        };
+        self.intercepted
+            .lock()
+            .unwrap()
+            .push((user_id, format!("{cmd:?}")));
+        if user_id == self.block_user.load(Ordering::SeqCst) {
+            return Err(RoomError::Business {
+                code: RoomErrorCode::Moderated,
+                msg: "blocked by test moderator".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn on_event(&self, ev: &RoomEvent) {
+        self.seen.lock().unwrap().push(ev.clone());
+    }
+}
+
+impl RecordingModerator {
+    fn new(block_user: i32) -> Arc<Self> {
+        Arc::new(Self {
+            block_user: std::sync::atomic::AtomicI32::new(block_user),
+            intercepted: Mutex::new(Vec::new()),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+/// 拦截在路由之前：被拒命令不产生任何房间副作用（不建房/不加路由/不消费脚本）；
+/// 其它用户不受影响；拒绝码 = Moderated（客户端可见）。
+#[tokio::test]
+async fn moderator_intercepts_client_command_before_routing() {
+    let moderator = RecordingModerator::new(1); // 只拦 user 1
+    let factory = ScriptedFactory::default();
+    factory.push(&rid(), vec![(Some(RoomResponse::Ok), Vec::new())]);
+    let rid2 = RoomId::new("mod-b-2".to_owned()).unwrap();
+    factory.push(
+        &rid2,
+        vec![(
+            Some(RoomResponse::Ok),
+            vec![RoomEvent::RoomCreated {
+                room_id: rid2.clone(),
+                host: 2,
+            }],
+        )],
+    );
+    let bus = Bus::new(
+        Arc::new(factory.clone()) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    )
+    .with_moderators(vec![Arc::clone(&moderator) as Arc<dyn phira_api::Moderator>]);
+
+    // user 1 建房 → 被拦：Err(Moderated)，无路由副作用
+    let resp = bus
+        .dispatch(
+            client_ctx(1),
+            RoomCommand::CreateRoom {
+                id: rid(),
+                name: "u1".into(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            resp,
+            Err(RoomError::Business {
+                code: RoomErrorCode::Moderated,
+                ..
+            })
+        ),
+        "被拦命令应回 Moderated: {resp:?}"
+    );
+    assert!(
+        bus.room_of(1).await.is_none(),
+        "被拦命令不得产生路由副作用（幽灵座位）"
+    );
+
+    // user 2 建房（不同房间）→ 正常
+    let resp = bus
+        .dispatch(
+            client_ctx(2),
+            RoomCommand::CreateRoom {
+                id: rid2.clone(),
+                name: "u2".into(),
+            },
+        )
+        .await;
+    assert!(matches!(resp, Ok(RoomResponse::Ok)));
+    assert_eq!(bus.room_of(2).await, Some(rid2));
+
+    // 拦截记录：只有 user 1 的 CreateRoom
+    let intercepted = moderator.intercepted.lock().unwrap().clone();
+    assert_eq!(
+        intercepted.len(),
+        2,
+        "两次命令都应经过拦截: {intercepted:?}"
+    );
+    assert!(intercepted.iter().all(|(u, _)| *u == 1 || *u == 2));
+    assert!(
+        intercepted
+            .iter()
+            .any(|(u, c)| *u == 2 && c.contains("CreateRoom"))
+    );
+}
+
+/// 系统命令不经拦截：生命周期事实/回注/配置不能被观察者卡住（core 保证）。
+#[tokio::test]
+async fn moderator_skips_system_commands() {
+    let moderator = RecordingModerator::new(i32::MAX); // 若被调用会拦——但不应被调用
+    let factory = ScriptedFactory::default();
+    factory.push(&rid(), vec![(Some(RoomResponse::Ok), Vec::new())]);
+    let bus = Bus::new(
+        Arc::new(factory.clone()) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    )
+    .with_moderators(vec![Arc::clone(&moderator) as Arc<dyn phira_api::Moderator>]);
+
+    // dispatch_system 到不存在的房间 → 路由层 Internal；且拦截器零调用
+    let resp = bus
+        .dispatch_system(
+            RoomId::new("nope".to_owned()).unwrap(),
+            RoomCommand::Tick { now: 0 },
+        )
+        .await;
+    assert!(resp.is_err(), "房间不存在应 Internal: {resp:?}");
+    assert!(
+        moderator.intercepted.lock().unwrap().is_empty(),
+        "系统命令不得经过观察者拦截"
+    );
+}
+
+/// 领域事件通知：收到 UserJoined（领域），不收到 RelayTouches（热路径，§4.4 分类）。
+#[tokio::test]
+async fn moderator_receives_domain_events_only() {
+    let moderator = RecordingModerator::new(i32::MIN); // 不拦
+    let factory = ScriptedFactory::default();
+    factory.push(
+        &rid(),
+        vec![(
+            Some(RoomResponse::Ok),
+            vec![
+                RoomEvent::RelayTouches {
+                    room_id: rid(),
+                    targets: Targets::Specific(vec![9]),
+                    player: 1,
+                    frames: Arc::new(Vec::new()),
+                },
+                RoomEvent::UserJoined {
+                    room_id: rid(),
+                    user: UserInfo {
+                        id: 2,
+                        name: "u2".into(),
+                        monitor: false,
+                    },
+                },
+            ],
+        )],
+    );
+    let bus = Bus::new(
+        Arc::new(factory.clone()) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    )
+    .with_moderators(vec![Arc::clone(&moderator) as Arc<dyn phira_api::Moderator>]);
+
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "u1".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // on_event 是 fire-and-forget：轮询等 UserJoined 到达
+    for _ in 0..100 {
+        if moderator
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, RoomEvent::UserJoined { user, .. } if user.id == 2))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let seen = moderator.seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, RoomEvent::UserJoined { user, .. } if user.id == 2)),
+        "领域事件应通知观察者: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, RoomEvent::RelayTouches { .. })),
+        "热路径事件不得通知观察者: {seen:?}"
+    );
+}
