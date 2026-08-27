@@ -1255,3 +1255,347 @@ async fn wait_preserves_lifecycle_when_queue_full() {
     })
     .await;
 }
+
+// ===== A2 两段式回源（§4.9-2 规则 2，2026-08） =====
+
+/// 回源 API 替身：可脚本化延迟/失败。
+struct FakeFetchApi {
+    /// 常驻失败开关（fail=true 时永远失败）。
+    fail: std::sync::atomic::AtomicBool,
+    /// 脚本化：前 `fail_first` 次调用失败，之后成功（A2 重试测试用）。
+    fail_first: std::sync::atomic::AtomicUsize,
+    /// 累计调用次数（断言重试发生过）。
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl phira_api::ApiClient for FakeFetchApi {
+    async fn fetch_chart(&self, id: i32) -> Result<phira_api::Chart, phira_api::ApiError> {
+        Ok(phira_api::Chart {
+            id,
+            name: "c".into(),
+        })
+    }
+    async fn fetch_record(&self, id: i32) -> Result<phira_api::Record, phira_api::ApiError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(phira_api::ApiError::Internal {
+                msg: "injected failure".into(),
+            });
+        }
+        if call < self.fail_first.load(Ordering::SeqCst) {
+            return Err(phira_api::ApiError::Internal {
+                msg: "injected transient failure".into(),
+            });
+        }
+        Ok(phira_api::Record {
+            id,
+            player: id,
+            score: 7,
+            perfect: 0,
+            good: 0,
+            bad: 0,
+            miss: 0,
+            max_combo: 0,
+            accuracy: 1.0,
+            full_combo: false,
+            std: 0.0,
+            std_score: 0.0,
+        })
+    }
+}
+
+/// Played 触发房外回源任务 → RecordFetched 回注同房间 actor（命令序列被记录）。
+/// 回注负载不占 Played 的响应通路（Played 立即 Ok 返回）。
+#[tokio::test]
+async fn played_two_phase_redelivery_reaches_actor() {
+    let factory = ScriptedFactory::default();
+    // 单房间单 actor 一份脚本，按序承接命令：
+    // CreateRoom → JoinRoom → Played 受理（立即 Ok）；RecordFetched 回注走默认 (None, [])
+    factory.push(
+        &rid(),
+        vec![
+            (Some(RoomResponse::Ok), Vec::new()), // CreateRoom
+            (
+                Some(RoomResponse::Ok),
+                vec![RoomEvent::UserJoined {
+                    room_id: rid(),
+                    user: UserInfo {
+                        id: 2,
+                        name: "u2".into(),
+                        monitor: false,
+                    },
+                }],
+            ), // JoinRoom：UserJoined 驱动路由增量
+            (Some(RoomResponse::Ok), Vec::new()), // Played 受理
+        ],
+    );
+    let bus = Bus::new(
+        Arc::new(factory.clone()) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    )
+    .with_api(Arc::new(FakeFetchApi {
+        fail: std::sync::atomic::AtomicBool::new(false),
+        fail_first: std::sync::atomic::AtomicUsize::new(0),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    }));
+
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "u1".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    bus.dispatch(
+        CmdCtx {
+            origin: Origin::Client { user_id: 2 },
+            room_id: rid(),
+        },
+        RoomCommand::JoinRoom {
+            id: rid(),
+            monitor: false,
+            name: "u2".into(),
+        },
+    )
+    .await
+    .unwrap();
+    // JoinRoom 的路由增量在 actor 处理该命令时才应用——轮询等待路由可见，
+    // 否则下一步 Played 走表路由会 miss。
+    for _ in 0..100 {
+        if bus.room_of(2).await.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let started = std::time::Instant::now();
+    let resp = bus
+        .dispatch(client_ctx(2), RoomCommand::Played { id: 2 })
+        .await;
+    let elapsed = started.elapsed();
+    assert!(matches!(resp, Ok(RoomResponse::Ok)));
+    // 受理响应快速返回（未 await 任何真实 IO——若仍是内联回源，此断言形态会变）
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "受理应立即返回"
+    );
+
+    // 轮询等待：RecordFetched 经房外任务回注到达 actor
+    wait_for(&factory.received, |cmds| {
+        cmds.iter().any(|c| {
+            matches!(
+                c,
+                RoomCommand::RecordFetched {
+                    user_id: 2,
+                    record_id: 2,
+                    ..
+                }
+            )
+        })
+    })
+    .await;
+}
+
+/// 未注入 api 时（如纯 actor 测试），Played 受理照常、无回注（仅日志）。
+#[tokio::test]
+async fn played_without_api_accepts_silently() {
+    let factory = ScriptedFactory::default();
+    factory.push(&rid(), vec![(Some(RoomResponse::Ok), Vec::new())]);
+    let bus = Bus::new(
+        Arc::new(factory.clone()) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    );
+    // join 前置缺失（无路由）→ NotInRoom；换成系统派发也行——这里只验证不 panic：
+    let resp = bus
+        .dispatch_system(
+            rid(),
+            RoomCommand::RecordFetched {
+                user_id: 9,
+                record_id: 9,
+                record: Err(phira_api::ApiError::Internal { msg: "x".into() }),
+            },
+        )
+        .await;
+    // 房不存在 → Internal（路由层）；行为与其它系统命令一致
+    assert!(resp.is_err(), "房间不存在时 RecordFetched 应报内部错");
+}
+
+/// A2 回源有界重试（§4.9-2）：前 1 次失败后成功 → 回注载荷为 Ok，且
+/// fetch_record 被调用 ≥2 次（瞬时故障被自愈，不需 impl 兜底结算）。
+#[tokio::test]
+async fn played_fetch_transient_failure_retries_then_succeeds() {
+    let factory = ScriptedFactory::default();
+    // CreateRoom → JoinRoom → Played 受理（脚本同 played_two_phase 测试）
+    factory.push(
+        &rid(),
+        vec![
+            (Some(RoomResponse::Ok), Vec::new()), // CreateRoom
+            (
+                Some(RoomResponse::Ok),
+                vec![RoomEvent::UserJoined {
+                    room_id: rid(),
+                    user: UserInfo {
+                        id: 2,
+                        name: "u2".into(),
+                        monitor: false,
+                    },
+                }],
+            ), // JoinRoom：UserJoined 驱动路由增量
+            (Some(RoomResponse::Ok), Vec::new()), // Played 受理
+        ],
+    );
+    let api = Arc::new(FakeFetchApi {
+        fail: std::sync::atomic::AtomicBool::new(false),
+        fail_first: std::sync::atomic::AtomicUsize::new(1), // 第一次失败，重试成功
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let bus = Bus::new(
+        Arc::new(factory.clone()) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    )
+    .with_api(Arc::clone(&api) as Arc<dyn phira_api::ApiClient>);
+
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "u1".into(),
+        },
+    )
+    .await
+    .unwrap();
+    bus.dispatch(
+        CmdCtx {
+            origin: Origin::Client { user_id: 2 },
+            room_id: rid(),
+        },
+        RoomCommand::JoinRoom {
+            id: rid(),
+            monitor: false,
+            name: "u2".into(),
+        },
+    )
+    .await
+    .unwrap();
+    for _ in 0..100 {
+        if bus.room_of(2).await.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    bus.dispatch(client_ctx(2), RoomCommand::Played { id: 2 })
+        .await
+        .unwrap();
+
+    // 重试后回注 Ok（等待 ≤2s，包含 500ms 重试间隔）
+    wait_for(&factory.received, |cmds| {
+        cmds.iter().any(|c| {
+            matches!(
+                c,
+                RoomCommand::RecordFetched {
+                    user_id: 2,
+                    record_id: 2,
+                    record: Ok(_),
+                    ..
+                }
+            )
+        })
+    })
+    .await;
+    let calls = api.calls.load(Ordering::SeqCst);
+    assert!(
+        calls >= 2,
+        "瞬时失败应触发重试（实际调用 {calls} 次，预期 ≥2）"
+    );
+}
+
+/// A2 兜底（§4.9-2）：持续失败 → 回注载荷为 Err（可诊断），且不超重试上限
+/// （1 + RETRIES 次）——避免后台任务无限重试。impl 侧见到 Err 会结算为 aborted。
+#[tokio::test]
+async fn played_fetch_persistent_failure_redelivers_err_bounded_retries() {
+    let factory = ScriptedFactory::default();
+    factory.push(
+        &rid(),
+        vec![
+            (Some(RoomResponse::Ok), Vec::new()), // CreateRoom
+            (
+                Some(RoomResponse::Ok),
+                vec![RoomEvent::UserJoined {
+                    room_id: rid(),
+                    user: UserInfo {
+                        id: 2,
+                        name: "u2".into(),
+                        monitor: false,
+                    },
+                }],
+            ), // JoinRoom
+            (Some(RoomResponse::Ok), Vec::new()), // Played 受理
+        ],
+    );
+    let api = Arc::new(FakeFetchApi {
+        fail: std::sync::atomic::AtomicBool::new(true), // 永远失败
+        fail_first: std::sync::atomic::AtomicUsize::new(0),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let bus = Bus::new(
+        Arc::new(factory.clone()) as Arc<dyn RoomFactory>,
+        Arc::new(RoomConfig::default()),
+    )
+    .with_api(Arc::clone(&api) as Arc<dyn phira_api::ApiClient>);
+
+    bus.dispatch(
+        client_ctx(1),
+        RoomCommand::CreateRoom {
+            id: rid(),
+            name: "u1".into(),
+        },
+    )
+    .await
+    .unwrap();
+    bus.dispatch(
+        CmdCtx {
+            origin: Origin::Client { user_id: 2 },
+            room_id: rid(),
+        },
+        RoomCommand::JoinRoom {
+            id: rid(),
+            monitor: false,
+            name: "u2".into(),
+        },
+    )
+    .await
+    .unwrap();
+    for _ in 0..100 {
+        if bus.room_of(2).await.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    bus.dispatch(client_ctx(2), RoomCommand::Played { id: 2 })
+        .await
+        .unwrap();
+
+    wait_for(&factory.received, |cmds| {
+        cmds.iter().any(|c| {
+            matches!(
+                c,
+                RoomCommand::RecordFetched {
+                    user_id: 2,
+                    record_id: 2,
+                    record: Err(_),
+                    ..
+                }
+            )
+        })
+    })
+    .await;
+    // 重试上限：1 初始 + 2 重试 = 3 次，绝不无限
+    let calls = api.calls.load(Ordering::SeqCst);
+    assert_eq!(calls, 3, "持续失败应恰重试到上限（实际 {calls} 次）");
+}

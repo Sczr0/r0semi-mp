@@ -18,13 +18,20 @@ use std::{
 };
 
 use phira_api::{
-    CmdCtx, Origin, RoomCommand, RoomConfig, RoomError, RoomErrorCode, RoomEvent, RoomFactory,
-    RoomId, RoomResponse, Targets,
+    ApiError, CmdCtx, Origin, RoomCommand, RoomConfig, RoomError, RoomErrorCode, RoomEvent,
+    RoomFactory, RoomId, RoomResponse, Targets,
 };
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 /// 房间命令队列容量（§4.9-9：有界 1024）。
 const ROOM_CHANNEL_CAPACITY: usize = 1024;
+
+/// A2 回源有界重试（§4.9-2）：总尝试 = 1 + `PLAYED_FETCH_RETRIES` 次，间隔
+/// `PLAYED_FETCH_RETRY_DELAY`。回源（phira.5wyxi.com）是全局唯一上游——瞬时
+/// 5s 超时/网络抖动直接判死会让玩家成绩静默丢失、房间卡 Playing；重试在 actor
+/// 外执行，不占房间串行位。重试仍失败才回注 `Err`，由 impl 结算为"无有效成绩"。
+const PLAYED_FETCH_RETRIES: usize = 2;
+const PLAYED_FETCH_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// 单条命令的投递载荷。
 struct Envelope {
@@ -134,6 +141,10 @@ struct BusInner {
     metrics: Metrics,
     /// 当前生效的房间配置（§4.9-8）。
     config: RwLock<Arc<RoomConfig>>,
+    /// 回源客户端（A2，§4.9-2 规则 2）：Played 的房外 HTTP 校验任务用；
+    /// 未注入 = 纯 actor 环境如部分测试，Played 受理后无回注。
+    /// OnceLock：组合根在 `Bus::new` 后 `with_api` 注入一次（运行期只读）。
+    api: std::sync::OnceLock<Arc<dyn phira_api::ApiClient>>,
 }
 
 /// 柜台（§2.4）：命令路由 + 事件广播 + 房间生命周期。
@@ -144,6 +155,9 @@ pub struct Bus {
 
 impl Bus {
     /// 创建柜台。`factory` 由组合根注入并持有 deps（§4.9-6）。
+    ///
+    /// A2：默认无回源客户端（`api=None`）——Played 受理后不会发起房外校验；
+    /// 生产接线用 [`Bus::with_api`] 注入。
     pub fn new(factory: Arc<dyn RoomFactory>, config: Arc<RoomConfig>) -> Self {
         Self {
             inner: Arc::new(BusInner {
@@ -153,8 +167,18 @@ impl Bus {
                 sink: std::sync::Mutex::new(None),
                 metrics: Metrics::default(),
                 config: RwLock::new(config),
+                api: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// 注入回源客户端（A2，§4.9-2）：启用 Played 的房外两段式校验。
+    ///
+    /// 必须在 spawn 任何命令派发前调用（组合根接线期）；重复注入以首次为准。
+    #[must_use]
+    pub fn with_api(self, api: Arc<dyn phira_api::ApiClient>) -> Self {
+        let _ = self.inner.api.set(api);
+        self
     }
 
     /// 挂接事件投递目标（阶段 2：转换层 + session 写路径）。
@@ -292,6 +316,11 @@ impl Bus {
     async fn route(&self, ctx: CmdCtx, cmd: RoomCommand) -> Result<RoomResponse, RoomError> {
         let needs_response = command_needs_response(&cmd);
         let policy = queue_policy(&cmd);
+        // A2：Played 的回源载荷在 move 前提取（record_id），供房外回源任务使用
+        let played_info = match &cmd {
+            RoomCommand::Played { id } => Some(*id),
+            _ => None,
+        };
 
         // —— 路由解析（§4.9-4）：CreateRoom/JoinRoom 靠载荷 id；系统命令按 ctx.room_id；
         //    其余客户端命令靠路由表，表 miss → 回"不在房间" ——
@@ -396,6 +425,73 @@ impl Bus {
             }
         }
 
+        // A2 两段式（§4.9-2 规则 2）：Played 不再在 actor 内 await 回源——命令照常
+        // 入队让 actor 做"受理"（幂等标记防重放），core 在房外发起 HTTP 回源任务
+        // （不占房间串行位），完成后以 `RecordFetched` 系统命令回注房间应用。
+        // 注意：回注**直接查表投递**而非再走 dispatch——后者经 route 形成类型级
+        // 自递归（Future 大小不可计算）。运行期语义等价：系统 origin、无回话、
+        // 房已关时发送失败仅记日志（Wait 语义下的可接受损失，对账由 inflight 兜底）。
+        if let (Origin::Client { user_id }, Some(record_id)) = (&ctx.origin, played_info) {
+            let api = self.inner.api.get().cloned();
+            let inner = Arc::clone(&self.inner);
+            let room_id = room_id.clone();
+            let user_id = *user_id;
+            tokio::spawn(async move {
+                let Some(api) = api else {
+                    tracing::warn!("no api injected; played record {record_id} unverifiable");
+                    return;
+                };
+                // 有界重试（瞬时故障自愈）；仍失败则原样回注 Err，由 impl 兜底结算
+                let mut record = Err(ApiError::Internal {
+                    msg: "fetch not attempted".to_owned(),
+                });
+                for attempt in 0..=PLAYED_FETCH_RETRIES {
+                    if attempt > 0 {
+                        tokio::time::sleep(PLAYED_FETCH_RETRY_DELAY).await;
+                    }
+                    let started = Instant::now();
+                    record = api.fetch_record(record_id).await;
+                    inner.metrics.record(
+                        "record_fetched",
+                        &if record.is_ok() {
+                            Ok(RoomResponse::Ok)
+                        } else {
+                            Err(internal("fetch failed"))
+                        },
+                        started.elapsed(),
+                    );
+                    if record.is_ok() {
+                        break;
+                    }
+                    tracing::warn!(record_id, attempt, "record fetch attempt failed");
+                }
+                let env = Envelope {
+                    ctx: CmdCtx {
+                        origin: Origin::System,
+                        room_id,
+                    },
+                    cmd: RoomCommand::RecordFetched {
+                        user_id,
+                        record_id,
+                        record,
+                    },
+                    respond: None,
+                };
+                let sent = match inner.rooms.read().await.get(&env.ctx.room_id) {
+                    Some(h) => h.tx.send(env).await.is_ok(),
+                    None => false,
+                };
+                if !sent {
+                    tracing::warn!(
+                        user_id,
+                        record_id,
+                        "record_fetched delivery failed (room closed?)"
+                    );
+                }
+            });
+        }
+
+        // 响应回传：非回注型命令等待 actor 回话（§4.4）；无回话命令按 Ok 归一
         match rx {
             Some(rx) => rx
                 .await
@@ -423,7 +519,8 @@ fn queue_policy(cmd: &RoomCommand) -> QueuePolicy {
         RoomCommand::UserDisconnected { .. }
         | RoomCommand::UserReconnected { .. }
         | RoomCommand::UserDangleExpired { .. }
-        | RoomCommand::GetClientState { .. } => QueuePolicy::Wait,
+        | RoomCommand::GetClientState { .. }
+        | RoomCommand::RecordFetched { .. } => QueuePolicy::Wait,
         // §5.6：新增命令默认按客户端命令处理（满则拒）
         _ => QueuePolicy::Reject,
     }
@@ -445,6 +542,7 @@ fn command_needs_response(cmd: &RoomCommand) -> bool {
         | RoomCommand::LockRoom { .. }
         | RoomCommand::CycleRoom { .. }
         | RoomCommand::GetClientState { .. } => true,
+        // RecordFetched 是回注型系统命令：结果经后续事件投递体现，本身无回话（§4.4）
         // §5.6：新增命令默认无回话，core 按 Ok 映射
         _ => false,
     }
@@ -472,6 +570,7 @@ fn command_name(cmd: &RoomCommand) -> &'static str {
         RoomCommand::UserReconnected { .. } => "user_reconnected",
         RoomCommand::UserDangleExpired { .. } => "user_dangle_expired",
         RoomCommand::GetClientState { .. } => "get_client_state",
+        RoomCommand::RecordFetched { .. } => "record_fetched",
         RoomCommand::UpdateConfig { .. } => "update_config",
         // §5.6：api 枚举 non_exhaustive，追加变体时必须留通配
         _ => "unknown",

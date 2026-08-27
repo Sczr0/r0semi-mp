@@ -108,6 +108,25 @@ fn sys_ctx() -> CmdCtx {
     }
 }
 
+// 确定性回源结果（A2 回注测试用，FakeApi 同口径：`player == record.id`）。
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)] // Result 形状是 RecordFetched 载荷所需
+fn record_ok_fn(id: i32) -> Result<Record, ApiError> {
+    Ok(Record {
+        id,
+        player: id, // FakeApi 口径：player == record.id（§6.5-10）
+        score: 100,
+        perfect: 1,
+        good: 2,
+        bad: 3,
+        miss: 4,
+        max_combo: 5,
+        accuracy: 0.99,
+        full_combo: true,
+        std: 0.1,
+        std_score: 0.9,
+    })
+}
+
 fn assert_business(resp: &RoomResponse, code: RoomErrorCode) {
     assert!(
         matches!(
@@ -174,6 +193,7 @@ pub async fn room_contract_suite<F: RoomFactory>(factory: &F) {
     create_and_join_flow(factory).await;
     permissions_and_state(factory).await;
     game_flow(factory).await;
+    record_fetch_failure_settles(factory).await;
     disconnect_reconnect(factory).await;
     monitor_and_relay(factory).await;
     config_and_client_state(factory).await;
@@ -184,6 +204,126 @@ pub async fn room_contract_suite<F: RoomFactory>(factory: &F) {
     join_during_game_rejected(factory).await;
     ready_countdown_tick(factory).await;
     relay_aggregation_buffer(factory).await;
+    game_time_tracking(factory).await;
+}
+
+/// game_time 进度记录（ISSUE-0007，§6.5-16/23）：Touches 记录最后帧时间，
+/// RequestStart/全员 ready 开打时重置为 NEG_INFINITY 哨兵，GetClientState 返回。
+#[allow(clippy::too_many_lines)] // 场景脚本六段断言一体
+async fn game_time_tracking<F: RoomFactory>(factory: &F) {
+    let frame = |t: f32| TouchFrame {
+        time: t,
+        points: Vec::new(),
+    };
+
+    // —— 未开打：GetClientState 返回哨兵 ——
+    let mut room = factory.create(rid());
+    create_room(&mut room).await;
+    room.handle(
+        ctx(2),
+        RoomCommand::JoinRoom {
+            id: rid(),
+            monitor: false,
+            name: "user2".to_owned(),
+        },
+    )
+    .await;
+    let (resp, _) = room
+        .handle(sys_ctx(), RoomCommand::GetClientState { user_id: 2 })
+        .await;
+    let Some(RoomResponse::ClientState(Some(state))) = resp else {
+        panic!("应返回房间状态: {resp:?}");
+    };
+    assert!(
+        state.last_game_time.is_infinite() && state.last_game_time.is_sign_negative(),
+        "未开打应为 NEG_INFINITY 哨兵, got {}",
+        state.last_game_time
+    );
+
+    // —— SelectChart 态发 Touches：记录进度（live 与否不影响记录）——
+    room.handle(
+        ctx(2),
+        RoomCommand::Touches {
+            frames: Arc::new(vec![frame(3.0), frame(7.5)]),
+        },
+    )
+    .await;
+    // 空帧包不更新、不 panic
+    room.handle(
+        ctx(2),
+        RoomCommand::Touches {
+            frames: Arc::new(Vec::new()),
+        },
+    )
+    .await;
+    let (resp, _) = room
+        .handle(sys_ctx(), RoomCommand::GetClientState { user_id: 2 })
+        .await;
+    let Some(RoomResponse::ClientState(Some(state))) = resp else {
+        panic!("应返回房间状态: {resp:?}");
+    };
+    assert_eq!(
+        state.last_game_time.to_bits(),
+        7.5f32.to_bits(),
+        "应取最后一帧时间（空包不覆盖）"
+    );
+
+    // —— RequestStart → 重置哨兵（原版 session.rs:602 时机）——
+    room.handle(ctx(1), RoomCommand::SelectChart { id: 1 })
+        .await;
+    room.handle(ctx(1), RoomCommand::RequestStart).await;
+    let (resp, _) = room
+        .handle(sys_ctx(), RoomCommand::GetClientState { user_id: 2 })
+        .await;
+    let Some(RoomResponse::ClientState(Some(state))) = resp else {
+        panic!("应返回房间状态: {resp:?}");
+    };
+    assert!(
+        state.last_game_time.is_infinite() && state.last_game_time.is_sign_negative(),
+        "开局应重置为 NEG_INFINITY, got {}",
+        state.last_game_time
+    );
+
+    // —— 全员 ready → StartPlaying 再次重置；随后 Touches 记录新进度 ——
+    room.handle(ctx(2), RoomCommand::Ready).await;
+    let (resp, _) = room
+        .handle(sys_ctx(), RoomCommand::GetClientState { user_id: 2 })
+        .await;
+    let Some(RoomResponse::ClientState(Some(state))) = resp else {
+        panic!("应返回房间状态: {resp:?}");
+    };
+    assert_eq!(state.state, RoomState::Playing);
+    assert!(
+        state.last_game_time.is_infinite() && state.last_game_time.is_sign_negative(),
+        "StartPlaying 应再次重置, got {}",
+        state.last_game_time
+    );
+    room.handle(
+        ctx(2),
+        RoomCommand::Touches {
+            frames: Arc::new(vec![frame(1.25)]),
+        },
+    )
+    .await;
+    let (resp, _) = room
+        .handle(sys_ctx(), RoomCommand::GetClientState { user_id: 2 })
+        .await;
+    let Some(RoomResponse::ClientState(Some(state))) = resp else {
+        panic!("应返回房间状态: {resp:?}");
+    };
+    assert_eq!(state.last_game_time.to_bits(), 1.25f32.to_bits());
+
+    // —— 其余用户不受影响（host 未发过触摸 → 保持哨兵）/ 每用户独立 ——
+    let (resp, _) = room
+        .handle(sys_ctx(), RoomCommand::GetClientState { user_id: 1 })
+        .await;
+    let Some(RoomResponse::ClientState(Some(state))) = resp else {
+        panic!("host 应在房间: {resp:?}");
+    };
+    assert!(
+        state.last_game_time.is_infinite() && state.last_game_time.is_sign_negative(),
+        "无触摸记录的 host 应保持哨兵"
+    );
 }
 
 /// 建房/入房/容量（§6.5-1/3/4/6/27）
@@ -366,9 +506,27 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
     let (resp, _) = room.handle(ctx(2), RoomCommand::CancelReady).await;
     assert_business(resp.as_ref().unwrap(), RoomErrorCode::InvalidState);
 
-    // —— Played：回源校验 + 重复上报错误（§6.5-10）——
+    // —— Played：A2 两段式（§4.9-2 规则 2）——
+    // 第 1 段（受理）：幂等预检 + in-flight 登记，立即 Ok，无事件。
     let (resp, events) = room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
     assert!(matches!(resp, Some(RoomResponse::Ok)));
+    assert!(events.is_empty(), "受理段不应产出事件: {events:?}");
+    // 重复上报（受理段即拒，与旧 AlreadyUploaded 语义一致）
+    let (resp, _) = room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
+    assert_business(resp.as_ref().unwrap(), RoomErrorCode::AlreadyUploaded);
+
+    // 第 2 段（回注）：RecordFetched 系统命令应用回源结果 → Played 广播事件。
+    let (resp, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 1,
+                record_id: 1,
+                record: record_ok_fn(1),
+            },
+        )
+        .await;
+    assert!(resp.is_none(), "回注型命令无回话");
     assert!(events.contains(&RoomEvent::Played {
         room_id: rid(),
         user: 1,
@@ -376,18 +534,51 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
         accuracy: 0.99,
         full_combo: true,
     }));
-    // 重复上报 → AlreadyUploaded
-    let (resp, _) = room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
+
+    // —— player 不匹配：回注时发现（player=3 ≠ user 2）→ 提交者按"无有效成绩"结算 ——
+    let (resp, _) = room.handle(ctx(2), RoomCommand::Played { id: 3 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    let (resp, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 2,
+                record_id: 3,
+                record: record_ok_fn(3), // player=3 ≠ 2
+            },
+        )
+        .await;
+    assert!(resp.is_none());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::Played { user, .. } if *user == 2)),
+        "违规成绩不得入账: {events:?}"
+    );
+    assert!(
+        events.contains(&RoomEvent::Abort {
+            room_id: rid(),
+            user: 2
+        }),
+        "违规成绩提交者应结算为 aborted（否则房间卡 Playing）: {events:?}"
+    );
+    // 被结算后重试上报 → AlreadyUploaded（aborted 幂等锁位，无成绩可再取）
+    let (resp, _) = room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
     assert_business(resp.as_ref().unwrap(), RoomErrorCode::AlreadyUploaded);
 
-    // —— player 不匹配 → InvalidRecord（§6.5-10）——
-    let (resp, _) = room.handle(ctx(2), RoomCommand::Played { id: 3 }).await; // record 3 → player 3 ≠ 2
-    assert_business(resp.as_ref().unwrap(), RoomErrorCode::InvalidRecord);
-    let (resp, _) = room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
+    // —— 全员完成 → GameEnd（§6.5-11；user3 受理 + 回注触发结算）——
+    let (resp, _) = room.handle(ctx(3), RoomCommand::Played { id: 3 }).await;
     assert!(matches!(resp, Some(RoomResponse::Ok)));
-
-    // —— 全员完成 → GameEnd（§6.5-11）——
-    let (_, events) = room.handle(ctx(3), RoomCommand::Played { id: 3 }).await;
+    let (_, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 3,
+                record_id: 3,
+                record: record_ok_fn(3),
+            },
+        )
+        .await;
     assert!(
         events
             .iter()
@@ -457,9 +648,31 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
     room.handle(ctx(1), RoomCommand::RequestStart).await;
     room.handle(ctx(2), RoomCommand::Ready).await;
     room.handle(ctx(3), RoomCommand::Ready).await;
-    room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
-    room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
-    let (_, events) = room.handle(ctx(3), RoomCommand::Played { id: 3 }).await;
+    // A2：受理 + 回注（回注触发的 GameEnd 结算 → 房主顺延在 settle 事件里）。
+    // 前两名受理+回注，最后一名的回注触发全员结算。
+    for uid in [1, 2] {
+        room.handle(ctx(uid), RoomCommand::Played { id: uid }).await;
+        room.handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: uid,
+                record_id: uid,
+                record: record_ok_fn(uid),
+            },
+        )
+        .await;
+    }
+    room.handle(ctx(3), RoomCommand::Played { id: 3 }).await;
+    let (_, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 3,
+                record_id: 3,
+                record: record_ok_fn(3),
+            },
+        )
+        .await;
     assert!(
         events
             .iter()
@@ -474,6 +687,78 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
             old_host: 1,
         }),
         "cycle 房主应顺延给下一位: {events:?}"
+    );
+}
+
+/// A2 兜底（§4.9-2）：回注失败（回源重试耗尽）→ 提交者按"无有效成绩"结算，
+/// 后续玩家正常结算 → GameEnd 必然触发——房间不会因单笔回注失败卡 Playing。
+#[allow(clippy::too_many_lines)] // 场景脚本三段断言一体
+async fn record_fetch_failure_settles<F: RoomFactory>(factory: &F) {
+    let mut room = factory.create(rid());
+    setup_playing(&mut room).await;
+
+    // user1 正常受理 + 回注成功
+    let (resp, _) = room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    room.handle(
+        sys_ctx(),
+        RoomCommand::RecordFetched {
+            user_id: 1,
+            record_id: 1,
+            record: record_ok_fn(1),
+        },
+    )
+    .await;
+
+    // user2 受理 Ok；回注 Err（回源重试耗尽）→ 结算为 aborted：
+    // 无 Played 事件、产生 Abort 事件、GameEnd 未触发（另两人才触发）
+    let (resp, _) = room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    let (resp, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 2,
+                record_id: 2,
+                record: Err(ApiError::Internal {
+                    msg: "upstream down".into(),
+                }),
+            },
+        )
+        .await;
+    assert!(resp.is_none());
+    assert!(
+        events.contains(&RoomEvent::Abort {
+            room_id: rid(),
+            user: 2
+        }),
+        "回注失败应结算为 aborted: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::Played { user: 2, .. })),
+        "回注失败不得入账 Played: {events:?}"
+    );
+
+    // user3 正常受理 + 回注 → 全员结算（1 成绩 / 2 aborted / 3 成绩）→ GameEnd
+    let (resp, _) = room.handle(ctx(3), RoomCommand::Played { id: 3 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    let (_, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 3,
+                record_id: 3,
+                record: record_ok_fn(3),
+            },
+        )
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::GameEnd { room_id, .. } if room_id == &rid())),
+        "全员结算应 GameEnd（回注失败不影响收尾）: {events:?}"
     );
 }
 
@@ -1086,8 +1371,29 @@ async fn playing_leave_triggers_settle<F: RoomFactory>(factory: &F) {
         RoomEvent::UserLeft { room_id, user: 3, .. } if room_id == &rid()
     )));
     // 1,2 上报成绩 → 全员完成（users 只剩 1,2）→ GameEnd
+    // A2 两段式：受理 + 回注；最后一笔回注触发结算。
+    let record1 = record_ok_fn(1);
     room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
-    let (_, events) = room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
+    room.handle(
+        sys_ctx(),
+        RoomCommand::RecordFetched {
+            user_id: 1,
+            record_id: 1,
+            record: record1,
+        },
+    )
+    .await;
+    room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
+    let (_, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 2,
+                record_id: 2,
+                record: record_ok_fn(2),
+            },
+        )
+        .await;
     assert!(
         events
             .iter()

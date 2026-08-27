@@ -77,6 +77,14 @@ pub struct RoomV1 {
     touch_buf: HashMap<i32, Vec<Arc<Vec<TouchFrame>>>>,
     /// 判定事件同款聚合缓冲。
     judge_buf: HashMap<i32, Vec<Arc<Vec<JudgeEvent>>>>,
+    /// A2：已受理待回源的成绩 (user_id, record_id) 集——幂等对账
+    /// （RecordFetched 回注时 remove；房关/重开自然丢弃）。
+    inflight: HashSet<(i32, i32)>,
+    /// 每玩家最近一次上报触摸帧的谱面内时间（秒）——ISSUE-0007 game_time 钩子移植：
+    /// 语义对齐原版（`frames.last().time`，f32 存 Arc 钉住地址不适用此处，直接 HashMap）；
+    /// 哨兵 = [`NEG_INFINITY`]（"本局未开打"，对齐原版 `reset_game_time`）。
+    /// 当前零行为差异（无消费方），供 §6.5-23 断线进度恢复做数据基础。
+    game_time: HashMap<i32, f32>,
 }
 
 impl RoomV1 {
@@ -97,6 +105,8 @@ impl RoomV1 {
             chart: None,
             touch_buf: HashMap::new(),
             judge_buf: HashMap::new(),
+            game_time: HashMap::new(),
+            inflight: HashSet::new(),
         }
     }
 
@@ -145,6 +155,12 @@ impl RoomV1 {
             is_host: self.is_host(user_id),
             is_ready,
             users,
+            // ISSUE-0007：请求者的最近进度（无记录/未开打 = NEG_INFINITY 哨兵）
+            last_game_time: self
+                .game_time
+                .get(&user_id)
+                .copied()
+                .unwrap_or(f32::NEG_INFINITY),
         }
     }
 
@@ -303,6 +319,13 @@ impl RoomV1 {
     fn drop_relay_bufs_of(&mut self, user_id: i32) {
         self.touch_buf.remove(&user_id);
         self.judge_buf.remove(&user_id);
+        self.game_time.remove(&user_id);
+    }
+
+    /// 开局进度重置：全部玩家归 NEG_INFINITY 哨兵（ISSUE-0007，对齐原版
+    /// `reset_game_time`——"本局未开打"与"已开打 ≥0"可区分）。
+    fn reset_game_time(&mut self) {
+        self.game_time.clear();
     }
 
     /// 对局彻底结束/流产（回 SelectChart）后的残余清理。
@@ -329,6 +352,8 @@ impl RoomV1 {
                         results: HashMap::new(),
                         aborted: HashSet::new(),
                     };
+                    // ISSUE-0007：全员 ready 正式开打 → 进度归零哨兵（对齐原版 room.rs:247）
+                    self.reset_game_time();
                     events
                 } else {
                     Vec::new()
@@ -597,6 +622,8 @@ impl RoomV1 {
             started,
             deadline: None,
         };
+        // ISSUE-0007：开局重置进度（对齐原版 session.rs:602 reset 时机）
+        self.reset_game_time();
         let mut events = vec![RoomEvent::GameStart {
             room_id: self.id.clone(),
             user: user_id,
@@ -686,45 +713,24 @@ impl RoomV1 {
         }
     }
 
-    async fn handle_played(
-        &mut self,
-        ctx: CmdCtx,
-        id: i32,
-    ) -> (Option<RoomResponse>, Vec<RoomEvent>) {
+    /// 上报成绩（A2 两段式第 1 段，§4.9-2 规则 2）：只做受理——状态/幂等预检 +
+    /// 登记 in-flight，立即返回 Ok；回源由 core 房外任务进行（不再 await 阻塞房间），
+    /// 完成后经 `RecordFetched` 回注应用（第 2 段）。
+    ///
+    /// 原版语义对齐：非 Playing 的成绩**受理后静默丢弃**（回注时无房/无记录即忽略），
+    /// 与旧内联路径"非 Playing 返回 Ok"一致。
+    fn handle_played(&mut self, ctx: CmdCtx, id: i32) -> (Option<RoomResponse>, Vec<RoomEvent>) {
         let Origin::Client { user_id } = ctx.origin else {
             return (None, Vec::new());
         };
-        // 回源校验成绩（规则 10；仅阻塞该房间 actor，§4.9-2）
-        let record = match self.deps.api.fetch_record(id).await {
-            Ok(record) => record,
-            Err(ApiError::Internal { msg }) => {
-                return (
-                    Some(RoomResponse::Failure(RoomError::Internal { msg })),
-                    Vec::new(),
-                );
-            }
-        };
-        if record.player != user_id {
-            return (
-                Some(RoomResponse::Failure(RoomError::Business {
-                    code: RoomErrorCode::InvalidRecord,
-                    msg: "invalid record".to_owned(),
-                })),
-                Vec::new(),
-            );
-        }
-        match &mut self.state {
+        // 幂等预检：已入账 / 已中止 / 已在途（回源未归）——任一即按"成绩以首条为准"
+        // 拒绝。in-flight 是关键：回注前的窗口内重复上报无法从 results 察觉。
+        match &self.state {
             InternalState::Playing { results, aborted } => {
-                if aborted.contains(&user_id) {
-                    return (
-                        Some(RoomResponse::Failure(RoomError::Business {
-                            code: RoomErrorCode::AlreadyAborted,
-                            msg: "aborted".to_owned(),
-                        })),
-                        Vec::new(),
-                    );
-                }
-                if results.insert(user_id, record.clone()).is_some() {
+                if results.contains_key(&user_id)
+                    || aborted.contains(&user_id)
+                    || self.inflight.iter().any(|(u, _)| *u == user_id)
+                {
                     return (
                         Some(RoomResponse::Failure(RoomError::Business {
                             code: RoomErrorCode::AlreadyUploaded,
@@ -732,6 +738,66 @@ impl RoomV1 {
                         })),
                         Vec::new(),
                     );
+                }
+            }
+            // 非 Playing：与原版一致静默成功（不登记 in-flight、不发起回源无效功）
+            _ => return (Some(RoomResponse::Ok), Vec::new()),
+        }
+        self.inflight.insert((user_id, id));
+        (Some(RoomResponse::Ok), Vec::new())
+    }
+
+    /// 回源结果应用（A2 第 2 段）：`RecordFetched` 系统命令回注。
+    /// 校验链 = 旧内联顺序（player 匹配 → aborted → 重复）。成功 → `Played` 广播 +
+    /// 全员结算检查；**失败（回源重试耗尽 / player 不匹配）→ 提交者按"无有效成绩"
+    /// 结算为 aborted**——协议上玩家已收到 Ok 受理、不会重试，若只记日志则
+    /// results/aborted 两不占 → GameEnd 永不触发 → 房间卡 Playing（§4.9-2 兜底）。
+    fn handle_record_fetched(
+        &mut self,
+        ctx: CmdCtx,
+        user_id: i32,
+        record_id: i32,
+        record: Result<Record, ApiError>,
+    ) -> (Option<RoomResponse>, Vec<RoomEvent>) {
+        // 仅 core 回源任务可发起（系统 origin）
+        if !matches!(ctx.origin, Origin::System) {
+            return (None, Vec::new());
+        }
+        // in-flight 对账：不在受理由来集（房已重开/未受理过/重复回注）→ 忽略
+        if !self.inflight.remove(&(user_id, record_id)) {
+            tracing::warn!(user_id, record_id, "record_fetched without inflight entry");
+            return (None, Vec::new());
+        }
+        let record = match record {
+            Ok(record) => record,
+            Err(ApiError::Internal { msg }) => {
+                // 回源失败（core 已做过有界重试）：两段式下受理 Ok 早已发出、客户端不会
+                // 重试，若只记日志则 results/aborted 两不占 → GameEnd 永不触发 → 房间卡
+                // Playing。结算为"无有效成绩"（abort），保证对局必然收尾（§4.9-2 兜底）。
+                tracing::warn!(
+                    user_id,
+                    record_id,
+                    "record fetch failed after retries: {msg}"
+                );
+                return (None, self.settle_record_failed(user_id));
+            }
+        };
+        if record.player != user_id {
+            // 违规成绩（协议外行为）：不能因为一次错误上报就冻结整间房——同按
+            // "无有效成绩"结算提交者。原版此处回 Failure(InvalidRecord)，两段式下
+            // 响应已发不可达，以 abort 结算 + 日志保存可诊断性。
+            tracing::warn!(
+                user_id,
+                record_id,
+                actual = record.player,
+                "record player mismatch — settled as aborted"
+            );
+            return (None, self.settle_record_failed(user_id));
+        }
+        match &mut self.state {
+            InternalState::Playing { results, .. } => {
+                if results.insert(user_id, record.clone()).is_some() {
+                    return (None, Vec::new());
                 }
                 let mut events = vec![RoomEvent::Played {
                     room_id: self.id.clone(),
@@ -741,10 +807,34 @@ impl RoomV1 {
                     full_combo: record.full_combo,
                 }];
                 events.extend(self.check_all_ready());
-                (Some(RoomResponse::Ok), events)
+                (None, events)
             }
-            // 原版语义：非 Playing 状态的成绩静默忽略（记录已回源校验）
-            _ => (Some(RoomResponse::Ok), Vec::new()),
+            // 受理后对局结束/流产（Abort 竞态）：结果自然作废
+            _ => (None, Vec::new()),
+        }
+    }
+
+    /// 回注失败/校验失败的结算兜底（A2，§4.9-2）：成绩无法入账时，把该玩家按
+    /// "无有效成绩（中止）"入 `aborted` 集并广播 `Abort`——复用与客户端主动
+    /// `handle_abort` 相同的收尾路径（清残余缓冲 + `check_all_ready`），
+    /// 全员结算后 GameEnd 必然触发，房间不会因单笔回注失败卡死。
+    /// 幂等：已有成绩/已中止（重复回注或竞态）→ 不产生事件。
+    fn settle_record_failed(&mut self, user_id: i32) -> Vec<RoomEvent> {
+        match &mut self.state {
+            InternalState::Playing { results, aborted } => {
+                if results.contains_key(&user_id) || !aborted.insert(user_id) {
+                    return Vec::new();
+                }
+                let mut events = vec![RoomEvent::Abort {
+                    room_id: self.id.clone(),
+                    user: user_id,
+                }];
+                self.drop_relay_bufs_of(user_id);
+                events.extend(self.check_all_ready());
+                events
+            }
+            // 非 Playing（对局已结束/回 SelectChart）：结果作废，无需结算
+            _ => Vec::new(),
         }
     }
 
@@ -754,7 +844,9 @@ impl RoomV1 {
         };
         match &mut self.state {
             InternalState::Playing { results, aborted } => {
-                if results.contains_key(&user_id) {
+                if results.contains_key(&user_id)
+                    || self.inflight.iter().any(|(u, _)| *u == user_id)
+                {
                     return (
                         Some(RoomResponse::Failure(RoomError::Business {
                             code: RoomErrorCode::AlreadyUploaded,
@@ -922,7 +1014,12 @@ impl RoomActor for RoomV1 {
             RoomCommand::RequestStart => self.handle_request_start(ctx),
             RoomCommand::Ready => self.handle_ready(ctx),
             RoomCommand::CancelReady => self.handle_cancel_ready(ctx),
-            RoomCommand::Played { id } => self.handle_played(ctx, id).await,
+            RoomCommand::Played { id } => self.handle_played(ctx, id),
+            RoomCommand::RecordFetched {
+                user_id,
+                record_id,
+                record,
+            } => self.handle_record_fetched(ctx, user_id, record_id, record),
             RoomCommand::Abort => self.handle_abort(ctx),
             RoomCommand::LockRoom { lock } => self.handle_lock(ctx, lock),
             RoomCommand::CycleRoom { cycle } => self.handle_cycle(ctx, cycle),
@@ -930,6 +1027,12 @@ impl RoomActor for RoomV1 {
                 let Origin::Client { user_id } = ctx.origin else {
                     return (None, Vec::new());
                 };
+                // ISSUE-0007 game_time：取本包最后一帧时间戳 = 玩家当前进度点
+                // （对齐原版 session.rs:393；空包不更新，非 live 也记录——打歌客户端
+                // live 标志与发帧无强绑定，进度记录不应依赖转发是否发生）。
+                if let Some(last) = frames.last() {
+                    self.game_time.insert(user_id, last.time);
+                }
                 // live 时只转发给 monitor（§6.5-16）。B6：不再立即产出 Relay 事件，
                 // 入聚合缓冲，Tick 到达按 player 合并 flush（高频帧零碎冲击不再直达网络）。
                 if self.live {

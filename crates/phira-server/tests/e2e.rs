@@ -104,7 +104,8 @@ fn setup_ctx_custom(
     let bus = Bus::new(
         Arc::new(rooms) as Arc<dyn phira_api::RoomFactory>,
         Arc::clone(&config),
-    );
+    )
+    .with_api(Arc::clone(&http) as Arc<dyn phira_api::ApiClient>);
 
     let (task, registry, fact_tx) = LifecycleTask::new(
         bus.clone(),

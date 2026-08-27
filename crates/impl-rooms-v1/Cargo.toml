@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 phira-api = { path = "../phira-api" }
 async-trait.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 phira-contract = { path = "../phira-contract" }

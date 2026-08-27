@@ -40,10 +40,12 @@ async fn main() -> Result<()> {
     let rooms = impl_rooms_v1::RoomsV1::new(config.rooms.clone(), deps);
 
     // 柜台开业：当前生效配置 = 组合根注入的初始配置（§4.9-8 热更走 Bus::update_config）
+    // with_api：A2 两段式——Played 的成绩回源在柜台（房外任务）进行，不阻塞房间 actor
     let bus = Bus::new(
         Arc::new(rooms) as Arc<dyn RoomFactory>,
         Arc::new(config.rooms.clone()) as Arc<RoomConfig>,
-    );
+    )
+    .with_api(Arc::clone(&http) as Arc<dyn ApiClient>);
 
     // 用户生命周期（§4.9-3）：单一生产者任务 + 注册表（重连窗口 = yml `reconnect_window`，§6.5-21）
     let (lifecycle_task, registry, fact_tx) = LifecycleTask::new(
