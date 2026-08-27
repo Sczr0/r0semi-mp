@@ -92,10 +92,21 @@ payload 读取窗口经 `ReadCharge` 入全局账（超限断连 fail closed—�
 账目平衡 + pressure 灌流）；bench 帧率无回归（1369/s @ N=100，与合读前同比例）。
 **帧率归一母尺（v4，2026-08）**：flamegraph workflow 产出 bench.log——
 300 客户端 / 10.07s / 4739 帧/s（≡300×16 全额节奏）/ **进程 CPU 3.81s（单核
-37.8%）/ 每帧 CPU 79.9µs**。**对比协议**：workflow 手动触发时 ref 选旧提交
-（4524c14 = Metrics 无锁化后、合读前；6b00487 = 写批处理后）同参数复跑，
-bench.log 里「每帧 CPU 成本」直接对拍——低于 79.9µs 即合读净收益（syscall
-占比受吞吐/连接期污染不可比，此指标为裁决依据）。
+37.8%）/ 每帧 CPU 79.9µs**。**对拍协议**：同代码 A/B 开关 R0SEMI_DISABLE_READ_COALESCE=1（legacy）vs 缺省（合读），
+workflow 勾选/不勾选即跑——bench.log 里「每帧 CPU 成本」为裁决依据（syscall
+占比受吞吐/连接期污染不可比）。
+
+**A/B 裁决（2026-08，双 run 同帧率 4.7k/s 紧邻）：** legacy（勾选）= 3.14s /
+每帧 66.1µs / recvfrom 25.8%；**合读（默认）= 1.59s / 每帧 33.4µs / recvfrom
+20.7%**；memcpy 0.02%→0.13%（拷贝升但量小）——机制自洽三连（syscall↓、
+拷贝↑小、CPU ↓）→ **合读净收益成立：每帧 CPU 成本 -49%**。方差标注：v4 母尺
+（合读 79.9µs）与本次 33.4µs 差 2.4×（GitHub 共享 runner 负载）；精确量化
+建议 3 连跑取中位，但同帧率紧邻对拍的定性结论不受影响。
+
+**CPU 优化线收官（累计实证）**：写批处理 → Metrics 热路径无锁化（锁帧 0 /
+lock_contended -38%）→ 读侧合读（每帧 -49%）+ 读侧在途记账补洞。剩余已知项：
+tokio 单 IO driver 架构约束、记账原子 SeqCst 安全边界（Relaxed 论证维持不做）。
+下一候选课题：反作弊 P2 / 管理面板（阶段 4）。
 `tokio` multi_thread 单 IO driver 为架构级约束，缓解靠减少 IO 事件数（已做
 写批处理 + 读合读两个方向）。
 
