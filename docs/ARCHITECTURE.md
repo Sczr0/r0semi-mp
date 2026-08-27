@@ -499,13 +499,13 @@ pub trait RoomActor: Send {
 └─────────────────────┘  ├──►  └───────────────┬───────────────┘
 ┌─ 定时器(500ms) ────────┘                      ▼
 │ 派发 Tick{now:TimeMs}     每个房间一次 handle：决策+副作用一体
-└─────────────────────     （HTTP 回源也在其中，见规则 2）
+└─────────────────────     （HTTP 回源已拆两段：actor 受理 → 房外任务回注，见规则 2）
 ```
 
 **规则**：
 
 1. **每房间串行**：同一房间的命令（客户端命令、系统命令、Tick）都经该房间的 channel FIFO 进入，`&mut self` 独占状态——无需内部锁，`handle` 内可安全 `.await`（HTTP 回源）
-2. **队头阻塞边界（已读码核实，评审 §8）**：**原版不冻结同房其它命令**——`get_room!` 克隆 Arc 后 guard 立即释放、`reqwest` 在锁外、`room.state.write()` 在 HTTP 之后，且各会话跑在独立 task。actor 模型的每房串行是**相对原版的行为回退**（不是"可接受代价"）：结算校验期间该房命令全部排队，8 条成绩串行回源时尾玩家等 8×RTT。**缓解（v1 采用）**：(a) 热路径可丢（规则 9）；(b) 每连接限速；(c) 结算突发可预期（同房同曲同时收尾，Played 集中在歌曲结束后）。若实测仍有问题，v2 拆两段（actor 派发 `VerifyRecord` 副作用 → core HTTP 任务 → `RecordVerified` 回注）。**禁止**用共享全局锁串起所有房间
+2. **队头阻塞边界（已读码核实，评审 §8）**：**原版不冻结同房其它命令**——`get_room!` 克隆 Arc 后 guard 立即释放、`reqwest` 在锁外、`room.state.write()` 在 HTTP 之后，且各会话跑在独立 task。actor 模型的每房串行是**相对原版的行为回退**（不是"可接受代价"）：结算校验期间该房命令全部排队，8 条成绩串行回源时尾玩家等 8×RTT。**A2 两段式（2026-08 已兑现，不再等 v2）**：`Played` 只做受理（幂等预检 + in-flight 登记，立即回 Ok），core **房外任务**回源（`Bus::with_api` 注入；有界重试 2 次 × 500ms 自愈瞬时上游抖动），完成后以 `RoomCommand::RecordFetched` 系统命令回注房间应用——Played 相关的队头阻塞**归零**（回源彻底移出 actor 串行位）。回注失败（重试耗尽 / player 不匹配）→ 提交者按"无有效成绩"结算为 aborted（§6.5 规则 10），GameEnd 必然触发、房间不卡 Playing；代价：客户端不再收到回源失败的错误响应（受理即 Ok；协议 A1 不变式禁止再造响应帧，client-behavior-review §5）。**禁止**用共享全局锁串起所有房间
 3. **顺序保证（评审 §8 补全输入侧）**：派发序由单一生产者保证，但**输入侧竞态必须闭环**：
    - **窗口边界**：`UserDangleExpired` 派发前，生命周期任务先查权威会话状态（该 user_id 当前是否有活会话）——重连通知的入队序 ≠ 墙钟序，9.999s 的重连可能排在 10.000s 的定时器后；盲发会踢掉刚重连的用户
    - **会话纪元**：生命周期事实的单位是 `(user_id, epoch)`；替换会话时 epoch+1 且**关闭旧 TCP、取消旧会话任务**（其死亡事实随之消失）
@@ -707,7 +707,7 @@ Playing ──全员 Played/Abort──► SelectChart（cycle 则顺延换房�
 7. `RequestStart` 前必须已选谱面；进入 WaitForReady 时 host 默认已 ready
 8. 全员（玩家+monitor）ready → `StartPlaying` → Playing
 9. host `CancelReady` → `CancelGame` + 回 SelectChart；非 host → 仅 `CancelReady`
-10. `Played`：回源官方 API 校验成绩记录（**仅阻塞该房间 actor，见 §4.9-2**），且 `record.player == 用户 id`；重复上报 → 错误
+10. `Played`：**A2 两段式（2026-08 兑现，§4.9-2 规则 2）**——第 1 段 actor 内**受理**：幂等预检（已入账/已中止/in-flight）＋登记 in-flight，立即回 Ok；第 2 段 core 房外任务回源官方 API（有界重试）→ `RecordFetched` 回注应用：成功 → 广播 `Played` + 全员结算检查（`record.player == 用户 id` 在此校验）；**回注失败（重试耗尽 / player 不匹配）→ 提交者按"无有效成绩"结算为 aborted**（`settle_record_failed`：进 aborted 集 + 广播 Abort + 清残余缓冲 + 全员结算）——GameEnd 必然触发，房间不卡 Playing（客户端已收 Ok 不会再重试，原"只记日志"会导致永久卡死）。重复上报 → `AlreadyUploaded`
 11. 全员完成/abort → `GameEnd` → 回 SelectChart；`cycle=true` 时房主顺延给下一位
 12. **断线重连总览**：Playing 中断线 → 判定断线后立即 abort；非 Playing 断线 → 10s 重连窗口（dangle），超时踢人（细节见规则 19-23）
 
@@ -728,7 +728,7 @@ Playing ──全员 Played/Abort──► SelectChart（cycle 则顺延换房�
 20. **断线判定**：心跳 10s 无包（§6.1）→ core **用户生命周期任务**派发 `UserDisconnected{user, epoch}`
 21. **重连窗口**：非 Playing 断线 → 10s 内重连则保留座位（`UserReconnected{user, epoch}`）；10s 到期 → **先查权威会话状态再派发** `UserDangleExpired`（防 9.999s 重连排在 10.000s 定时器后，§4.9-3）→ impl 移除座位、广播 `LeaveRoom`、若为房主则迁移房主（规则 5）
 22. **Playing 中断线**：无重连窗口，判定断线后立即 abort（移除 + 广播）
-23. **重连恢复**：重连成功的鉴权响应必须携带当前房间状态（`ClientRoomState`）——core 通过 `RoomCommand::GetClientState` 查询 impl（§4.4）；**旧连接（epoch 不匹配）到达的命令一律拒绝**
+23. **重连恢复**：重连成功的鉴权响应必须携带当前房间状态（`ClientRoomState`）——core 通过 `RoomCommand::GetClientState` 查询 impl（§4.4）；**旧连接（epoch 不匹配）到达的命令一律拒绝**。**ISSUE-0007（2026-08 兑现）**：快照携带 `last_game_time`（该玩家最近触摸帧的谱面内时间，f32；无记录 = `NEG_INFINITY` 哨兵，对齐原版 reset_game_time）——`ClientRoomState` **尾部追加**字段，旧客户端读端逐字段读、不校验剩余字节、静默忽略（演进约束：结构体尾追加安全、枚举加变体必炸，锚点测试 `trailing_bytes_after_struct_fields_tolerated` / `unknown_enum_tag_still_rejected`）。数据基础就绪；"断点续观战/按进度结算"等消费方未立项（当前死字段，与原版同病）
 24. **两个 10s 的区别**：心跳断线判定（最后包后 ~10s）与重连窗口（断线后 10s）独立计时，最坏约 20s 完成踢人
 25. **可测性**：impl 唯一时钟源是 `Tick { now: TimeMs }`（u64 毫秒，测试可伪造）；HTTP/随机数经 `RoomDeps` 注入（§4.9-6）——没有这三件事，规则 21/22 的 10s 窗口和规则 10 的回源校验根本无法写契约测试断言
 26. **广播范围**：所有 Message 变体均为**房内广播**（用户+monitor；已核实原版 `broadcast` 仅遍历房内 `users()+monitors()`，协议无全服广播，评审 §8 一）——`Targets::All` 的语义即此
@@ -923,6 +923,7 @@ pub trait Moderator: Send + Sync {
 | **大帧并发** | 协议 2MiB 是上限不是常态：服务端配置更紧帧上限（默认 ~1MiB）；**每连接解码缓冲记账** + 全局在途字节上限（如 64MiB），超限即断连——**已兑现（2026-08，ADR-0010 安全锁 A）**：`IN_FLIGHT_BYTES` 全局 64MiB + 每连接 8MiB，超限丢新 + 断最重连接，`MemoryReleaser` 保证账目平衡无泄漏 |
 | **鉴权前大帧** | **鉴权前帧上限收紧到 ~4KiB**（握手 + token ≤32B 之外无合法大帧）——直接堵死"未鉴权 2MiB 帧"攻击 |
 | **慢消费者（观战）** | live 路径（Touches/Judges→monitor）用**丢旧保新**策略：每 monitor 有界环形缓冲，满则丢最旧帧，**绝不阻塞房间 actor、绝不无限积压**（评审 §7）；房间命令队列：有界（1024），满时按消息类处理——**热路径满则丢新、Tick 可丢、生命周期事实等待、其它客户端命令丢弃断连**（§4.9-9，评审 §8 五-2） |
+| **回源响应放大**（C3，2026-08 已加固） | 手写 HTTP/1.1 回源客户端（§4.9-7）响应体上限 **16MiB**：Content-Length 声明超限**不读不缓冲直接拒绝**，声明小实发多超限即断（防恶意/异常上游把回源连接变内存放大器，同一防御哲学）；30x 重定向**显式报错不跟随**（上游直连语义，未来加 CDN 302 从静默失败变可诊断日志）。回归测试：http.rs `oversized_content_length_rejected_without_reading` / `redirect_302_rejected_explicitly` / `trailing_bytes_beyond_content_length_discarded` |
 | **半开连接** | 握手超时（读首字节 ≤5s）+ 鉴权超时（≤10s）+ 未鉴权连接数上限 + 每 IP 限额（§11） |
 
 ---

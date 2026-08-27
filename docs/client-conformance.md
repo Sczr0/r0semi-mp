@@ -129,3 +129,18 @@ r0semi 的 interop 测试用的 `phira-mp-client` **就是真客户端集成的�
 > 时序参数层靠源码给边界 + 实验给数字；
 > 分发现实层永远只能靠监控与遥测缓解。
 > 而"用 CI 自动维持、随客户端演进自动更新的兼容性保障体系"——是五家中没有任何一家拥有（或意识到可以拥有）的能力。
+
+## 已落地：真 SDK 崩溃猎手（2026-08，client-behavior-review §5 A1–A6）
+
+一套机器化的一致性防线已进入测试套件（`crates/phira-server/tests/conformance.rs`，
+dev-dependency 引入 Apache-2.0 的 `phira-mp-client` rev cc822df，与游戏客户端
+Cargo.toml 锁定一致）：
+
+- **对端是真 SDK**（游戏客户端在用的库）——"服务端多说话会不会炸客户端"不再靠推理，直接跑；
+  剧本覆盖 client-behavior-review §5 的 A1–A6 不变式：握手/鉴权顺序、Pong 2s 预算、
+  响应唯一性、重连快照（A5）、广播字节级对称（A6）+ LockRoom 推送被真客户端应用。
+- **运行时坑位（实测）**：`worker_threads = 2` 下会随机整体僵死（tokio 唤醒丢失，
+  全任务 park、CPU ~0.016s；对最小协议服务器同样 2 线程却正常）——取 **4**（与 e2e 对齐）。
+- 未来协议 v2 或新增 ServerCommand 变体：**在 TCP 上加变体会直接踢掉旧客户端**
+  （读端 `bail!("invalid enum")` → recv 循环退出）——v2 能力一律走 HTTP/IPC 旁路，
+  本套件是这条铁律的回归防线。
