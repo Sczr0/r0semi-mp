@@ -1,6 +1,16 @@
 # cargo-deny：第三方依赖许可审查（§4.1 / §5.4 第五道闸门）
 [advisories]
 yanked = "deny"
+# RUSTSEC-2026-0118/0119（hickory-proto 0.25.x NSEC3 无限循环 +
+# O(n²) 编码 CPU 耗尽）：dev-only 传递依赖——phira-mp-client（conformance 真 SDK
+# 对端，rev cc822df）的 SRV 解析链。测试直连 IP socket，从不到达 DNS/NSEC3 路径，
+# 不进生产二进制；上游 SDK 锁定 hickory-resolver 0.25.2（<0.26），漏洞仅在 0.26.1
+# 修复且 0.26 为 API 换代（升级即编译破坏）——无法升级，只能忽略并记档。
+# 若 SDK 上游解锁 resolver 版本：优先 `cargo update -p hickory-resolver` 后移除本条。
+ignore = [
+    "RUSTSEC-2026-0118", # hickory-proto NSEC3 closest-encloser OOM（dev-only）
+    "RUSTSEC-2026-0119", # hickory-proto O(n²) 编码 CPU 耗尽（dev-only）
+]
 
 [licenses]
 allow = [
@@ -20,4 +30,6 @@ allow = [
 multiple-versions = "warn"
 
 [sources]
-allow-git = []
+# phira-mp SDK（conformance 崩溃猎手对端，Apache-2.0）：git 依赖白名单唯一项
+# （client-behavior-review §8；rev 锁 cc822df 与游戏客户端一致）。
+allow-git = ["https://github.com/TeamFlos/phira-mp"]
