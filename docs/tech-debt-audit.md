@@ -26,14 +26,19 @@ Rust 分配器可复用同尺寸类释放块的地址。地址复用 = 新事件
 - 触发：需 ≥1 观战者在线 + 地址碰撞；统计上随运行时长线性累积必然发生。
 - **修复（方案 A 已落地）**：`EncodeCache` 条目升级为 `EncodeEntry { _pin, bytes }`，`_pin` 持源 Arc 克隆（`Box<dyn Any + Send + Sync>`）钉住地址；`get_or_encode(key, pin, encode)` 三参；删除错误断言；4 个回归测试。详见 ISSUE-0011 文末修复记录。
 
-### A2. actor 内 await 回源 = 房间级队头阻塞
+### A2. actor 内 await 回源 = 房间级队头阻塞 —— ✅ 已修复（2026-08，两段式 + 兜底）
 
 `handle_played` 中 `self.deps.api.fetch_record(id).await` 在房间 actor 内等待官方 API
 （最长 5s，impl-rooms-v1/src/lib.rs handle_played）。期间该房间所有命令（含触摸帧）排队。
 
 - 危害：5 人一局，一人交成绩卡全场数秒。
-- 代码注释自行标注"仅阻塞该房间 actor（§4.9-2）"——已有认知，属权衡。
-- 修法：回源移出 actor（先回"受理中"，响应经系统命令回流）。**建议待 B1 倒计时/ Tick 机制成熟后再做**（届时回流通道现成）。可观测性（B3 暴露 Metrics 后可看 fetch_record 延迟分布）应作为投入决策依据。
+- **修复（两段式已落地，§4.9-2 规则 2）**：`Played` 只做受理（幂等预检 + in-flight 登记，
+  立即回 Ok），core 房外任务回源（`Bus::with_api` 注入，完成后以 `RecordFetched` 系统
+  命令回注）；回注失败（core 有界重试 2 次耗尽 / player 不匹配）→ 提交者按"无有效成绩"
+  结算为 aborted，保证 GameEnd 必然触发（房间不卡 Playing）——契约测试
+  `record_fetch_failure_settles` 钉死。
+- 代价：客户端不再收到回源失败的错误响应（受理即 Ok），失败以结算 + 日志呈现——协议
+  A1 不变式禁止再造响应帧（client-behavior-review §5），此取舍为设计决策。
 
 ---
 
@@ -107,7 +112,7 @@ D2 在协议 v2 到来时会被动暴露；D3 的正确解法不是抄传闻，�
 | **立即**（天级） | ✅ A1 ABA 修复（ISSUE-0011）· ✅ B3 Metrics 暴露 · ✅ D2 版本握手校验 · ⬜ client-conformance 崩溃猎手测试 | 消灭全部已知正确性地雷 |
 | **短期**（周级） | ✅ B2 i18n · 谱面反作弊 · ✅ 观战聚合缓冲（B6+Tick 心跳）· ✅ D1 Chat 限速 · ✅ C2 Registry 拆表（ISSUE-0012） | 每项带契约测试落地 |
 | **中期**（月级） | ✅ B1 Tick 通电（倒计时，提前完成）· 一致性断言库 + 漂移哨兵 · 管理 API | 玩家可感知 + 护城河成形 |
-| **择机** | A2 回源出队 · C1 server.rs 拆分 · 回放录制（Store 接口） | 绑定到相关功能进场时顺手做 |
+| **择机** | ✅ A2 回源出队（已提前完成）· C1 server.rs 拆分 · 回放录制（Store 接口） | 绑定到相关功能进场时顺手做 |
 | **远景** | Store 持久化 · 协议 v2 预案 · 多实例（仅当需求出现） | 文档立 flag，不动代码 |
 
 ## 总体判断
