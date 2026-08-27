@@ -1,0 +1,59 @@
+# CPU 瓶颈定位（1500 人狂按键场景，§10.1.1 load 29 的本地复现）
+
+> 状态：2026-08 定位完成（静态放大证据链）；优化待拍板（候选见 §4）。
+> 复现工具：`crates/phira-server/tests/bench_broadcast.rs`（`#[ignore]` 手动跑）。
+
+## 1. 场景与复现
+
+```bash
+# 基准刻度：N 客户端同房，全 16Hz Touches
+R0SEMI_BENCH_N=300 R0SEMI_BENCH_SECS=8 cargo test -p phira-server --test bench_broadcast -- --ignored --nocapture
+```
+
+实测（本机）：50 客户端 → 691 触摸帧/秒（≈50×16 预期 ✓）；300 客户端全流程通过（22.5s，
+其中 ~21s 是串行连接握手——生产每 IP 未鉴权并发上限 5 是 bench 需串行连入的原因，§10.4）。
+房内触摸帧/秒 = 输入负载；**CPU 成本 = 每帧 × 房内人数（扇出）**。
+
+## 2. 放大结构（静态证据链，数学即结论）
+
+单条 `Touches` 命令的下游成本（1500 人同房）：
+
+```
+1 命令 → 房间 actor → 1 个 RelayTouches 事件（targets=All）
+  → bus.process_events：遍历 routes 1500 条过滤 room_id（O(N)）
+  → deliveries 列表 push 1500 × ev.clone()
+  → 1500 次 sink.deliver(user, ev)：
+      ├─ phira_core::convert::event_to_server —— 同一事件对每个接收者重跑一次转换！
+      ├─ sessions.read().await（tokio RwLock 读锁 ×1500）
+      ├─ EncodeCache.get_or_encode（Arc::as_ptr hash 查/编码；§ADR-0009 已共享编码一次）
+      └─ 记账原子 queue_bytes.fetch_add ×2 + try_send（安全锁 A，§10.4）
+```
+
+**放大数**：1500 人 × 16Hz = 24k cmd/s 输入 → **36M 下游投递/秒**。
+每投递 ≈ 30-80ns（转换 + 读锁 + 原子 + send）→ **1.1-2.9 CPU 秒/秒**。双核
+load 29 与这个量级吻合——**扇出放大就是瓶颈本体**，单点优化（编码一次等 ADR-0009）
+已被放大率吃光。
+
+## 3. 采样探路记录（samply on Windows）
+
+`samply record`（v0.13.1，ETW）对 8s 压测仅采到每线程 6 个样本（>90s 窗口），
+火焰图不可信。Windows 采样受限；**未来在 Linux CI 用 `perf record` 复核**
+（bench 保持 `#[ignore]` + 环境变量化，可挂到任何平台）。
+
+## 4. 优化候选（按 ROI 排序，均需拍板后实施）
+
+| # | 方案 | 收益机制 | 代价/风险 | 通道 |
+|---|---|---|---|---|
+| 1 | **转换一次、投递复用**：core 在 process_events 里对每个事件转一次 `ServerCommand` 序列，`deliver` 传已转换结果 | 砍掉 99.93% 的转换重跑（1500× → 1×） | 碰 `EventSink` 契约（§5.6：加 fast-path 或改签名）；API 主版本影响 | 契约变更 |
+| 2 | **房间→成员直取**：`Targets::All` 不再遍历全量 routes，维护 per-room 成员集 | O(N)=1500 遍历 → O(1) 直读（每次事件省一趟全表扫描） | SessionRegistry/RoomListSink 已有同类结构可复用；状态一致性要钉契约测试 | 组合根/核心内改 |
+| 3 | **记账原子调度**：`SeqCst` → `Relaxed`（账目只需最终一致，无需全序） | 每投递 2-4 次原子从 ~15-20ns → ~5ns | ADR-0010 安全语义要重论证；账目平衡测试已现成 | ADR |
+| 4 | **触摸旁路广播**（§4.9-9 已声明热路径可丢）：Touches 不进 actor 状态机，读路径直接 fan-out | 砍掉 actor 串行 + 状态流转（命令数减半级别） | 信令面重大改造（读路径旁路 actor）；丢帧语义要契约化 | ADR + 契约测试 |
+
+**建议**：#1+#2 打包（同属"投递面去重放大"，共享契约测试改动）为一个 ADR；
+#3 独立小改；#4 留作触摸流进一步优化的储备（当前放大主要在生产转换+遍历上）。
+
+## 5. 验收刻度
+
+- bench 固定 N=300 基准记录**服务端 CPU 时间**（Windows 实测受限，Linux perf 复核）；
+- 优化后同样本秒数下「房内触摸帧/秒」不变（输入守恒）+ 服务端 CPU 占比显著下降；
+- 契约测试全绿 + memory_guard 账目平衡（#3 的重点回归面）。
