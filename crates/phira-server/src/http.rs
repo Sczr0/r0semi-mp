@@ -234,7 +234,6 @@ async fn http_get_with_timeout(
 ) -> Result<Vec<u8>, ApiError> {
     http_get_with_tls_timeout(base, path, bearer, None, timeout).await
 }
-
 /// 请求入口（测试可注入自定义 TLS 配置，`None` = 生产 webpki-roots 验证）。
 ///
 /// `pub` 仅对集成测试暴露（组合根内部细节，doc(hidden)）。
@@ -248,7 +247,16 @@ pub async fn http_get_with_tls(
     http_get_with_tls_timeout(base, path, bearer, tls, HTTP_TIMEOUT).await
 }
 
+/// 同 host 重定向跟随上限（含首跳共 3 跳）：防重定向环/链式注入把请求打向任意上游。
+const MAX_REDIRECTS: usize = 3;
+
 /// 内部实现（timeout 可注入）。
+///
+/// 2026-08（C3 清偿）：30x 从"显式拒绝"升级为**有限跟随**——同 host（含端口）
+/// 重定向最多 3 跳，跨域拒绝。安全边界：
+/// - 白名单 = base 的 host，跳转目标必须与其一致（含端口），否则 `ApiError`；
+/// - bearer token 只随同 host 请求重发，**绝不离开信任域**（跨域 302 落"untrusted host"）；
+/// - Location 缺失 / 跳数耗尽 / 非 200 终态均显式报错（可诊断，不静默）。
 async fn http_get_with_tls_timeout(
     base: &str,
     path: &str,
@@ -256,6 +264,83 @@ async fn http_get_with_tls_timeout(
     tls: Option<Arc<rustls::ClientConfig>>,
     timeout: Duration,
 ) -> Result<Vec<u8>, ApiError> {
+    let (_bt, base_host, base_port) = parse_base(base)?;
+    let mut path = path.to_owned();
+    for hop in 0..=MAX_REDIRECTS {
+        let payload = http_get_one(base, &path, bearer, tls.clone(), timeout).await?;
+        match payload.status {
+            200 => return Ok(payload.body),
+            300..=399 => {
+                let location = payload.location.ok_or_else(|| ApiError::Internal {
+                    msg: format!("HTTP {} from {path} without Location", payload.status),
+                })?;
+                let next = resolve_same_host(&location, &base_host, base_port)?;
+                debug!(
+                    "redirect hop {hop}: {path} -> {next} (HTTP {})",
+                    payload.status
+                );
+                path = next;
+            }
+            other => {
+                return Err(ApiError::Internal {
+                    msg: format!("HTTP {other} from {path}"),
+                });
+            }
+        }
+    }
+    Err(ApiError::Internal {
+        msg: format!("too many redirects (>={} hops): {path}", MAX_REDIRECTS + 1),
+    })
+}
+
+/// 重定向目标解析：相对路径直接接受；绝对 URL 校验 host+端口 == base（白名单，
+/// 跨域拒绝）；返回下一跳相对 path（重发仍走 base host，token 不外泄）。
+fn resolve_same_host(location: &str, base_host: &str, base_port: u16) -> Result<String, ApiError> {
+    let location = location.trim();
+    let Some(rest) = location
+        .strip_prefix("http://")
+        .or_else(|| location.strip_prefix("https://"))
+    else {
+        // 相对 Location：同一信任域，直接接受
+        let p = if location.starts_with('/') {
+            location.to_owned()
+        } else {
+            format!("/{location}")
+        };
+        return Ok(p);
+    };
+    // 绝对 URL：`host[:port][/path...]`
+    let (host_part, path) = match rest.split_once('/') {
+        Some((h, p)) => (h, format!("/{p}")),
+        None => (rest, "/".to_owned()),
+    };
+    let (host, port) = match host_part.split_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok()),
+        None => (host_part, None),
+    };
+    if host != base_host {
+        return Err(ApiError::Internal {
+            msg: format!("redirect to untrusted host {host:?} (base {base_host:?})"),
+        });
+    }
+    if let Some(port) = port
+        && port != base_port
+    {
+        return Err(ApiError::Internal {
+            msg: format!("redirect to untrusted port {port} (base {base_port})"),
+        });
+    }
+    Ok(path)
+}
+
+/// 单次 GET 交换（不跟随）：返回状态 + 可选 Location + body。
+async fn http_get_one(
+    base: &str,
+    path: &str,
+    bearer: Option<&str>,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    timeout: Duration,
+) -> Result<Exchange, ApiError> {
     let (transport, host, port) = parse_base(base)?;
     // Never Trust the Client（2026-08）：token 是客户端可控数据（协议 Varchar 允许 CR/LF），
     // 直接拼进请求头可注入任意头——拒绝而非转义（fail closed）。
@@ -293,6 +378,13 @@ async fn http_get_with_tls_timeout(
     }
 }
 
+/// 一次 HTTP 交换的结果（状态 + 可选 Location + body；30x 跟随决策在上层）。
+struct Exchange {
+    status: u16,
+    location: Option<String>,
+    body: Vec<u8>,
+}
+
 /// 传输无关的 HTTP/1.1 GET 交换（`S` = 明文 TcpStream 或 TlsStream<TcpStream>）。
 async fn http_exchange<S>(
     stream: S,
@@ -300,7 +392,7 @@ async fn http_exchange<S>(
     path: &str,
     bearer: Option<&str>,
     timeout: Duration,
-) -> Result<Vec<u8>, ApiError>
+) -> Result<Exchange, ApiError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -349,16 +441,13 @@ where
             }
         }
 
-        // 状态行：`HTTP/1.1 200 OK`
+        // 状态行：`HTTP/1.1 200 OK`；30x 的 Location 供上层决定跟随与否
         let status = parse_status(&head)?;
-        if status != 200 {
-            // C3：30x 显式拒绝而非跟随——跟随重定向需要二次请求逻辑 + 跨域信任判断
-            // （重定向目标可能不是官方 API），而当前上游（phira.5wyxi.com）语义为直连；
-            // 显式报错让"上游加了 CDN 302"从静默失败变成可诊断日志（tech-debt-audit C3）。
-            return Err(ApiError::Internal {
-                msg: format!("HTTP {status} from {path}"),
-            });
-        }
+        let location = if (300..400).contains(&status) {
+            location_of(&head)
+        } else {
+            None
+        };
 
         // Content-Length（缺失则按"无 body"处理；声明超上限直接拒绝——不读不缓冲）
         let len = content_length(&head)?;
@@ -404,7 +493,11 @@ where
             });
         }
         body.truncate(len);
-        Ok(body)
+        Ok(Exchange {
+            status,
+            location,
+            body,
+        })
     })
     .await;
 
@@ -414,6 +507,16 @@ where
             msg: format!("http timeout after {timeout:?}: {path}"),
         }),
     }
+}
+
+/// 解析 Location 头（仅 30x 需要；缺失 = None）。
+fn location_of(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
+    text.split("\r\n").find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("location")
+            .then(|| value.trim().to_owned())
+    })
 }
 
 /// 解析状态行取状态码。

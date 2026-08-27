@@ -301,9 +301,9 @@ async fn oversized_content_length_rejected_without_reading() {
     mock.await.unwrap();
 }
 
-/// 302 重定向 → 显式拒绝（含 30x 状态码的可诊断错误），绝不跟随。
+/// 302 至跨域 host → 拒绝（token 绝不离开信任域；可诊断错误）。
 #[tokio::test]
-async fn redirect_302_rejected_explicitly() {
+async fn redirect_302_cross_host_rejected() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -311,15 +311,123 @@ async fn redirect_302_rejected_explicitly() {
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 1024];
         let _ = sock.read(&mut buf).await.unwrap();
-        let resp = "HTTP/1.1 302 Found\r\nLocation: http://evil.example/chart\r\nContent-Length: 0\r\n\r\n";
+        let resp = "HTTP/1.1 302 Found\r\nLocation: http://evil.example:1234/chart\r\nContent-Length: 0\r\n\r\n";
         sock.write_all(resp.as_bytes()).await.unwrap();
     });
 
     let client = HttpApiClient::new(format!("http://{addr}"));
     let err = client.fetch_chart(7).await.unwrap_err();
     assert!(
-        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("HTTP 302")),
-        "302 应显式报错而非跟随: {err:?}"
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("untrusted host")),
+        "跨域 302 应拒绝而非跟随: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 按序应答 mock：第 i 次 accept 校验请求以「GET {path_i} 」开头，回写 {resp_i}。
+/// （跟随测试专用：多次连接、原始响应可控；mock_server 固定回 200 不适配。）
+async fn mock_sequence(listener: TcpListener, steps: Vec<(String, String)>) {
+    let mut buf = [0u8; 4096];
+    for (path, resp) in steps {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            head.extend_from_slice(&buf[..n]);
+            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head_text = String::from_utf8_lossy(&head);
+        assert!(
+            head_text.starts_with(&format!("GET {path} ")),
+            "mock 应收到 GET {path}, got: {head_text}"
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    }
+}
+
+/// 302 跟随：绝对 URL（同 host）→ 相对 Location → 终态 200，谱面取回。
+#[tokio::test]
+async fn redirect_302_followed_same_host() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let abs = format!("http://{addr}/chart/7");
+    let body = br#"{"id": 7, "name": "T"}"#;
+    let ok = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        String::from_utf8_lossy(body)
+    );
+
+    let mock = tokio::spawn(async move {
+        mock_sequence(
+            listener,
+            vec![
+                (
+                    "/chart/7".to_owned(),
+                    format!("HTTP/1.1 302 Found\r\nLocation: {abs}\r\nContent-Length: 0\r\n\r\n"),
+                ),
+                (
+                    "/chart/7".to_owned(),
+                    "HTTP/1.1 302 Found\r\nLocation: /chart/7\r\nContent-Length: 0\r\n\r\n"
+                        .to_owned(),
+                ),
+                ("/chart/7".to_owned(), ok),
+            ],
+        )
+        .await;
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let chart = client.fetch_chart(7).await.expect("两跳后应取到谱面");
+    assert_eq!(chart.id, 7);
+    assert_eq!(chart.name, "T");
+    mock.await.unwrap();
+}
+
+/// 302 自环 → 跳数耗尽报错（不无限跟随）。
+#[tokio::test]
+async fn redirect_302_loop_exhausted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mock = tokio::spawn(async move {
+        let step = (
+            "/chart/7".to_owned(),
+            "HTTP/1.1 302 Found\r\nLocation: /chart/7\r\nContent-Length: 0\r\n\r\n".to_owned(),
+        );
+        mock_sequence(listener, vec![step; 4]).await;
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(7).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("too many redirects")),
+        "自环 302 应在跳数上限后报错: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 302 无 Location → 显式报错（不可跟随），不静默。
+#[tokio::test]
+async fn redirect_302_without_location_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        let resp = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n";
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(7).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("without Location")),
+        "302 无 Location 应显式报错: {err:?}"
     );
     mock.await.unwrap();
 }

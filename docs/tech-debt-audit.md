@@ -92,10 +92,16 @@ bus.rs:520 已留升级路径："泛化触发条件 = 第二个大扇出广播�
 属"协议之外"的兼容面，不在开源范围（见 client-conformance.md）。
 
 **加固已落地（2026-08）**：响应体 16MiB 上限（声明超限不读不缓冲直接拒绝 + 声明小实发多超限即断）
-+ 30x 重定向显式报错不跟随（CDN 302 从静默失败变可诊断日志）——回归测试三连：
-`oversized_content_length_rejected_without_reading` / `redirect_302_rejected_explicitly` /
-`trailing_bytes_beyond_content_length_discarded`。**剩余项**：管理 API 或回放接入时验一次
-实际上游（phira.5wyxi.com）302/CDN 实证，届时为管理面补重定向解码。
++ 30x 有限跟随（同 host 白名单，见下）——回归测试 6 连：`oversized_content_length_rejected_without_reading` /
+`redirect_302_cross_host_rejected` / `redirect_302_followed_same_host` / `redirect_302_loop_exhausted` /
+`redirect_302_without_location_rejected` / `trailing_bytes_beyond_content_length_discarded`。
+
+**302 跟随升级（2026-08 二次清偿）**：从"显式拒绝"改为**同 host 有限跟随**（≤3 跳，
+`resolve_same_host` 白名单：目标 host+port 必须与 base 一致，跨域拒绝）——上游加 CDN 反代时
+鉴权/取谱面自动跟上；token 只随同 host 请求重发，绝不跨域外泄；Location 缺失/跳数耗尽/
+非 200 终态均显式报错（可诊断，不静默）。**剩余项**：若实际上游 302 到**子域** CDN
+（如 cdn.5wyxi.com），需把白名单从"同 host"扩为"可配置 allowlist"（走 config 项，现状拒绝对
+故障更安全）。
 
 ### C4. 谱面反作弊规则耦合（已标识的演进点，P2 触发时清偿）
 
