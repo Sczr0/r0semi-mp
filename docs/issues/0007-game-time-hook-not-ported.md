@@ -1,6 +1,6 @@
 # ISSUE-0007：原版 `game_time` 钩子（玩家最后触摸时间）未移植——`GetClientState` 断线恢复缺"玩家进度"维度
 
-- 状态：**待解决**
+- 状态：**已解决（2026-08-27）**——方案 A（尾追加 last_game_time + actor 内记录/双时机重置）落地，客户端兼容性由源码审计 + 回归测试保证，见文末修复记录
 - 发现日期：2026-08（对照原版 TeamFlos/phira-mp 源码逐行评审）
 - 发现方式：clone 原版 `phira-mp-server`，对比 Touches/Judges 热路径处理与本重写 `impl-rooms-v1`
 - 严重级：低（当前零影响——原版该字段亦"只写不读"，属预留能力缺失，非行为差异）
@@ -79,3 +79,45 @@ RoomCommand::Touches { frames } => {
 - §6.5-16（Touches 只转 monitor）：进度数据来源是热路径命令，顺带记录零成本
 - §4.6（时间/连接事实必须命令化）：决定移植形态必须是 actor 状态（方案 A），禁止全局原子（方案 C）
 - 与 ISSUE-0001（幽灵座位重放）同属"断线/重连语义"族；互不依赖
+
+---
+
+## 修复记录（2026-08-27，方案 A 落地，比原计划"随断线恢复立项"提前）
+
+前置可行性已由源码审计钉死：`docs/client-behavior-review.md` §6 证实真 SDK 读端
+逐字段读、**不校验剩余字节** → `ClientRoomState` **尾部追加**字段对存量客户端安全
+（此前 issue 里"A 会破坏契约/需版本协商"的顾虑不成立）。配套回归测试：
+`phira-api/tests/proto.rs::trailing_bytes_after_struct_fields_tolerated`
+（正向尾随容忍）+ `unknown_enum_tag_still_rejected`（不对称性锚点：枚举加变体仍必炸）。
+
+### 实施内容
+
+1. **契约层（§5.6 流程）**：`ClientRoomState` 尾部追加 `last_game_time: f32`；
+   derive 因 f32 无 `Eq` 相应降为 `PartialEq`（金样测试同步：尾部 4 字节
+   `NEG_INFINITY` LE = `00 00 80 FF`）；proto.rs 编解码同步。
+2. **impl 层**：`RoomV1.game_time: HashMap<i32, f32>`——Touches 分支取
+   `frames.last().time` 记录（空包不更新；非 live 也记录——进度记录不应依赖转发开关）；
+   `handle_request_start` 与 `check_all_ready → StartPlaying` 两处重置为
+   NEG_INFINITY 哨兵（对齐原版 session.rs:602 / room.rs:247 双时机）；
+   `drop_relay_bufs_of` 同步清理（离房不留残记录）。
+3. **消费出口**：`to_client_state` 按请求者填充（无记录返回哨兵）——重连恢复
+   GetClientState 天然携带进度维度（本端无单独字段开销协议帧外增 4 字节）。
+4. **契约测试**：新增 `game_time_tracking` 场景组——哨兵初值 / 最后帧时间 /
+   空包不覆盖 / RequestStart 重置 / StartPlaying 重置 / 开打后新进度 /
+   未触摸用户独立保持哨兵。
+5. **选型说明**：方案 A 变体——未沿用 issue 原稿"`ClientRoomState` 若加字段属
+   契约变更需版本检查"的强流程，改用**尾追加弱演进**（旧读端字节流自然截断，
+   无需协商），依据即上述审计结论；ADR-0001..0012 不受影响。
+
+### 验收对照（原 issue 验收标准）
+
+- ✅ handle Touches 后 GetClientState 返回该用户最后触摸时间（含空 frames 包不 panic、
+  非 live 也记录）
+- ✅ `ClientRoomState` 加字段：契约测试补齐；cargo-semver-checks 由结构体加字段 +
+  `PartialEq` derive 收敛判定（CI 第 6 闸门盯防）
+- ✅ `cargo test --workspace` 全绿（33 组）；clippy `-D warnings` 通过
+
+### 关联状态变化
+
+- 本 issue 关闭后，"断线恢复缺进度维度"的**数据基础**已就绪；§6.5-23 的
+  "断点续观战/按进度结算"等未来功能可直接消费 `last_game_time`。

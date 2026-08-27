@@ -337,6 +337,9 @@ impl BinaryData for ClientRoomState {
             is_host: r.read()?,
             is_ready: r.read()?,
             users: r.read()?,
+            // ISSUE-0007：尾部追加字段——读端容忍"缺失"不可能（本端总是收到自己写出的
+            // 帧格式）；容忍的是**旧对端多发**的尾随数据（见 tests trailing_bytes_*）。
+            last_game_time: r.read()?,
         })
     }
 
@@ -349,6 +352,8 @@ impl BinaryData for ClientRoomState {
         w.write(&self.is_host)?;
         w.write(&self.is_ready)?;
         w.write(&self.users)?;
+        // 尾部追加（ISSUE-0007）：旧客户端读到此即停，剩余字节静默忽略
+        w.write(&self.last_game_time)?;
         Ok(())
     }
 }

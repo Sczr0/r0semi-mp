@@ -179,6 +179,7 @@ fn client_room_state_construct() {
         is_host: true,
         is_ready: false,
         users,
+        last_game_time: f32::NEG_INFINITY,
     };
     assert!(state.is_host);
     assert!(state.live);

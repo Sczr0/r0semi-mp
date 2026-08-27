@@ -207,6 +207,7 @@ fn golden_authenticate_response() {
                     monitor: false,
                 },
             )]),
+            last_game_time: f32::NEG_INFINITY,
         }),
     )));
     // tag=1, Result Ok: 1, UserInfo(i32 100, uleb(2)+"p1", bool 0),
@@ -229,6 +230,8 @@ fn golden_authenticate_response() {
         0x64, 0x00, 0x00, 0x00, // UserInfo.id = 100
         0x02, 0x70, 0x31, // name "p1"
         0x00, // monitor=false
+        0x00, 0x00, 0x80,
+        0xFF, // last_game_time = f32::NEG_INFINITY LE（尾追加，ISSUE-0007）
     ];
     assert_eq!(enc(&resp), expected);
 }
@@ -299,6 +302,7 @@ fn roundtrip_all_server_commands() {
         is_host: false,
         is_ready: true,
         users: HashMap::new(),
+        last_game_time: 12.5,
     };
     let cases = vec![
         ServerCommand::Pong,
@@ -513,4 +517,54 @@ fn err_empty_room_id() {
         decode_packet::<ClientCommand>(&bytes),
         Err(DecodeError::InvalidRoomId(_))
     ));
+}
+
+// —— 3. 尾部字节容忍（演进约束，client-behavior-review §6） ——
+
+/// 服务端在结构体**尾部追加字段**后，旧读端（逐字段读、不校验剩余）必须静默忽略
+/// 多余字节——这是 game_time（ISSUE-0007）等尾追加演进的兼容前提：
+/// 新服务端发的帧可能被旧客户端消费（原版 derive 读端同样不校验剩余）。
+#[test]
+fn trailing_bytes_after_struct_fields_tolerated() {
+    // 最小合法 Authenticate(Ok) 响应 + 尾部 6 字节垃圾（模拟未来版本追加的字段）
+    // 布尔走 1 字节（0/1）；Result::Ok = 1；Option::None = 0
+    let mut bytes = vec![
+        0x01u8, // tag = Authenticate
+        0x01,   // Result::Ok（bool 1 字节）
+        // UserInfo: id=1(LE i32), name uleb(1)="p", monitor=false
+        0x01, 0x00, 0x00, 0x00, 0x01, b'p', 0x00, // Option<ClientRoomState> = None
+        0x00,
+        // —— 未来版本的尾追加字段（此处为垃圾占位，如 f32 game_time bits）——
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02,
+    ];
+    let decoded: ServerCommand = decode_packet(&bytes).unwrap();
+    match decoded {
+        ServerCommand::Authenticate(Ok((ui, None))) => {
+            assert_eq!(ui.id, 1);
+            assert_eq!(ui.name, "p");
+        }
+        other => panic!("expected Authenticate(Ok((user, None))), got {other:?}"),
+    }
+
+    // 同理：JoinRoomResponse 结构体后有尾部字节也必须容忍。
+    // ServerCommand::JoinRoom tag=9：ok=1, state tag=2(Playing), users uleb(0), live=1
+    bytes = vec![0x09, 0x01, 0x02, 0x00, 0x01, 0xFF, 0xEE];
+    let decoded: ServerCommand = decode_packet(&bytes).unwrap();
+    assert!(matches!(
+        decoded,
+        ServerCommand::JoinRoom(Ok(JoinRoomResponse {
+            state: RoomState::Playing,
+            live: true,
+            ..
+        }))
+    ));
+}
+
+/// 反向锚点：枚举变体的未知 tag **不容忍**（bail invalid enum → 客户端断连，真 SDK 行为）
+/// ——这条不测本 crate 会 bail 就够（已有 err_invalid_enum 覆盖解码器侧）；此测试钉住的是
+/// "trailing = OK, unknown tag = Err"的不对称性，防止未来有人把读端改成"校验剩余长度"。
+#[test]
+fn unknown_enum_tag_still_rejected() {
+    let bytes = vec![0xC8u8]; // tag=200，不存在
+    assert!(decode_packet::<ServerCommand>(&bytes).is_err());
 }

@@ -170,7 +170,13 @@ pub struct UserInfo {
 }
 
 /// 客户端房间状态快照（协议 §6.3，重连恢复用，§6.5-23）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # 线格式演进（§5.6，2026-08，ISSUE-0007）
+/// `last_game_time` 为**尾部追加**字段：读端逐字段读、不校验剩余字节，
+/// 旧客户端（含真 SDK phira-mp-client，client-behavior-review.md §6）静默忽略
+/// 尾随数据——兼容性由 `trailing_bytes_after_struct_fields_tolerated` 回归测试钉住。
+/// 注：f32 不实现 `Eq`，derive 相应由 `Eq` 降为 `PartialEq`。
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClientRoomState {
     /// 房间 id。
     pub id: RoomId,
@@ -188,6 +194,10 @@ pub struct ClientRoomState {
     pub is_ready: bool,
     /// 房内用户表（玩家 + monitor）。
     pub users: std::collections::HashMap<i32, UserInfo>,
+    /// 请求快照的用户最近一次触摸帧的谱面内时间（秒；ISSUE-0007 game_time）。
+    /// 哨兵 [`f32::NEG_INFINITY`] = 本局未开打/无记录（对齐原版 reset_game_time）；
+    /// 线上追加在尾部（旧客户端忽略）。
+    pub last_game_time: f32,
 }
 
 /// 加入房间的响应载荷（协议 §6.3）。
@@ -624,6 +634,20 @@ pub enum RoomCommand {
         /// 用户 id。
         user_id: i32,
     },
+    /// 回源成绩回注（A2 两段式，§4.9-2）：core 侧 HTTP 任务完成 `fetch_record` 后，
+    /// 把结果派发回房间 actor 应用。`record` 为 `None` = 回源失败（归 Internal）。
+    ///
+    /// 与原版差异说明：原版在会话任务内锁外做 HTTP（不冻结同房其它命令）；
+    /// actor 串行下"actor 内 await 回源"是行为回退（§4.9-2 规则 2），本命令是其
+    /// 拆段方案的后半段——前半段 `Played` 命令本身不再 await 回源。
+    RecordFetched {
+        /// 上报成绩的玩家 id。
+        user_id: i32,
+        /// 成绩记录 id（幂等/校验对齐原始 Played 载荷）。
+        record_id: i32,
+        /// 回源结果；`Err` = 内部故障（超时/网络），语义同旧内联路径。
+        record: Result<crate::Record, crate::ApiError>,
+    },
     /// 配置热重载（§4.9-8）。
     UpdateConfig {
         /// 新配置（Arc 共享）。
@@ -651,7 +675,10 @@ pub trait ApiClient: Send + Sync {
 }
 
 /// 回源错误（归 `RoomError::Internal` / `AuthError::Internal`）。
-#[derive(Debug, Clone, thiserror::Error)]
+///
+/// `PartialEq`（A2）：`RecordFetched` 命令携带 `Result<Record, ApiError>`，
+/// `RoomCommand` 的 `PartialEq` derive 传递要求。
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("api error: {msg}")]
 pub enum ApiError {
     /// 内部故障（网络/超时/HTTP 错误）。
