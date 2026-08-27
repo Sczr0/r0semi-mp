@@ -101,6 +101,105 @@ impl Drop for ReadCharge {
     }
 }
 
+/// 读循环：合读（默认）——一次 `read` 4KiB 进 pending 缓冲 + 游标消费（小帧多帧/次，
+/// 长度前缀不再逐字节 `read_u8`），payload 优先消费 pending、不足才 `read_exact` 补齐。
+/// 防垃圾（§6）：pending 上界 = 读缓冲尺寸（4KiB 恒定，不随输入增长）；长度拒收
+/// （>32bit / 前缀>5B / >packet_limit）与解码失败断连不变。读侧在途记账（安全锁 A
+/// 账外区域补洞）：读取+解码+分发字节入全局账，超限 fail closed 断连；`ReadCharge`
+/// Drop guard 保证任何退出路径记账平衡。
+async fn recv_packets_coalesced<R, F, S>(
+    read: &mut S,
+    send_tx: &Arc<mpsc::Sender<Outbound>>,
+    packet_limit: &Arc<AtomicU32>,
+    handler: &mut Box<dyn FnMut(Arc<mpsc::Sender<Outbound>>, R) -> F + Send + Sync>,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + Unpin,
+    R: phira_api::BinaryData + std::fmt::Debug,
+    F: Future<Output = ()> + Send + 'static,
+{
+    // 读侧合读（实测淬取，docs/performance-cpu.md §6）：一次 `read` 取 4KiB
+    // 到一个 pending 缓冲 + 游标消费——小帧多帧/次，长度前缀不再逐字节 `read_u8`
+    // （每字节一次 syscall），payload 优先消费 pending、不足才 `read_exact` 补齐。
+    // 防垃圾（§6）：pending 上界 = 读缓冲尺寸（固定 4KiB，不随输入增长）；
+    // 长度拒收（>32bit / nlen>5 / >packet_limit）与解码失败断连均不变。
+    //
+    // 读侧在途记账（安全锁 A 账外区域补洞）：payload 读取+解码+分发期间占用的
+    // 字节入全局账目——声明 2MiB 帧的恶意洪水跨连接被全局 64MiB 闸住（超限断连
+    // fail closed）；`ReadCharge` Drop guard 兜底保证任何退出路径记账平衡。
+    let mut buf = [0u8; 4096];
+    let mut pending: Vec<u8> = Vec::with_capacity(4096);
+    let mut cursor = 0usize;
+    let mut payload = Vec::new();
+    loop {
+        // —— ULEB128 长度前缀（≤5 字节；pending 优先，不足一次读补齐）——
+        let mut len: u64 = 0;
+        let mut pos = 0;
+        let mut nlen = 0usize;
+        loop {
+            if cursor >= pending.len() {
+                pending.clear();
+                cursor = 0;
+                let n = read.read(&mut buf).await?;
+                if n == 0 {
+                    bail!("connection closed mid-frame"); // 半帧挂断（同 read_u8 EOF 语义）
+                }
+                pending.extend_from_slice(&buf[..n]);
+            }
+            let byte = pending[cursor];
+            cursor += 1;
+            nlen += 1;
+            len |= u64::from(byte & 0x7f) << pos;
+            pos += 7;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            // >32 bit（pos 超 32）/ 前缀超 5 字节 → 拒绝（§6.1 防攻击）
+            if pos > 32 || nlen > 5 {
+                bail!("invalid length");
+            }
+        }
+        if len > u64::from(packet_limit.load(Ordering::SeqCst)) {
+            bail!(
+                "data packet too large (limit {})",
+                packet_limit.load(Ordering::SeqCst)
+            );
+        }
+        // 值域已知：len ≤ packet_limit（u32 上限）→ usize/64 位平台无损
+        let len = usize::try_from(len).expect("len ≤ packet_limit (u32) fits usize");
+
+        // —— payload：pending 剩余优先，不足 read_exact 补齐；记账覆盖整段生命 ——
+        if !crate::server::charge_memory(len) {
+            // 全局在途超限（声明大帧洪水）：fail closed 断连——读侧不能丢新（无重发），
+            // 断连是对攻击者最小成本的处置
+            bail!("read-side memory guard exceeded ({len})");
+        }
+        let _charge = crate::stream::ReadCharge(len);
+        payload.clear();
+        let take = (len - payload.len()).min(pending.len() - cursor);
+        payload.extend_from_slice(&pending[cursor..cursor + take]);
+        cursor += take;
+        if payload.len() < len {
+            payload.resize(len, 0);
+            // pending 已消费 take 字节，余下 len - take 从 socket 补齐
+            read.read_exact(&mut payload[take..]).await?;
+        }
+        trace!("received {} bytes", payload.len());
+
+        let decoded: R = match decode_packet(&payload) {
+            Ok(val) => val,
+            Err(err) => {
+                warn!("invalid packet: {err:?} {payload:?}");
+                break;
+            }
+        };
+        trace!("decodes to {decoded:?}");
+        handler(Arc::clone(send_tx), decoded).await;
+        // `_charge` Drop：分发完成后释放读侧在途账（任何退出路径平衡）
+    }
+    Ok(())
+}
+
 /// 双向帧流：发送载荷固定为 [`Outbound`]（服务端侧——命令或共享编码帧），
 /// `R` = 接收载荷类型（`ClientCommand`）。
 ///
@@ -234,84 +333,17 @@ where
         let recv_task_handle = tokio::spawn({
             let send_tx = Arc::clone(&send_tx);
             async move {
-                // 读侧合读（实测淬取，docs/performance-cpu.md §6）：一次 `read` 取 4KiB
-                // 到一个 pending 缓冲 + 游标消费——小帧多帧/次，长度前缀不再逐字节 `read_u8`
-                // （每字节一次 syscall），payload 优先消费 pending、不足才 `read_exact` 补齐。
-                // 防垃圾（§6）：pending 上界 = 读缓冲尺寸（固定 4KiB，不随输入增长）；
-                // 长度拒收（>32bit / nlen>5 / >packet_limit）与解码失败断连均不变。
-                //
-                // 读侧在途记账（安全锁 A 账外区域补洞）：payload 读取+解码+分发期间占用的
-                // 字节入全局账目——声明 2MiB 帧的恶意洪水跨连接被全局 64MiB 闸住（超限断连
-                // fail closed）；`ReadCharge` Drop guard 兜底保证任何退出路径记账平衡。
-                let mut buf = [0u8; 4096];
-                let mut pending: Vec<u8> = Vec::with_capacity(4096);
-                let mut cursor = 0usize;
-                let mut payload = Vec::new();
-                loop {
-                    // —— ULEB128 长度前缀（≤5 字节；pending 优先，不足一次读补齐）——
-                    let mut len: u64 = 0;
-                    let mut pos = 0;
-                    let mut nlen = 0usize;
-                    loop {
-                        if cursor >= pending.len() {
-                            pending.clear();
-                            cursor = 0;
-                            let n = read.read(&mut buf).await?;
-                            if n == 0 {
-                                bail!("connection closed mid-frame"); // 半帧挂断（同 read_u8 EOF 语义）
-                            }
-                            pending.extend_from_slice(&buf[..n]);
-                        }
-                        let byte = pending[cursor];
-                        cursor += 1;
-                        nlen += 1;
-                        len |= u64::from(byte & 0x7f) << pos;
-                        pos += 7;
-                        if byte & 0x80 == 0 {
-                            break;
-                        }
-                        // >32 bit（pos 超 32）/ 前缀超 5 字节 → 拒绝（§6.1 防攻击）
-                        if pos > 32 || nlen > 5 {
-                            bail!("invalid length");
-                        }
-                    }
-                    if len > u64::from(packet_limit.load(Ordering::SeqCst)) {
-                        bail!(
-                            "data packet too large (limit {})",
-                            packet_limit.load(Ordering::SeqCst)
-                        );
-                    }
-                    // 值域已知：len ≤ packet_limit（u32 上限）→ usize/64 位平台无损
-                    let len = usize::try_from(len).expect("len ≤ packet_limit (u32) fits usize");
-
-                    // —— payload：pending 剩余优先，不足 read_exact 补齐；记账覆盖整段生命 ——
-                    if !crate::server::charge_memory(len) {
-                        // 全局在途超限（声明大帧洪水）：fail closed 断连——读侧不能丢新（无重发），
-                        // 断连是对攻击者最小成本的处置
-                        bail!("read-side memory guard exceeded ({len})");
-                    }
-                    let _charge = crate::stream::ReadCharge(len);
-                    payload.clear();
-                    let take = (len - payload.len()).min(pending.len() - cursor);
-                    payload.extend_from_slice(&pending[cursor..cursor + take]);
-                    cursor += take;
-                    if payload.len() < len {
-                        payload.resize(len, 0);
-                        // pending 已消费 take 字节，余下 len - take 从 socket 补齐
-                        read.read_exact(&mut payload[take..]).await?;
-                    }
-                    trace!("received {} bytes", payload.len());
-
-                    let decoded: R = match decode_packet(&payload) {
-                        Ok(val) => val,
-                        Err(err) => {
-                            warn!("invalid packet: {err:?} {payload:?}");
-                            break;
-                        }
-                    };
-                    trace!("decodes to {decoded:?}");
-                    handler(Arc::clone(&send_tx), decoded).await;
-                    // `_charge` Drop：分发完成后释放读侧在途账（任何退出路径平衡）
+                // A/B 对拍开关（2026-08，flamegraph workflow 对拍协议，docs/performance-cpu.md §6）：
+                // R0SEMI_DISABLE_READ_COALESCE=1 → 旧逐字节读（对照基线）；未设 → 合读。
+                // 合读为默认与长期形态；legacy 仅作基准/回归安全网——同代码同 workflow 只差
+                // 一个 env，帧率归一对拍无混差（每帧 CPU 成本为裁决依据）。
+                if std::env::var("R0SEMI_DISABLE_READ_COALESCE").is_ok_and(|v| v == "1") {
+                    let _ =
+                        recv_packets_legacy(&mut read, &send_tx, &packet_limit, &mut handler).await;
+                } else {
+                    let _ =
+                        recv_packets_coalesced(&mut read, &send_tx, &packet_limit, &mut handler)
+                            .await;
                 }
                 Ok(())
             }
@@ -373,4 +405,60 @@ impl<R> Drop for Stream<R> {
             handle.abort();
         }
     }
+}
+
+/// 读循环：legacy 逐字节读（仅对拍基准 R0SEMI_DISABLE_READ_COALESCE=1；无读侧记账）——
+/// 逐字节 `read_u8` 解析长度前缀 + `read_exact` payload，与合读前行为一致。
+/// 保留原因：flamegraph A/B 母尺对照（同构建同 workflow 只差 env，帧率归一对拍）。
+#[allow(clippy::too_many_lines)] // 对照实现，保持与原版逐字节语义逐行对应
+async fn recv_packets_legacy<R, F, S>(
+    read: &mut S,
+    send_tx: &Arc<mpsc::Sender<Outbound>>,
+    packet_limit: &Arc<AtomicU32>,
+    handler: &mut Box<dyn FnMut(Arc<mpsc::Sender<Outbound>>, R) -> F + Send + Sync>,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + Unpin,
+    R: phira_api::BinaryData + std::fmt::Debug,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let mut buffer = Vec::new();
+    loop {
+        // ULEB128 长度：>32 bit 拒绝（防攻击，§6.1）
+        let mut len = 0u32;
+        let mut pos = 0;
+        loop {
+            let byte = read.read_u8().await?;
+            len |= u32::from(byte & 0x7f) << pos;
+            pos += 7;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            if pos > 32 {
+                bail!("invalid length");
+            }
+        }
+        if len > packet_limit.load(Ordering::SeqCst) {
+            bail!(
+                "data packet too large (limit {})",
+                packet_limit.load(Ordering::SeqCst)
+            );
+        }
+        let len = len as usize;
+
+        buffer.resize(len, 0);
+        read.read_exact(&mut buffer).await?;
+        trace!("received {} bytes: {buffer:?}", buffer.len());
+
+        let payload: R = match decode_packet(&buffer) {
+            Ok(val) => val,
+            Err(err) => {
+                warn!("invalid packet: {err:?} {buffer:?}");
+                break;
+            }
+        };
+        trace!("decodes to {payload:?}");
+        handler(Arc::clone(send_tx), payload).await;
+    }
+    Ok(())
 }

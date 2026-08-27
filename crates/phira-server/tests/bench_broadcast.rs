@@ -173,6 +173,7 @@ async fn recv_frame(sock: &mut TcpStream) -> phira_api::ServerCommand {
 
 /// 进程 CPU 时间（Linux：/proc/self/stat 的 utime+stime，时钟节拍归一）。
 /// Windows 无等价廉价读取 —— None（本机跑不出帧率归一指标，以吞吐帧率近似）。
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn cpu_seconds() -> Option<f64> {
     let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
     let rest = stat.split_whitespace().nth(13)?; // 字段 14 = utime（0 基 13）

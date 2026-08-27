@@ -23,6 +23,11 @@ on:
         description: perf 采样率 Hz
         default: "1999"
         required: false
+      disable_read_coalesce:
+        description: 'A/B 对拍：勾选 = 旧逐字节读（对照基线），不勾 = 合读（默认）'
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: read
@@ -85,6 +90,7 @@ jobs:
         run: |
           R0SEMI_BENCH_N=${{ inputs.n_clients }} \
           R0SEMI_BENCH_SECS=${{ inputs.seconds }} \
+          ${{ inputs.disable_read_coalesce == 'true' && 'R0SEMI_DISABLE_READ_COALESCE=1 ' || '' }} \
           perf record -F ${{ inputs.sample_rate }} --call-graph fp -o perf.data -- \
             "${{ steps.harness.outputs.harness }}" --ignored --nocapture 2>&1 | tee /tmp/bench.log
 
