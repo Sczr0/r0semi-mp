@@ -85,12 +85,49 @@ bus.rs:520 已留升级路径："泛化触发条件 = 第二个大扇出广播�
 `DangleExpired` 后调 `evict_name` 释放昵称；epoch 单调不回收保 ISSUE-0009 语义。
 详见 ISSUE-0012 文末修复记录。
 
-### C3. 手写 HTTP 客户端健壮性天花板
+### C3. 手写 HTTP 客户端健壮性天花板 —— ✅ 已加固（2026-08，剩余项见下）
 
-`http.rs`：Content-Length 无上限校验、只认 200（不跟重定向）、注释自嘲"本实现只打自己的 mock API"。
-官方 API 行为变更（如加 CDN 302）即断鉴权/取谱面。属"协议之外"的兼容面，不在开源范围（见 client-conformance.md）。
-当管理 API 或回放接入时，建议为它补充重定向解码与响应体上限。
+`http.rs`（手写 HTTP/1.1，约两百行）：Content-Length 无上限校验、只认 200（不跟重定向）、
+注释自嘲"本实现只打自己的 mock API"。官方 API 行为变更（如加 CDN 302）即断鉴权/取谱面。
+属"协议之外"的兼容面，不在开源范围（见 client-conformance.md）。
 
+**加固已落地（2026-08）**：响应体 16MiB 上限（声明超限不读不缓冲直接拒绝 + 声明小实发多超限即断）
++ 30x 重定向显式报错不跟随（CDN 302 从静默失败变可诊断日志）——回归测试三连：
+`oversized_content_length_rejected_without_reading` / `redirect_302_rejected_explicitly` /
+`trailing_bytes_beyond_content_length_discarded`。**剩余项**：管理 API 或回放接入时验一次
+实际上游（phira.5wyxi.com）302/CDN 实证，届时为管理面补重定向解码。
+
+### C4. 谱面反作弊规则耦合（已标识的演进点，P2 触发时清偿）
+
+`handle_record_fetched` 内的谱面匹配（P1，`record.chart vs self.chart.id`）把**反作弊判定规则**
+硬编码进了房间状态机（impl-rooms-v1）。区分两种耦合：
+- **数据耦合（必然，保留）**：判定需要 `self.chart`（本局谱面）——record 全字段 + 本局谱面的
+  交集**只存在于回注点**，这是谱面匹配进不了观察者面（Moderator 无房间视野、`on_event(Played)`
+  无 record_id/chart、`intercept` 禁长 IO）的根因；
+- **规则耦合（当前程控，可清偿）**："chart 不一致 → 成绩无效"的判定逻辑本身。
+
+**为什么当前程控是止损**：单一规则 + 零配置需求 + 契约测试钉死 + 失败路径已收敛为单一形态
+（成绩无效 → 复用 `settle_record_failed` 结算，反作弊失败绝不卡房间）——此刻抽接口是预言式抽象
+（原则 5）。**但"无多解"论据对未来不成立**：运营可能要求"宽松（仅 chart/fail-open）vs 严格
+（chart+level+mod）vs 名单式"。
+
+**清偿路径（P2 触发时）**：判定点接成契约级 policy 插座——`impl-rooms-v1` 保留默认实现
+（现 chart 匹配规则），组合根可注入叠加规则：
+
+```rust
+// phira-api（弱演进）
+pub trait RecordPolicy: Send + Sync {
+    /// 回注点裁决：本局谱面 + 成绩 + 上报者 → 拒绝理由（None = 放行）。
+    fn evaluate(&self, room_chart: Option<i32>, record: &Record, user_id: i32)
+        -> Option<RoomError>;
+}
+```
+
+**安全线（外置后必须由接口签名封死）**：policy 只允许"拒绝该成绩"（走既有 settle 结算），
+**不允许其它副作用**——策略再烂，后果最多是某个成绩变成 abort，房间不变量与 GameEnd 收尾
+不受影响。
+**触发时机**：P2（mod/level/阈值类运营规则）需求到来时，与 `record.Mod` 数据口（上游有、
+DTO 未接）一并落地。
 ---
 
 ## D 级：防御缺口（有意取舍但仍属缺口）
@@ -110,7 +147,7 @@ D2 在协议 v2 到来时会被动暴露；D3 的正确解法不是抄传闻，�
 | 阶段 | 内容 | 判据 |
 |---|---|---|
 | **立即**（天级） | ✅ A1 ABA 修复（ISSUE-0011）· ✅ B3 Metrics 暴露 · ✅ D2 版本握手校验 · ✅ client-conformance 崩溃猎手测试（conformance.rs，真 SDK A1–A6） | 消灭全部已知正确性地雷 |
-| **短期**（周级） | ✅ B2 i18n · ✅ 谱面反作弊（P0/P1 落地：`Record.chart` 数据口 + 回注点谱面匹配（fail-open）；P2 观察者规则/P3 难度校验未做）· ✅ 观战聚合缓冲（B6+Tick 心跳）· ✅ D1 Chat 限速 · ✅ C2 Registry 拆表（ISSUE-0012） | 每项带契约测试落地 |
+| **短期**（周级） | ✅ B2 i18n · ✅ 谱面反作弊（P0/P1 落地：`Record.chart` 数据口 + 回注点谱面匹配（fail-open）；P2 观察者规则/P3 难度校验未做；规则耦合已标识 → **C4**）· ✅ 观战聚合缓冲（B6+Tick 心跳）· ✅ D1 Chat 限速 · ✅ C2 Registry 拆表（ISSUE-0012） | 每项带契约测试落地 |
 | **中期**（月级） | ✅ B1 Tick 通电（倒计时，提前完成）· 一致性断言库 + 漂移哨兵 · 管理 API | 玩家可感知 + 护城河成形 |
 | **择机** | ✅ A2 回源出队（已提前完成）· C1 server.rs 拆分 · 回放录制（Store 接口） | 绑定到相关功能进场时顺手做 |
 | **远景** | Store 持久化 · 协议 v2 预案 · 多实例（仅当需求出现） | 文档立 flag，不动代码 |
