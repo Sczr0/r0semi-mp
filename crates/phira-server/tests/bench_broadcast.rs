@@ -171,6 +171,18 @@ async fn recv_frame(sock: &mut TcpStream) -> phira_api::ServerCommand {
     .expect("recv_frame timeout: 帧流错位或服务器无响应")
 }
 
+/// 进程 CPU 时间（Linux：/proc/self/stat 的 utime+stime，时钟节拍归一）。
+/// Windows 无等价廉价读取 —— None（本机跑不出帧率归一指标，以吞吐帧率近似）。
+fn cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let rest = stat.split_whitespace().nth(13)?; // 字段 14 = utime（0 基 13）
+    let utime: u64 = rest.parse().ok()?;
+    let rest = stat.split_whitespace().nth(14)?; // 字段 15 = stime
+    let stime: u64 = rest.parse().ok()?;
+    let hz = 100.0; // Linux USER_HZ 通常 100；glibc 下可用 sysconf，这里取常量近似
+    Some((utime + stime) as f64 / hz)
+}
+
 /// 触摸流：16Hz Touches（帧 Arc 共享）持续 secs 秒；每 128ms 稀疏清读缓冲——
 /// 贴近真实客户端（勤读），避免被服务端"乌龟踢除"（§10.4 backpressure kicker）。
 async fn touch_loop(mut sock: TcpStream, touches: Vec<u8>, secs: u64) -> u64 {
@@ -268,10 +280,19 @@ async fn broadcast_fanout_bench() {
     }
     drop(ctx);
 
+    // CPU 时间（Linux /proc/self/stat utime+stime；Windows None）——帧率归一化的可比指标：
+    // 优化前后同参数跑，看每帧 CPU 成本是否下降（syscall 占比受吞吐/连接期比例污染，不可比）
+    let cpu = cpu_seconds();
+    let fps = f64::from(u32::try_from(total).unwrap_or(u32::MAX)) / elapsed.as_secs_f64();
+    let per_frame = cpu.map(|c| c * 1_000_000.0 / fps / elapsed.as_secs_f64());
     eprintln!(
         "== 广播扇出基准 ==
-客户端: {n}  | 时长: {elapsed:?} | 房内触摸帧/秒: {:.0} | 在途: {:.1} MiB",
-        f64::from(u32::try_from(total).unwrap_or(u32::MAX)) / elapsed.as_secs_f64(),
+客户端: {n}  | 时长: {elapsed:?} | 房内触摸帧/秒: {fps:.0} | 在途: {:.1} MiB",
         f64::from(u32::try_from(in_flight_bytes()).unwrap_or(u32::MAX)) / 1_048_576.0,
+    );
+    eprintln!(
+        "  进程 CPU 秒: {cpu_cell} | 每帧 CPU 成本: {frame_cell}",
+        cpu_cell = cpu.map_or_else(|| "N/A (Windows)".to_owned(), |c| format!("{c:.2}s")),
+        frame_cell = per_frame.map_or_else(|| "N/A".to_owned(), |v| format!("{v:.1}µs")),
     );
 }
