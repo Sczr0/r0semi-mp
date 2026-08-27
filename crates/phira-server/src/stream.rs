@@ -90,6 +90,17 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 高频小包场景直接减系统调用量。低流量时 `recv_many` 至少等一帧即返回，延迟不增。
 pub const WRITE_BATCH_MAX: usize = 64;
 
+/// 读侧在途记账守卫（安全锁 A 账外区域补洞，docs/performance-cpu.md §6）：
+/// payload 读取+解码+分发期间的字节占用计入全局账，Drop 时释放——
+/// 任何退出路径（正常 / decode 失败断连 / abort / panic）账目必然平衡。
+pub struct ReadCharge(usize);
+
+impl Drop for ReadCharge {
+    fn drop(&mut self) {
+        crate::server::release_memory(self.0);
+    }
+}
+
 /// 双向帧流：发送载荷固定为 [`Outbound`]（服务端侧——命令或共享编码帧），
 /// `R` = 接收载荷类型（`ClientCommand`）。
 ///
@@ -223,43 +234,84 @@ where
         let recv_task_handle = tokio::spawn({
             let send_tx = Arc::clone(&send_tx);
             async move {
-                let mut buffer = Vec::new();
+                // 读侧合读（实测淬取，docs/performance-cpu.md §6）：一次 `read` 取 4KiB
+                // 到一个 pending 缓冲 + 游标消费——小帧多帧/次，长度前缀不再逐字节 `read_u8`
+                // （每字节一次 syscall），payload 优先消费 pending、不足才 `read_exact` 补齐。
+                // 防垃圾（§6）：pending 上界 = 读缓冲尺寸（固定 4KiB，不随输入增长）；
+                // 长度拒收（>32bit / nlen>5 / >packet_limit）与解码失败断连均不变。
+                //
+                // 读侧在途记账（安全锁 A 账外区域补洞）：payload 读取+解码+分发期间占用的
+                // 字节入全局账目——声明 2MiB 帧的恶意洪水跨连接被全局 64MiB 闸住（超限断连
+                // fail closed）；`ReadCharge` Drop guard 兜底保证任何退出路径记账平衡。
+                let mut buf = [0u8; 4096];
+                let mut pending: Vec<u8> = Vec::with_capacity(4096);
+                let mut cursor = 0usize;
+                let mut payload = Vec::new();
                 loop {
-                    // ULEB128 长度：>32 bit 拒绝（防攻击，§6.1）
-                    let mut len = 0u32;
+                    // —— ULEB128 长度前缀（≤5 字节；pending 优先，不足一次读补齐）——
+                    let mut len: u64 = 0;
                     let mut pos = 0;
+                    let mut nlen = 0usize;
                     loop {
-                        let byte = read.read_u8().await?;
-                        len |= u32::from(byte & 0x7f) << pos;
+                        if cursor >= pending.len() {
+                            pending.clear();
+                            cursor = 0;
+                            let n = read.read(&mut buf).await?;
+                            if n == 0 {
+                                bail!("connection closed mid-frame"); // 半帧挂断（同 read_u8 EOF 语义）
+                            }
+                            pending.extend_from_slice(&buf[..n]);
+                        }
+                        let byte = pending[cursor];
+                        cursor += 1;
+                        nlen += 1;
+                        len |= u64::from(byte & 0x7f) << pos;
                         pos += 7;
                         if byte & 0x80 == 0 {
                             break;
                         }
-                        if pos > 32 {
+                        // >32 bit（pos 超 32）/ 前缀超 5 字节 → 拒绝（§6.1 防攻击）
+                        if pos > 32 || nlen > 5 {
                             bail!("invalid length");
                         }
                     }
-                    if len > packet_limit.load(Ordering::SeqCst) {
+                    if len > u64::from(packet_limit.load(Ordering::SeqCst)) {
                         bail!(
                             "data packet too large (limit {})",
                             packet_limit.load(Ordering::SeqCst)
                         );
                     }
-                    let len = len as usize;
+                    // 值域已知：len ≤ packet_limit（u32 上限）→ usize/64 位平台无损
+                    let len = usize::try_from(len).expect("len ≤ packet_limit (u32) fits usize");
 
-                    buffer.resize(len, 0);
-                    read.read_exact(&mut buffer).await?;
-                    trace!("received {} bytes: {buffer:?}", buffer.len());
+                    // —— payload：pending 剩余优先，不足 read_exact 补齐；记账覆盖整段生命 ——
+                    if !crate::server::charge_memory(len) {
+                        // 全局在途超限（声明大帧洪水）：fail closed 断连——读侧不能丢新（无重发），
+                        // 断连是对攻击者最小成本的处置
+                        bail!("read-side memory guard exceeded ({len})");
+                    }
+                    let _charge = crate::stream::ReadCharge(len);
+                    payload.clear();
+                    let take = (len - payload.len()).min(pending.len() - cursor);
+                    payload.extend_from_slice(&pending[cursor..cursor + take]);
+                    cursor += take;
+                    if payload.len() < len {
+                        payload.resize(len, 0);
+                        // pending 已消费 take 字节，余下 len - take 从 socket 补齐
+                        read.read_exact(&mut payload[take..]).await?;
+                    }
+                    trace!("received {} bytes", payload.len());
 
-                    let payload: R = match decode_packet(&buffer) {
+                    let decoded: R = match decode_packet(&payload) {
                         Ok(val) => val,
                         Err(err) => {
-                            warn!("invalid packet: {err:?} {buffer:?}");
+                            warn!("invalid packet: {err:?} {payload:?}");
                             break;
                         }
                     };
-                    trace!("decodes to {payload:?}");
-                    handler(Arc::clone(&send_tx), payload).await;
+                    trace!("decodes to {decoded:?}");
+                    handler(Arc::clone(&send_tx), decoded).await;
+                    // `_charge` Drop：分发完成后释放读侧在途账（任何退出路径平衡）
                 }
                 Ok(())
             }

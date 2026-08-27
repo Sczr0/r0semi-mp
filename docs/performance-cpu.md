@@ -81,9 +81,18 @@ artifact。Windows 非管理员 ETW 采样 + samply save-only 无符号（函数
 **同一 benchmark 的权威复核面**。两次 Run 各下载 artifact，collapsed.txt 直接数值
 对比（写批处理前后效果在此验证）。
 
-**备选后续**：读侧长度前缀逐字节 `read_u8`（每字节 poll）可改为带用户缓冲的合读
-（需 pending 缓冲，防吞后续帧载荷——本轮未动）；`tokio` multi_thread 单 IO driver
-为架构级约束（1500 连接高频双向 → driver 单线程），缓解靠减少 IO 事件数。
+**读侧合读（2026-08 已落地，stream.rs）**：一次 `read` 取 4KiB 进 pending 缓冲 +
+游标消费——小帧多帧/次，长度前缀不再逐字节 `read_u8`（每字节一次 syscall），
+payload 优先消费 pending、不足才 `read_exact` 补齐。防垃圾面（§6 论证兑现）：
+pending 上界 = 4KiB 读缓冲（不随输入增长）；长度拒收（>32bit / 前缀>5B /
+>packet_limit）与解码失败断连不变。**同提交补读侧在途记账**（安全锁 A 账外区域）：
+payload 读取窗口经 `ReadCharge` 入全局账（超限断连 fail closed——声明 2MiB 帧
+洪水被全局 64MiB 闸住），Drop guard 兜底任何退出路径记账平衡。
+验证：242 全绿（含 frames/conformance/fuzz_frames/e2e 帧正确性 + memory_guard
+账目平衡 + pressure 灌流）；bench 帧率无回归（1369/s @ N=100，与合读前同比例）。
+**量化复核**：flamegraph workflow 复采应见 recvfrom 占比回落（21% → 更低）。
+`tokio` multi_thread 单 IO driver 为架构级约束，缓解靠减少 IO 事件数（已做
+写批处理 + 读合读两个方向）。
 
 ## 4. 优化候选（按 ROI 排序，均需拍板后实施）
 
