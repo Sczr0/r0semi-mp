@@ -192,10 +192,20 @@ async fn memory_accounting_grows_on_charge_and_drains_on_close() {
         "大帧投递应记账增长: baseline={baseline} charged={charged}"
     );
 
-    // 关闭连接（写任务收尾清账）→ 记账回落
+    // 关闭连接（写任务收尾清账：消费释放 + MemoryReleaser 兜底）→ 记账回落。
+    // 注意：`IN_FLIGHT_BYTES` 是全局 static，本文件两个测试并行共享——CI（Linux）
+    // send buffer 大，并行测试的帧可能正在陆续写出/释放，固定 sleep 会读到 mid-flight
+    // 账（本地 Windows 小 buffer 秒卡死所以稳定绿）——改轮询等待回落（≤2s），
+    // 真正等"收尾完成"而非赌时序。
     drop(client);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let after = in_flight_bytes();
+    let mut after = in_flight_bytes();
+    for _ in 0..100 {
+        if after <= baseline + 64 * 1024 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        after = in_flight_bytes();
+    }
     assert!(
         after <= baseline + 64 * 1024,
         "连接关闭后记账应回落（无泄漏）: baseline={baseline} after={after}"
