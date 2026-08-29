@@ -1,0 +1,39 @@
+# r0semi-mp 容器编排（D-01）
+#
+# 一条命令起服：
+#   docker compose up -d --build
+# 验收：
+#   curl -s http://127.0.0.1:8080/healthz      # → 200
+#   nc 127.0.0.1 12346                          # 游戏端口可握手（0x01 版本字节 + Ping → Pong）
+#
+# 覆盖配置（可选）：先 cp server_config.example.yml server_config.yml 再改，
+# 取消下方 volumes 注释即可挂载覆盖镜像内默认配置。
+services:
+  r0semi-mp:
+    build: .
+    image: r0semi-mp:latest
+    container_name: r0semi-mp
+    restart: unless-stopped
+    ports:
+      - "12346:12346"   # 游戏端口（MP 协议，客户端填此端口）
+      - "8080:8080"     # 管理 HTTP（/healthz + /rooms + /admin/*）
+    volumes:
+      # 管理面持久化（bans.json / audit.jsonl / config 快照，镜像内 /app/data）
+      - r0semi-mp-data:/app/data
+      # 覆盖配置（可选；基于 server_config.example.yml 修改）
+      # - ./server_config.yml:/app/server_config.yml:ro
+    environment:
+      # 可选覆盖（优先级高于 server_config.yml，见 docs/deployment.md §2）
+      # R0SEMI_MP_ADMIN_TOKEN: "changeme"   # 管理面 token（不设 = 管理面禁用）
+      # R0SEMI_MP_API_BASE: "https://phira.5wyxi.com"
+      # R0SEMI_MP_PORT: "12346"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    stop_signal: SIGTERM   # §11 优雅停机（维护广播 + 宽限窗口）
+
+volumes:
+  r0semi-mp-data:
