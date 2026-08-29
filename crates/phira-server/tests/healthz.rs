@@ -201,6 +201,29 @@ async fn rooms_endpoint_still_works() {
     );
 }
 
+/// total 正向断言（2026-08 review 补）：已鉴权在线会话计入 total——
+/// 未进房也计（文档口径：SessionSink 全量在线，含 monitor，不等于 players 之和）。
+#[tokio::test]
+async fn rooms_total_counts_online_sessions() {
+    let ctx = test_ctx();
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    ctx.sink
+        .register(
+            42,
+            Arc::new(tx),
+            Arc::new(phira_server::server::Backpressure::new()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            phira_server::l10n::Locale::EnUs,
+        )
+        .await;
+    let resp = http_get(Arc::clone(&ctx), "/rooms").await;
+    assert!(resp.contains("200 OK"), "状态行: {resp}");
+    assert!(
+        resp.contains("\"total\":1"),
+        "在线会话（未进房）计入 total: {resp}"
+    );
+}
+
 #[tokio::test]
 async fn unknown_path_is_404() {
     let resp = http_get(test_ctx(), "/nope").await;
@@ -264,6 +287,13 @@ async fn admin_rooms_list_with_state_filter() {
     assert!(
         resp.contains("\"r2\"") && !resp.contains("\"r1\""),
         "playing 过滤: {resp}"
+    );
+
+    // 大小写不敏感承诺（docs §4）：查询值大写也命中（http_serve 全量小写 + 过滤点本地归一）
+    let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/rooms?state=PLAYING", "").await;
+    assert!(
+        resp.contains("\"r2\"") && !resp.contains("\"r1\""),
+        "PLAYING 大写查询应同样命中: {resp}"
     );
 
     let resp = http_admin(

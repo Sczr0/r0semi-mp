@@ -422,9 +422,12 @@ async fn route_admin_read(
         "/admin/rooms" => {
             let rooms = ctx.room_list.snapshot().await;
             let rooms = if let Some(st) = query.strip_prefix("state=") {
+                // 查询值本地归一（docs 承诺"GET 值不区分大小写"）：http_serve 已对整个
+                // query 小写（:288），此处再归一是兜底自洽——过滤点不依赖上游顺序
+                let want = st.to_ascii_lowercase();
                 rooms
                     .into_iter()
-                    .filter(|r| r.state.to_ascii_lowercase().contains(st))
+                    .filter(|r| r.state.contains(want.as_str()))
                     .collect::<Vec<_>>()
             } else {
                 rooms

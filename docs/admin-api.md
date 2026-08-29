@@ -54,7 +54,7 @@
 | 端点 | 阶段 | 状态 | 说明 |
 |---|---|---|---|
 | `GET /` | 0 | ✅ | 端点清单 |
-| `GET /rooms` | 0 | ✅ | 公开房间列表（隐私过滤，`hidden_prefixes`）；**2026-08 对齐外部标准格式**：`{rooms:[{roomid, cycle, lock, host:{name,id}, state, chart:{name,id}, players:[{name,id}]}], total}`——`total`=服务器在线玩家总数（含未进房），`state` 三态 `select_chart`/`playing`/`wait_for_ready`，id 统一 int，monitor 不进 `players`，未选图 `chart=null`，名字渲染时经 SessionRegistry 解析（未注册→null） |
+| `GET /rooms` | 0 | ✅ | 公开房间列表（隐私过滤，`hidden_prefixes`）；**2026-08 对齐外部标准格式**：`{rooms:[{roomid, cycle, lock, host:{name,id}, state, chart:{name,id}, players:[{name,id}]}], total}`——`total`=已鉴权在线会话总数（**含未进房玩家与 monitor 观战者**，口径 = SessionSink 全量在线，不等于各房 `players` 之和），`state` 三态 `select_chart`/`playing`/`wait_for_ready`，id 统一 int，monitor 不进 `players`，未选图 `chart=null`，名字渲染时经 SessionRegistry 解析（未注册→null） |
 | `GET /healthz` | 0 | ✅ | 测活 + Metrics 暴露（B3） |
 | `GET /admin/rooms?state=` | 1 | ✅ 本轮 | 房间列表（与 `/rooms` 同构的标准 JSON 数组）+ 状态过滤（`select_chart`/`playing`/`wait_for_ready`；GET 值不区分大小写，含子串匹配；不传 = 全部） |
 | `GET /admin/rooms/{id}` | 1 | ✅ 本轮 | 单房详情（同标准 JSON；不存在 → 404） |
