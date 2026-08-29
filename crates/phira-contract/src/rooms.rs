@@ -589,7 +589,10 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
     // 被结算（aborted）后重试上报 → 幂等静默 Ok（ADR-0013；aborted 幂等锁位——
     // 成绩以首条为准，重复上报不改变状态、无成绩可再取）
     let (resp, events) = room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
-    assert!(matches!(resp, Some(RoomResponse::Ok)), "aborted 后重试应静默成功");
+    assert!(
+        matches!(resp, Some(RoomResponse::Ok)),
+        "aborted 后重试应静默成功"
+    );
     assert!(events.is_empty(), "幂等重放不应产出事件: {events:?}");
 
     // —— 全员完成 → GameEnd（§6.5-11；user3 受理 + 回注触发结算）——

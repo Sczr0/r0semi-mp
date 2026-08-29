@@ -2065,15 +2065,27 @@ mod tests {
             let hi = (i >> 16) as u16;
             let lo = (i & 0xffff) as u16;
             let ip: std::net::IpAddr = format!("2001:db8:0:0:{hi:x}:{lo:x}:0:0").parse().unwrap();
-            telemetry.record(ip, base + Duration::from_secs(1) + Duration::from_secs(i as u64));
+            telemetry.record(
+                ip,
+                base + Duration::from_secs(1) + Duration::from_secs(i as u64),
+            );
         }
-        assert!(telemetry.len() <= RESET_MAX_IPS, "IP 数必须受 RESET_MAX_IPS 约束");
+        assert!(
+            telemetry.len() <= RESET_MAX_IPS,
+            "IP 数必须受 RESET_MAX_IPS 约束"
+        );
         // 每 IP 计数也有上限（单 IP 洪水不撑爆）
         let flood: std::net::IpAddr = "198.51.100.1".parse().unwrap();
         for i in 0..(RESET_MAX_PER_IP * 4) {
-            telemetry.record(flood, base + Duration::from_secs(1) + Duration::from_secs(i as u64));
+            telemetry.record(
+                flood,
+                base + Duration::from_secs(1) + Duration::from_secs(i as u64),
+            );
         }
-        assert!(telemetry.count(flood) <= RESET_MAX_PER_IP, "单 IP 计数必须受 RESET_MAX_PER_IP 约束");
+        assert!(
+            telemetry.count(flood) <= RESET_MAX_PER_IP,
+            "单 IP 计数必须受 RESET_MAX_PER_IP 约束"
+        );
     }
 
     /// C-02：心跳恢复判定（纯函数）——濒危窗口（≥ HEARTBEAT_STALE_MARK）触发恢复日志；
