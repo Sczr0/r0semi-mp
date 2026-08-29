@@ -1,0 +1,63 @@
+# r0semi-mp 服务器配置样例（server_config.example.yml）
+#
+# 用法：复制为 server_config.yml（与二进制同目录，或 `R0SEMI_MP_CONFIG` 指定路径）。
+# 全部字段都有默认值，只写要覆盖的即可；本文件展示所有可配项与默认值。
+# 配置热重载（config_poll_interval 周期轮询）；环境变量可覆盖文件（见文末）。
+# 字段集合与 crates/phira-core/src/config.rs 的 YamlConfig 严格一致（2026-08 核对）。
+
+# 监听地址（默认 "0.0.0.0:12346"——IPv4 通配，原版默认端口）。
+listen: "0.0.0.0:12346"
+
+# 官方 API 基地址（回源谱面/成绩，阶段 4 TLS 已解锁）。
+api_base: "https://phira.5wyxi.com"
+
+# 观战者白名单（§6.5-4；默认 [2]）。
+monitors: [2]
+
+# 断线重连窗口（秒；非对局，默认 10）。
+reconnect_window: 10
+
+# 对局中断线重连窗口（秒；C-03/ADR-0012，默认 60）。
+# 对局中掉线不再 10s 即弃赛：core 命令化查询房间状态，Playing 用本值，其余用 reconnect_window。
+playing_reconnect_window: 60
+
+# 鉴权阶段超时（秒；C-01，默认 10）。
+# 版本字节确认后→鉴权完成之间的硬上限——未鉴权连接无法靠持续发包无限挂占准入额度。
+auth_timeout: 10
+
+# 回源 HTTP 请求超时（秒；默认 5）。
+http_timeout: 5
+
+# 停机维护宽限窗口（秒；默认 10）。
+maintenance_grace: 10
+
+# 配置文件轮询间隔（秒；默认 2）。
+config_poll_interval: 2
+
+# 停机维护通知文案（§11 系统 Chat）。
+maintenance_notice: "服务器维护中，房间即将关闭，请稍后再来"
+
+# 进服欢迎语（鉴权成功后广播给本人，user=0 系统消息；不配 = 不发）。
+# welcome_message: "欢迎来到 r0semi-mp"
+
+# 私密房间 id 前缀（房间列表 /rooms 不展示这些房间；不配 = 全部展示）。
+# hidden_room_prefixes: ["solo"]
+
+# 管理 HTTP 端口（/healthz + /rooms + /admin/*；不配 = 不开启）。
+# http_port: 8080
+
+# PROXY protocol（反代后真实 IP，每 IP 限额才有效；true = 所有连接必须先发 PROXY 头）。
+# proxy_protocol: false
+
+# 管理面 Bearer token（/admin/* 需要 `Authorization: Bearer <token>`；不配 = 管理面禁用）。
+# admin_token: "changeme"
+
+# 管理面持久化目录（bans.json / audit.jsonl / config 快照，自动创建；默认 "./data"）。
+persist_dir: "./data"
+
+# —— 环境变量覆盖（优先级高于文件）——
+# R0SEMI_MP_PORT         监听端口
+# R0SEMI_MP_API_BASE     官方 API 基地址
+# R0SEMI_MP_CONFIG       配置文件路径（默认 server_config.yml）
+# R0SEMI_MP_ADMIN_TOKEN  管理面 token
+# R0SEMI_MP_PERSIST_DIR  持久化目录

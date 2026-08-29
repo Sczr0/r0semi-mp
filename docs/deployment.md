@@ -15,12 +15,16 @@ cargo build --release -p phira-server
 
 ## 2. 服务器配置（server_config.yml，与二进制同目录）
 
+完整样例见仓库根 `server_config.example.yml`（每项含默认值注释，2026-08 与代码对齐）：
+
 ```yaml
 # 可选——全部字段都有默认值；只写要覆盖的
 listen: "0.0.0.0:12346"
 api_base: "https://phira.5wyxi.com"   # 回源官方（阶段 4 TLS 已解锁）
 monitors: [2]                          # 观战者白名单（§6.5-4）
-reconnect_window: 10                   # 断线重连窗口（秒）
+reconnect_window: 10                   # 断线重连窗口（秒；非对局，默认 10）
+playing_reconnect_window: 60          # 对局中断线重连窗口（秒；C-03/ADR-0012，默认 60）
+auth_timeout: 10                       # 鉴权阶段超时（秒；C-01，默认 10）
 http_timeout: 5                        # 回源 HTTP 超时（秒）
 maintenance_grace: 10                  # 停机宽限窗口（秒）
 config_poll_interval: 2                # 配置文件轮询（秒）
@@ -28,6 +32,9 @@ maintenance_notice: "服务器维护中，房间即将关闭，请稍后再来"
 persist_dir: "./data"                 # 管理面持久化目录（bans/audit/config 快照，自动创建）
 admin_token: "changeme"               # 管理面 Bearer token（不配 = 管理面整体禁用）
 http_port: 8080                        # 管理 HTTP 端口（/healthz + /rooms + /admin/*）
+# welcome_message: "欢迎语"           # 进服欢迎语（不配 = 不发）
+# hidden_room_prefixes: ["solo"]      # 私密房间前缀（/rooms 不展示）
+# proxy_protocol: false               # PROXY protocol（反代真实 IP）
 ```
 
 > 环境变量覆盖文件：`R0SEMI_MP_PORT` / `R0SEMI_MP_API_BASE` / `R0SEMI_MP_CONFIG`（文件路径）
