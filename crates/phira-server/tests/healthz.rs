@@ -195,7 +195,10 @@ async fn healthz_exposes_bus_metrics() {
 async fn rooms_endpoint_still_works() {
     let resp = http_get(test_ctx(), "/rooms").await;
     assert!(resp.contains("200 OK"), "状态行: {resp}");
-    assert!(resp.contains("[]"), "空房间列表: {resp}");
+    assert!(
+        resp.contains("{\"rooms\":[],\"total\":0}"),
+        "标准外层 {{rooms,total}} 空列表: {resp}"
+    );
 }
 
 #[tokio::test]
@@ -247,12 +250,14 @@ async fn admin_rooms_list_with_state_filter() {
     )
     .await;
 
-    // 全量列表：两房都在，含 cycle 字段（阶段 1 详情字段）
+    // 全量列表：两房都在，含标准字段（cycle/lock/roomid，2026-08 对齐格式）
     let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/rooms", "").await;
     assert!(resp.contains("200 OK"), "状态行: {resp}");
-    assert!(resp.contains("\"r1\""), "r1 在列表: {resp}");
-    assert!(resp.contains("\"r2\""), "r2 在列表: {resp}");
+    assert!(resp.contains("\"roomid\":\"r1\""), "r1 在列表: {resp}");
+    assert!(resp.contains("\"roomid\":\"r2\""), "r2 在列表: {resp}");
     assert!(resp.contains("\"cycle\":false"), "cycle 字段存在: {resp}");
+    assert!(resp.contains("\"lock\":false"), "lock 字段存在: {resp}");
+    assert!(resp.contains("\"players\":[{"), "players 名单渲染: {resp}");
 
     // state 过滤：play 只留 r2（子串 + 大小写不敏感）
     let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/rooms?state=play", "").await;
@@ -264,13 +269,13 @@ async fn admin_rooms_list_with_state_filter() {
     let resp = http_admin(
         Arc::clone(&ctx),
         "GET",
-        "/admin/rooms?state=selectchart",
+        "/admin/rooms?state=select_chart",
         "",
     )
     .await;
     assert!(
         resp.contains("\"r1\"") && !resp.contains("\"r2\""),
-        "selectchart 过滤: {resp}"
+        "select_chart 过滤: {resp}"
     );
 }
 
@@ -288,8 +293,12 @@ async fn admin_room_detail_and_404() {
 
     let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/rooms/solo-1", "").await;
     assert!(resp.contains("200 OK"), "状态行: {resp}");
-    assert!(resp.contains("\"id\":\"solo-1\""), "id: {resp}");
-    assert!(resp.contains("\"host\":7"), "host: {resp}");
+    assert!(resp.contains("\"roomid\":\"solo-1\""), "roomid: {resp}");
+    assert!(
+        resp.contains("\"host\":{\"id\":7,\"name\":null}"),
+        "host 对象（未注册名字 → null；serde_json 键序字典序）: {resp}"
+    );
+    assert!(resp.contains("\"state\":\"select_chart\""), "三态: {resp}");
 
     let resp = http_admin(Arc::clone(&ctx), "GET", "/admin/rooms/nope", "").await;
     assert!(resp.contains("404 Not Found"), "不存在应 404: {resp}");

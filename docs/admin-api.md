@@ -54,10 +54,10 @@
 | 端点 | 阶段 | 状态 | 说明 |
 |---|---|---|---|
 | `GET /` | 0 | ✅ | 端点清单 |
-| `GET /rooms` | 0 | ✅ | 公开房间列表（隐私过滤，`hidden_prefixes`） |
+| `GET /rooms` | 0 | ✅ | 公开房间列表（隐私过滤，`hidden_prefixes`）；**2026-08 对齐外部标准格式**：`{rooms:[{roomid, cycle, lock, host:{name,id}, state, chart:{name,id}, players:[{name,id}]}], total}`——`total`=服务器在线玩家总数（含未进房），`state` 三态 `select_chart`/`playing`/`wait_for_ready`，id 统一 int，monitor 不进 `players`，未选图 `chart=null`，名字渲染时经 SessionRegistry 解析（未注册→null） |
 | `GET /healthz` | 0 | ✅ | 测活 + Metrics 暴露（B3） |
-| `GET /admin/rooms?state=` | 1 | ✅ 本轮 | 房间列表 + 状态过滤（playing/waiting/selectchart；GET 值不区分大小写，含子串匹配；不传 = 全部） |
-| `GET /admin/rooms/{id}` | 1 | ✅ 本轮 | 单房详情（RoomInfo + cycle）；不存在 → 404 |
+| `GET /admin/rooms?state=` | 1 | ✅ 本轮 | 房间列表（与 `/rooms` 同构的标准 JSON 数组）+ 状态过滤（`select_chart`/`playing`/`wait_for_ready`；GET 值不区分大小写，含子串匹配；不传 = 全部） |
+| `GET /admin/rooms/{id}` | 1 | ✅ 本轮 | 单房详情（同标准 JSON；不存在 → 404） |
 | `GET /admin/users` | 1 | ✅ 本轮 | 在线用户（id + name + room_id）；name 缺失（未注册）→ null |
 | `GET /admin/metrics` | 1 | ✅ 本轮 | bus Metrics 快照（与 /healthz.metrics 同构） |
 | `POST /admin/rooms/{id}/kick` | 2 | ✅ 本轮 | 系统命令 `AdminKick`（复用 evict；不断 TCP）+ 审计 |
@@ -69,11 +69,12 @@
 | `POST /admin/config/rollback` | 3 | ✅ 本轮 | 一步回切上一份（取走即清空，二次回滚 409）+ 审计 |
 | `POST /admin/observers {kind,op}` | 3 | ✅ 本轮 | observer 热插拔：`kind:"ban"`（BanObserver）add/remove 幂等；其它 kind 400 + 审计 |
 
-**阶段 1 已知限制（诚实记录）**：
-- `/admin/rooms/{id}` 详情目前 = RoomInfo（id/host/users/state/locked/cycle）；
-  **成员名单、谱面难度（level）** 列阶段 2 数据源扩展（RoomListSink 记录成员）；
+**阶段 1 已知限制（诚实记录，2026-08 部分清偿）**：
+- ~~`/admin/rooms/{id}` 详情目前 = RoomInfo（id/host/users/state/locked/cycle）；成员名单……~~
+  **已清偿（2026-08）**：成员名单（`players`，不含 monitor）与谱面（`chart` name+id）
+  已进标准格式；**谱面难度（level）仍缺**（回源才有，留数据源扩展）；
 - `/admin/users` 暂不含 lang/队列状态（SessionSink 未暴露），阶段 2 补；
-- 状态过滤的匹配对象是 RoomListSink 的状态字符串（`SelectChart(1)` 等），
+- 状态过滤的匹配对象是三态 snake_case 字符串（`select_chart` 等），
   子串语义已够面板用。
 
 ## 5. 演进路线（每阶段独立上线、可验收）

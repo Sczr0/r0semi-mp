@@ -160,22 +160,29 @@ async fn accept_loop(listener: TcpListener, ctx: Arc<ConnContext>) {
     }
 }
 
-/// 管理 HTTP accept 循环（独立端口，§运营：/rooms；http_port 未配置时立即结束）。
-/// 房间列表快照项（§运营：公开房间列表，`/rooms` HTTP 端点返回）。
-#[derive(Debug, Clone, serde::Serialize)]
+/// 房间列表快照项（§运营：公开房间列表，`/rooms` HTTP 端点返回；管理读面共用）。
+///
+/// 2026-08 对齐公开房间列表标准格式（用户拍板：id 统一 int、monitor 不进名单）：
+/// `roomid`/`lock`/`host{name,id}`/`state`(select_chart|playing|wait_for_ready)/
+/// `chart{name,id}`/`players[{name,id}]`。本结构只存事实（id 集合 + 谱面 + 三态）；
+/// 名字在渲染时经 `SessionRegistry` 解析（admin.rs `room_json`）——存活期成立：
+/// `evict_name` 发生在 `UserLeft` 之后（lifecycle.rs，ISSUE-0012）。
+#[derive(Debug, Clone)]
 pub struct RoomInfo {
     /// 房间 id。
     pub id: String,
     /// 房主用户 id。
     pub host: i32,
-    /// 当前人数。
-    pub users: usize,
-    /// 房间状态。
-    pub state: String,
+    /// 房间状态（三态 snake_case：`select_chart` / `playing` / `wait_for_ready`）。
+    pub state: &'static str,
     /// 是否锁定。
     pub locked: bool,
     /// 循环对局（admin 详情用，阶段 1：RoomListSink 维护 CycleRoom 事件）。
     pub cycle: bool,
+    /// 玩家 id 名单（加入序；**不含 monitor**——观察者不是玩家，2026-08 拍板）。
+    pub players: Vec<i32>,
+    /// 当前谱面（`SelectChart` 事件记录 name+id；`GameEnd`/`CancelGame(None)` 清空）。
+    pub chart: Option<(String, i32)>,
 }
 
 /// 房间列表观察者（§7.3 观察者模式）：订阅事件维护活动房间快照。
@@ -224,10 +231,11 @@ impl EventSink for RoomListSink {
                         RoomInfo {
                             id: room_id.as_str().to_owned(),
                             host: *host,
-                            users: 1,
-                            state: "SelectChart".to_owned(),
+                            state: "select_chart",
                             locked: false,
                             cycle: false,
+                            players: vec![*host],
+                            chart: None,
                         },
                     );
                 }
@@ -235,14 +243,17 @@ impl EventSink for RoomListSink {
             E::RoomClosed { room_id } => {
                 self.rooms.write().await.remove(room_id);
             }
-            E::UserJoined { room_id, .. } => {
-                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.users += 1;
+            E::UserJoined { room_id, user } => {
+                // monitor 不进 players（观察者不是玩家，2026-08 拍板）
+                if let Some(r) = self.rooms.write().await.get_mut(room_id)
+                    && !user.monitor
+                {
+                    r.players.push(user.id);
                 }
             }
-            E::UserLeft { room_id, .. } => {
+            E::UserLeft { room_id, user, .. } => {
                 if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.users = r.users.saturating_sub(1);
+                    r.players.retain(|p| p != user);
                 }
             }
             E::NewHost {
@@ -252,27 +263,31 @@ impl EventSink for RoomListSink {
                     r.host = *new_host;
                 }
             }
-            E::SelectChart { room_id, id, .. } => {
+            E::SelectChart {
+                room_id, name, id, ..
+            } => {
                 if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.state = format!("SelectChart({id})");
+                    r.state = "select_chart";
+                    r.chart = Some((name.clone(), *id));
                 }
             }
             E::GameStart { room_id, .. } => {
                 if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    "WaitingForReady".clone_into(&mut r.state);
+                    r.state = "wait_for_ready";
                 }
             }
             E::StartPlaying { room_id } => {
                 if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    "Playing".clone_into(&mut r.state);
+                    r.state = "playing";
                 }
             }
             E::GameEnd { room_id, chart } | E::CancelGame { room_id, chart, .. } => {
                 if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.state = match chart {
-                        Some(id) => format!("SelectChart({id})"),
-                        None => "SelectChart".to_owned(),
-                    };
+                    r.state = "select_chart";
+                    // 谱面保留（Some(id) 与存量一致）；None = 图已被取消 → 清空
+                    if chart.is_none() {
+                        r.chart = None;
+                    }
                 }
             }
             E::LockRoom { room_id, lock } => {
@@ -285,7 +300,7 @@ impl EventSink for RoomListSink {
                     r.cycle = *cycle;
                 }
             }
-            // 热路径（RelayTouches/Judges）与不改变列表展示的（Chat/Ready/Played/Abort/CycleRoom）
+            // 热路径（RelayTouches/Judges）与不改变列表展示的（Chat/Ready/Played/Abort）
             // 不更新快照
             _ => {}
         }

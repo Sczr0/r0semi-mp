@@ -2,6 +2,7 @@
 
 > 对象：`phira-mp`（原版）· `gooophira-mp`（Go）· `phira-mp-nodejsver`（TS/Node）· `jphira-mp`（Java/netty）· `r0semi-mp`（本仓库，Rust 重写）。
 > 方法：2026-08-27 对五个本地副本的**源码实证审计**（每条关键结论附证据路径），非 README 转述；README 自述与代码不符处单独标注。
+> **2026-08-29 复核更新**：四家对照副本未漂移（本地 HEAD 2026-05-31 ~ 2026-08-01，工作区干净），r0semi 一列数据全量重测并重写（行数/依赖/测试数/能力面均为当日实测，口径见 §7）。
 > 姊妹篇：`competitor-review.md`（12 维度 + 经验吸收矩阵，以 r0semi 为中心的视角）；本文是对等的五家全景画像——各自是谁、强在哪、弱在哪、适合谁。
 
 ---
@@ -12,7 +13,7 @@
 - **gooophira-mp 赢在"现在"**：功能密度五家第一——.phirarec 回放录制、SQLite 统计、Redis 共享、OTP 管理台、runtime-config rollback、飞书/Discord webhook、真客户端怪癖补偿库。代价是 4.4 万行 Go 单体 + 两级锁的复杂度，且作者自述"AI 赶工、不建议生产使用"。
 - **phira-mp-nodejsver 赢在"门槛最低 + 溯源最认真"**：逐行标注原版源码行号，插件 SDK 类型独立发布，README 性能数据漂亮（自报未验证）。短板是单事件循环无背压，且 README 承诺的 8 个内置插件并不随仓库分发。
 - **jphira-mp 赢在"Java 生态嵌入 + 5 分钟挂起恢复"**：netty pipeline 分阶段 handler 是教科书式结构，JitPack 一行引入当库用。短板是静态全局单例遍布与其"可嵌入"定位自相矛盾，且协议在外部库中不可见。
-- **r0semi-mp 赢在"以后"**：唯一把"内存可量化（实测 RSS 4.3–5.2MB）、对抗性输入可证明（fuzz+守卫）、可替换性可机器验证（check-deps+契约测试）"三件事做成 CI 资产的实现；功能面刻意窄（无回放/管理台/持久化是显式非目标）。
+- **r0semi-mp 赢在"以后"，且"以后"正在到账（2026-08-29 复核）**：08-27 审计后的两天里，管理 API 全家桶（只读观测 + 写面干预 + Bearer 认证 + 审计环 + runtime-config 一步回滚 + observer 热插拔 + 管理事实持久化）、反作弊三件套（谱面匹配 / 跨房 record 重放检测 / 成绩频率观测）、CPU 优化线（读侧合读每帧 -49%）与真客户端 SDK 一致性测试（conformance.rs）全部落地；仍是唯一把"内存可量化（实测 RSS 4.3–5.2MB）、对抗性输入可证明（fuzz+守卫）、可替换性可机器验证（check-deps+契约测试）"三件事做成 CI 资产的实现。剩余显式非目标：回放录制 / Redis / 联邦 / Web 面板。
 
 ---
 
@@ -21,13 +22,13 @@
 | | 原版 phira-mp | gooophira-mp | phira-mp-nodejsver | jphira-mp | r0semi-mp |
 |---|---|---|---|---|---|
 | 语言/运行时 | Rust/tokio | Go 1.26 | TypeScript/Node 18+ | Java 17(推21)/netty 4.2.3 | Rust/tokio (edition 2024) |
-| 规模 | **3003 行**（server 1369 / common 812 / client 579 / macros 243） | **44171 行**（288 文件；测试 15407 行 ≈35%） | src **8683 行**（29 文件）+ test 1275 行 | main **8242 行**（105 文件）+ test 4876 行 | **17552 行**（api 2872 / core 4154 / impl-v1 974 / contract 1472 / server 8080，含测试） |
-| 依赖面 | Cargo.lock **325 包**（reqwest 全家桶） | go.mod 直依 9 个（redis/sqlite/larksuite…） | 运行时直依仅 **6 个**（express/ws/js-yaml…） | netty×3 + log4j2×5 + guava/caffeine/orbit/zstd-jni + 外部协议库 | Cargo.lock **118 包**（原版的 36%；手写 HTTP/1.1 替代 reqwest） |
+| 规模 | **3003 行**（server 1369 / common 812 / client 579 / macros 243） | **44171 行**（288 文件；测试 15407 行 ≈35%） | src **8683 行**（29 文件）+ test 1275 行 | main **8242 行**（105 文件）+ test 4876 行 | **21642 行**（api 2577 / core 4771 / impl-v1 1020 / contract 1847 / server 11427，含测试；08-29 实测） |
+| 依赖面 | Cargo.lock **325 包**（reqwest 全家桶） | go.mod 直依 9 个（redis/sqlite/larksuite…） | 运行时直依仅 **6 个**（express/ws/js-yaml…） | netty×3 + log4j2×5 + guava/caffeine/orbit/zstd-jni + 外部协议库 | Cargo.lock **203 包**（= 运行时 118 包不变【原版的 36%】+ 真 SDK conformance dev 树 85 包；全 lock 无 reqwest，手写 HTTP/1.1） |
 | 血统 | 本体 | 语义复刻（命令一一对应） | 逐行移植（源码行号注释） | 协议复刻在独立外部库 | 只复刻 common 协议语义，内部架构全新 |
-| 测试 | 几乎无 | 90 文件 + 4 处 bench，CI `-race` | jest 16 文件，eslint 偏松 | 27 文件，JUnit5 + Mock 基建 | ~200 测试函数（含契约/fuzz/压测），6 道 CI 闸门 |
-| CI | 无 | ci.yml：vet + test -race + 12 平台交叉编译 | test.yml：Node 18/20/22 矩阵 | test.yml + 自动 pre-release | fmt/clippy pedantic/check-deps(+ADR连续性)/test/cargo-deny/semver 六闸门 |
-| 运营面 | 无 | 完整（OTP/ban/runtime-config/console WS/web GUI） | dashboard 插件默认关（不随仓库分发） | 无 | `/rooms` + `/healthz` 极简 |
-| 持久化 | 无 | SQLite 6 表 + Redis 缓存降级 | 封禁 IP/ID 持久化文件 | 无（内存态；回放 zstd 压缩存盘） | 无（v1 显式全内存态） |
+| 测试 | 几乎无 | 90 文件 + 4 处 bench，CI `-race` | jest 16 文件，eslint 偏松 | 27 文件，JUnit5 + Mock 基建 | 242 测试函数（含契约/fuzz/压测/真 SDK conformance），6 道 CI 闸门 |
+| CI | 无 | ci.yml：vet + test -race + 12 平台交叉编译 | test.yml：Node 18/20/22 矩阵 | test.yml + 自动 pre-release | fmt/clippy pedantic/check-deps(+ADR连续性)/test/cargo-deny/semver 六闸门 + nightly musl 产物发布 + flamegraph 采样 workflow（手动） |
+| 运营面 | 无 | 完整（OTP/ban/runtime-config/console WS/web GUI） | dashboard 插件默认关（不随仓库分发） | 无 | `/rooms` `/healthz` + **`/admin/*` 全家桶**（只读观测/写面干预/Bearer 认证/审计环/runtime-config 回滚/observer 热插拔；无 OTP/Web GUI——刻意取舍） |
+| 持久化 | 无 | SQLite 6 表 + Redis 缓存降级 | 封禁 IP/ID 持久化文件 | 无（内存态；回放 zstd 压缩存盘） | 管理事实文件持久化（bans/audit/config 快照，tmp+rename 原子写 + fail soft）；房间/会话态仍内存（关服清空是特性） |
 
 ---
 
@@ -44,7 +45,7 @@ commands.go   Commands.ts        jphira-mp-protocol  phira-api/src/*
  与原版一一对应"  :157-178"逐条溯源    (2.2.1, 本地未见)   + 契约测试钉死
 ```
 
-四家衍生都指向同一权威：原版 `phira-mp-common`。区别在**忠实策略**——gooophira 和 nodejsver 把自己当"移植"，逐条对齐；jphira 把协议下沉外部库（本仓库审计不到）；r0semi 把协议升格为带契约测试的独立 crate（`phira-contract/src/rooms.rs` 里"任何实现必须通过"的用例集）。另外原版的 `phira-mp-client` crate 不是测试桩而是**真客户端集成用的同一套 SDK**（525 行，oneshot 回调 API + SRV 解析），这给所有实现提供了字节级对称参照——r0semi 的 `client-conformance.md` 正是打算拿它做可执行一致性断言。
+四家衍生都指向同一权威：原版 `phira-mp-common`。区别在**忠实策略**——gooophira 和 nodejsver 把自己当"移植"，逐条对齐；jphira 把协议下沉外部库（本仓库审计不到）；r0semi 把协议升格为带契约测试的独立 crate（`phira-contract/src/rooms.rs` 里"任何实现必须通过"的用例集）。另外原版的 `phira-mp-client` crate 不是测试桩而是**真客户端集成用的同一套 SDK**（525 行，oneshot 回调 API + SRV 解析），这给所有实现提供了字节级对称参照——r0semi 已把它做成可执行一致性断言：`phira-server/tests/conformance.rs` 以游戏客户端 Cargo.toml 锁定的同一 rev（cc822df）真 SDK 为对端跑 A1–A6 崩溃猎手剧本（2026-08 落地）。
 
 ---
 
@@ -117,21 +118,27 @@ commands.go   Commands.ts        jphira-mp-protocol  phira-api/src/*
 
 ### 3.5 r0semi-mp —— 把正确性变成 CI 资产
 
-**架构（五家唯一"契约分层"）**：`phira-api`（货架规格：non_exhaustive 枚举 + trait，**零 tokio**，deps 仅 thiserror/half/async-trait——已验证 crates/phira-api/Cargo.toml）← `phira-core`（柜台：总线/会话/生命周期，禁 unwrap/expect）← `impl-rooms-v1`（货物，**连 core 都不许认识**）← `phira-server`（老板/组合根，唯一认识所有人）。依赖方向由 `tools/check-deps.py` ALLOW 表物理强制进 CI；换实现 = 组合根换工厂 + `phira-contract/src/rooms.rs` 契约测试全绿。11 个 ADR 沉淀每个决策（0001 actor 并发 … 0011 事件插座）。
+**架构（五家唯一"契约分层"）**：`phira-api`（货架规格：non_exhaustive 枚举 + trait，**零 tokio**，deps 仅 thiserror/half/async-trait——已验证 crates/phira-api/Cargo.toml）← `phira-core`（柜台：总线/会话/生命周期，禁 unwrap/expect）← `impl-rooms-v1`（货物，**连 core 都不许认识**）← `phira-server`（老板/组合根，唯一认识所有人）。依赖方向由 `tools/check-deps.py` ALLOW 表物理强制进 CI；换实现 = 组合根换工厂 + `phira-contract/src/rooms.rs` 契约测试全绿。11 个 ADR 沉淀每个决策（0001 actor 并发 … 0011 事件插座）。组合根拆分（C1）已启动：admin.rs / storage.rs 自 server.rs 上帝文件抽出（2026-08-28）。
 
-**并发宪法**：每房间一个 actor + 有界 mpsc(1024) 串行 + actor 内 `&mut self` 零锁；队列压力三级分类——热路径 DropIfFull（丢新保活）、生命周期事实 Wait、其余 Reject（ADR-0005）；时间/连接事实全部命令化（Tick/UserDisconnected/UserDangleExpired），生命周期任务单一生产者派发，impl 层禁止开后台任务。热路径编码一次：EncodeCache 帧 Arc 指针缓存（条目钉住源 Arc 防 ABA，ADR-0009）+ Outbound::Encoded 直写。
+**并发宪法**：每房间一个 actor + 有界 mpsc(1024) 串行 + actor 内 `&mut self` 零锁；队列压力三级分类——热路径 DropIfFull（丢新保活）、生命周期事实 Wait、其余 Reject（ADR-0005）；时间/连接事实全部命令化（Tick/UserDisconnected/UserDangleExpired），生命周期任务单一生产者派发，impl 层禁止开后台任务。热路径编码一次：EncodeCache 帧 Arc 指针缓存（条目钉住源 Arc 防 ABA，ADR-0009）+ Outbound::Encoded 直写。08-27 审计后 CPU 优化线三项落地：写批处理（`recv_many` 攒 64 帧一次 `write_all`）、Metrics 热路径无锁化（Touches/Judges 单原子计数，锁帧归零）、读侧合读（4KiB pending 缓冲 + 游标消费，A/B 对拍每帧 CPU 66.1→33.4µs，**-49%**）。
 
-**资源红线写成常量并可验证**：全局在途字节 `MEMORY_GUARD_LIMIT = 64MiB`（server.rs:434）+ 每连接 sendq `PER_CONN_MEM_LIMIT = 8MiB`（:437，超限踢）+ 已鉴权连接上限 1000，三层 charge/consume/Drop-guard 记账平衡（tests/memory_guard.rs 盯着）；**两段式帧上限**是五家唯一：`PRE_AUTH_MAX_PACKET=4KiB`（stream.rs:83）鉴权通过才 `store(MAX_PACKET_SIZE=2MiB)`（:1462）——未鉴权内存放大系数限到 1/500。
+**资源红线写成常量并可验证**：全局在途字节 `MEMORY_GUARD_LIMIT = 64MiB`（server.rs:761）+ 每连接 sendq `PER_CONN_MEM_LIMIT = 8MiB`（:764，超限踢）+ 已鉴权连接上限 1000，三层 charge/consume/Drop-guard 记账平衡（tests/memory_guard.rs 盯着）；**两段式帧上限**是五家唯一：`PRE_AUTH_MAX_PACKET=4KiB`（stream.rs:83）鉴权通过才 `store(MAX_PACKET_SIZE=2MiB)`（server.rs:1709）——未鉴权内存放大系数限到 1/500。读侧 payload 窗口亦已入账（ReadCharge → 全局 64MiB 闸门，Drop guard 兜底任何退出路径）——账外区域闭合，"声明 2MiB 帧"洪水在读路径即被闸住。
 
-**输入防御纵深**：ULEB 移位 ≥64 直接 Err；类型级约束 `Varchar<32>/<200>` + RoomId 字符白名单；双层 fuzz（解码器 proptest 固定种子 + fuzz_frames 真 TCP 垃圾流）；压测 harness 入库（tests/pressure.rs，回环 1500 连接 ~1.5–2.3Gbps 0 panic 0 内存膨胀，负载 29@2核暴露 CPU 小包处理为真实瓶颈——ARCHITECTURE §10.1.1）。
+**输入防御纵深**：ULEB 移位 ≥64 直接 Err；类型级约束 `Varchar<32>/<200>` + RoomId 字符白名单；双层 fuzz（解码器 proptest 固定种子 + fuzz_frames 真 TCP 垃圾流）；读侧合读的 pending 缓冲上界即 4KiB 读缓冲（不随输入增长），垃圾流下内存恒定；压测 harness 入库（tests/pressure.rs，回环 1500 连接 ~1.5–2.3Gbps 0 panic 0 内存膨胀，负载 29@2核暴露 CPU 小包处理为真实瓶颈——ARCHITECTURE §10.1.1）。
 
-**鉴权链路**：手写 HTTP/1.1 GET（http:// 明文供 Oracle 环境 / https:// rustls 单栈 ring+webpki-roots），TLS 配置进程级 OnceLock 单例（对比原版每请求新建 reqwest Client）；回源 5s 超时；token 先过 CR/LF 净化再拼 Authorization 头（http.rs:252 起 "Never Trust the Client"）——鉴权上游同为 `https://phira.5wyxi.com` 但基址集中配置。
+**鉴权链路**：手写 HTTP/1.1 GET（http:// 明文供 Oracle 环境 / https:// rustls 单栈 ring+webpki-roots），TLS 配置进程级 OnceLock 单例（对比原版每请求新建 reqwest Client）；回源 5s 超时；token 先过 CR/LF 净化再拼 Authorization 头（http.rs "Never Trust the Client"）——鉴权上游同为 `https://phira.5wyxi.com` 但基址集中配置。08-28 加固两连：302 有限跟随（同 host 白名单 + 3 跳上限，显式拒绝 30x）、响应体 16MiB 上限。
 
-**重连/顶号语义**：session epoch——新鉴权 register 即 epoch+1，派发前校验 `current_epoch(user_id)==state.epoch` 否则拒绝 + force_close（ISSUE-0009 已修，tests/stale_connection.rs 回归）；路由 miss 重放 3×20ms 防幽灵座位（ADR-0007）；`reconnect_window` 可配（默认 10s，config.rs:52）；贵命令每连接限速 CreateRoom 1/s、JoinRoom/SelectChart/Played 5/s 超限 TooManyRequests（ADR-0008）。近期已落：Tick 通电的 WaitForReady 60s 强开倒计时（对照 gooophira 语义）+ 业务错误按用户 language 本地化（对照原版 Fluent 方案，契约零变更）——competitor-review 中"B1 Tick 空壳/i18n 英文硬编码"两条短板已成历史。
+**重连/顶号语义**：session epoch——新鉴权 register 即 epoch+1，派发前校验 `current_epoch(user_id)==state.epoch` 否则拒绝 + force_close（ISSUE-0009 已修，tests/stale_connection.rs 回归）；路由 miss 重放 3×20ms 防幽灵座位（ADR-0007）；`reconnect_window` 可配（默认 10s，config.rs:58）；贵命令每连接限速 CreateRoom 1/s、JoinRoom/SelectChart/Played 5/s 超限 TooManyRequests（ADR-0008）。近期已落：Tick 通电的 WaitForReady 60s 强开倒计时（对照 gooophira 语义）+ 业务错误按用户 language 本地化（对照原版 Fluent 方案，契约零变更）——competitor-review 中"B1 Tick 空壳/i18n 英文硬编码"两条短板已成历史。
 
-**实测成绩**：量产稳态 RSS **4.3–5.2MB / 峰值 4.6–5.4MB**（低于 7–15MB 预算下界），Cargo.lock 118 包 = 原版 36%，且是五家唯一把许可证/漏洞审计（cargo-deny）与契约 semver（cargo-semver-checks）放进 CI 闸门的。
+**管理 API 与持久化（08-27 审计后落地，阶段 0–3.6.1 全绿）**：三职责域 × 三条既有通道——只读观测（`/admin/rooms?state=` 过滤、单房详情、`/admin/users`、`/admin/metrics`）走快照零风险；写面干预（AdminKick/AdminBan/AdminBroadcast/AdminDisconnect 系统命令族，管理动作排队进房间 actor——**通道防竞态，不用锁**）+ 静态 **Bearer 认证**（默认 loopback 绑定）+ 有界审计环（256，持久化 audit.jsonl）；配置域 runtime-config 热更 + **一步 rollback**（跨重启可用，二次回滚 409）+ observer 热插拔（ban / anticheat）。持久化只做"**管理事实**"（bans.json / audit.jsonl / config.current.json / config.last.json，组合根 storage.rs 独占）：tmp+rename 原子写、fail soft、契约/core/impl 零感知；房间/会话态仍内存——"关服清空"是显式特性。对照 gooophira 的刻意取舍：不做 OTP 双步（自建服过重）、不做 Web GUI（面板 = 纯 API 消费方，阶段 4）、不做 WS console（gooophira 的复杂度来源）。
 
-**弱在哪（诚实清单）**：功能面刻意窄——无回放录制、无管理台、无持久化、无 Redis/联邦（v1 显式非目标）；单人项目总线风险；CPU 高频小包是已知未优化瓶颈；真客户端一致性断言在建设中（源码依据已落 `client-behavior-review.md`）。观战聚合缓冲已对照 gooophira MonitorBuffer 落地（commit fef36a1，B6），不再是短板。
+**反作弊三件套（Moderator 契约插座 §7.3 兑现）**：P1 谱面匹配——Record.chart 数据口 + 回注点谱面校验（fail-open 口径与 gooophira 一致）；P2 **AntiCheatObserver 跨房 record 重放检测**——第二个真实 Moderator，同一 record 跨房重投被 Moderated 拒绝（端到端测试钉死），热插拔 `kind=anticheat` + `/admin/anticheat` 读面；R2 成绩频率观测（on_event 面首个真用途）：60s 窗口 ≥10 局 → `high_frequency` flag，纯观测不自动拦。gooophira 的"反作弊诚实地说只做了一半"（谱面 fail-open）在 r0semi 补上了重放检测与频率观测两翼，且观察者接口被第二个实例再次定形。
+
+**真客户端一致性断言（维度 12 兑现）**：`phira-server/tests/conformance.rs` 以**真客户端在用的同一 SDK**（`phira-mp-client`，rev cc822df 与 Phira 游戏客户端 Cargo.toml 锁定对齐）为对端，跑 client-behavior-review §5 的 A1–A6 剧本——"服务端多说话会不会炸客户端"从推理变成测试。dev-dependency 引入 85 包（hickory SRV 解析/moka/icu 等），生产二进制零新增，全 lock 仍无 reqwest；cargo-deny 已加 dev-only hickory 漏洞豁免。
+
+**实测成绩**：量产稳态 RSS **4.3–5.2MB / 峰值 4.6–5.4MB**（低于 7–15MB 预算下界）不变；新增 CPU 维度可复核数据——bench_broadcast 入库（300 客户端 4739 帧/s 全额节奏）+ flamegraph CI workflow（Linux perf 权威复核，collapsed 栈 artifact 可数值对比）+ 同帧率 A/B 对拍：读侧合读使**每帧 CPU 成本 66.1→33.4µs（-49%）**。Cargo.lock 203 包（运行时 118 = 原版 36%），仍是五家唯一把许可证/漏洞审计（cargo-deny）与契约 semver（cargo-semver-checks）放进 CI 闸门的（另加 nightly musl 静态产物自动发布）。
+
+**弱在哪（诚实清单，2026-08-29 复核）**：无回放录制、无 Redis/联邦、无 Web 面板（管理 API 已备，面板属阶段 4，前端刻意不进仓库）；房间态不持久化（关服清空是显式特性）；单人项目总线风险；CPU 优化线已收官（读合读/写批处理/无锁化），剩余为架构级约束（tokio 单 IO driver；记账 SeqCst 属安全锁 A 边界维持不动）；为 encode-once 放弃广播级多语言内容的取舍仍在。真客户端一致性断言已从"在建设中"变为已落地（conformance.rs 真 SDK 剧本）；观战聚合缓冲已对照 gooophira MonitorBuffer 落地（commit fef36a1，B6）；"无管理台/无持久化"两条已从清单移除（管理面阶段 0–3.6.1 + 管理事实持久化落地）。
 
 ---
 
@@ -177,7 +184,7 @@ commands.go   Commands.ts        jphira-mp-protocol  phira-api/src/*
 | gooophira | FetchUserInfo 抽象接口 + integration 实现，端点可配默认同源 | token TTL 6h + Redis 共享 | 500ms 线性退避重试 |
 | nodejsver | GET /me Bearer（config 与 auth.ts 双处 URL 硬编码） | 无明显缓存 | stress_ 虚拟 token 仅非生产 |
 | jphira | PhiraFetcher caffeine 4 缓存 | 结果 10min/万条 | ⚠️ token 明文进日志；插件事件可在上游查询前短路注入 |
-| r0semi | 手写 HTTP/1.1 + rustls 单例配置，基址集中 | 组合根 trait 可替换（AuthHandler） | token CR/LF 净化 + 5s 超时 + 契约层 AuthOutcome |
+| r0semi | 手写 HTTP/1.1 + rustls 单例配置，基址集中 | 组合根 trait 可替换（AuthHandler） | token CR/LF 净化 + 5s 超时 + 契约层 AuthOutcome + 302 有限跟随（同 host 白名单 3 跳）+ 响应体 16MiB 上限 |
 
 ### T5 i18n
 
@@ -196,10 +203,11 @@ commands.go   Commands.ts        jphira-mp-protocol  phira-api/src/*
 | 开房/选图/准备/游玩/观战 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | ready 强制倒计时 | ❌ | ✅ 60s + 播报 + Aborted | 控制台 fstart 命令 | ✅（状态机） | ✅ Tick 60s 强开（对齐 gooophira 语义） |
 | 回放录制 | ❌ | ✅ .phirarec + 上传/下载站 | ❌ | ✅ zstd 存储 | ❌ |
-| 密码/黑白名单房 | ❌ | banroom/kick preserve | 字段有、TCP 通路未见 | 锁房 + host 整体开关 | 封禁属管理域（当前不在范围） |
+| 密码/黑白名单房 | ❌ | banroom/kick preserve | 字段有、TCP 通路未见 | 锁房 + host 整体开关 | ❌（AdminBan 用户封禁已落地；密码/黑白名单房仍不在范围） |
 | 重试幂等 Played | ❌ | ✅ 静默成功 | ❌ | ? | PartOf AlreadyUploaded 语义留档（ISSUE 口径） |
-| 管理 HTTP 面 | ❌ | ✅ 全家桶 + OTP + runtime-config | 依赖未分发插件 | ❌ | /rooms+/healthz 观测 |
-| 持久化 | ❌ | SQLite+Redis | 封禁持久化 | 内存态 | ❌（Store 接口留扩展） |
+| 反作弊 | ❌ | ⚠️ 谱面匹配 fail-open（自述半套） | ❌ | ❌ | ✅ 谱面匹配 + 跨房 record 重放检测 + 成绩频率观测（Moderator 插座 + 热插拔 + /admin/anticheat） |
+| 管理 HTTP 面 | ❌ | ✅ 全家桶 + OTP + runtime-config + Web GUI | 依赖未分发插件 | ❌ | ✅ /admin/* 全家桶（观测+干预+热更回滚+审计持久化；Bearer，无 OTP/Web GUI——刻意） |
+| 持久化 | ❌ | SQLite+Redis | 封禁持久化 | 内存态 | 管理事实文件持久化（bans/audit/config 快照）；房间态内存（显式特性） |
 
 ### T7 工程纪律（CI 会拦什么）
 
@@ -209,24 +217,28 @@ commands.go   Commands.ts        jphira-mp-protocol  phira-api/src/*
 | gooophira | vet only（无 golangci-lint） | go.mod 存档 | 无 | bench 三阶段进 CI、12 平台交叉编译、-race |
 | nodejsver | eslint9 flat（no-explicit-any 仅 warn） | npm audit 未接 CI | 无 | jest 18/20/22 矩阵、pkg 打包 |
 | jphira | 无 lint 闸门 | 无 | 无 | JitPack/shadowJar 发布 |
-| r0semi | clippy **pedantic 全量 -D warnings** + forbid(unsafe) + api missing_docs=deny | ✅ cargo-deny 许可+漏洞 | ✅ cargo-semver-checks + 契约测试 crate | check-deps 依赖方向 + check-adr 编号连续性 + fuzz + 压测入库 |
+| r0semi | clippy **pedantic 全量 -D warnings** + forbid(unsafe) + api missing_docs=deny | ✅ cargo-deny 许可+漏洞 | ✅ cargo-semver-checks + 契约测试 crate | check-deps 依赖方向 + check-adr 编号连续性 + fuzz + 压测/基准入库 + 真客户端 SDK conformance + flamegraph 采样 workflow（手动） |
 
-### T8 性能与资源（有实测的只有一家）
+### T8 性能与资源（有实测的只有一家，且已从"确认瓶颈"走到"完成优化"）
 
-r0semi 是唯一公开可复核运行时数据的：RSS 稳态 4.3–5.2MB（ARCHITECTURE §10.1.1），回环 1500 连接灌流 ~1.5–2.3Gbps、0 panic、RSS 不膨胀，瓶颈确认为 CPU 小包处理（load 29@2核）。nodejsver README 自报 5000 并发零错误/连接 TPS 620——**自报口径，本审计未复现**。goophira/jphira/原版无公开数据；gooophira 有 bench 工具链但结果未固化文档。原版 RSS 30–50MB 来自媒体池分析（reqwest/rustls 元凶），属于结构性推断。
+r0semi 是唯一公开可复核运行时数据的，08-27 审计后数据面进一步加厚：
+- **内存**：RSS 稳态 4.3–5.2MB / 峰值 4.6–5.4MB（ARCHITECTURE §10.1.1），回环 1500 连接灌流 ~1.5–2.3Gbps、0 panic、RSS 不膨胀——不变；
+- **CPU**：瓶颈确认为小包处理后**优化线收官**——写批处理（64 帧一次 write_all）→ Metrics 热路径无锁化（锁帧归零、lock_contended -38%）→ 读侧合读（同帧率 A/B 对拍每帧 CPU **66.1→33.4µs，-49%**）；基准与工具链全部入库（bench_broadcast 300 客户端 4739 帧/s 全额节奏 + flamegraph workflow 的 Linux perf 权威复核与 collapsed 栈 artifact）；剩余为架构级约束（tokio 单 IO driver）。
+
+nodejsver README 自报 5000 并发零错误/连接 TPS 620——**自报口径，本审计未复现**。goophira/jphira/原版无公开数据；gooophira 有 bench 工具链但结果未固化文档。原版 RSS 30–50MB 来自媒体池分析（reqwest/rustls 元凶），属于结构性推断。
 
 ---
 
 ## 5. r0semi 到底哪里不同（六条差异点）
 
 1. **分层不是愿望，是 CI 产物**。别家"分层清晰"靠自觉（gooophira 单体内聚、nodejsver 目录约定、jphira 包结构），r0semi 的依赖方向被 `check-deps.py` ALLOW 表物理拦截，impl 连 core 都不 import。"子系统可整体替换"因此可机器验证。
-2. **内存是被记账的资源，不是碰运气的副作用**。64MiB 全局在途字节账本 + 每连接 8MiB 队列顶 + 1000 已鉴权上限 + 4KiB 鉴权前降级，四道护栏带平衡性测试——五家中唯一按**字节**而非按**帧数**管内存的。
+2. **内存是被记账的资源，不是碰运气的副作用**。64MiB 全局在途字节账本 + 每连接 8MiB 队列顶 + 1000 已鉴权上限 + 4KiB 鉴权前降级，四道护栏带平衡性测试——五家中唯一按**字节**而非按**帧数**管内存的；读路径 payload 窗口也已入账（ReadCharge + Drop guard 兜底），账外区域闭合。
 3. **时间事实命令化**。goroutine ticker（gooophira）、setInterval 巡检（nodejsver）、ScheduledExecutorService（jphira）都是"各处顺手开定时器"；r0semi 禁止 impl 层拥有时钟，Tick/超时/断线全部经单一生产者进入队列——确定性来自宪法而不来自 review。
 4. **广播热路径编码一次**。原版逐人 clone await；gooophira 聚合缓冲是"减少 syscall"仍多次编码；r0semi EncodeCache 让同一事件对所有目标只编码一次、Arc 直写——这是丢掉 per-user 内容定制（如广播级 i18n）换来的，取舍写在 ADR-0009。
 5. **对抗面假设不同**。别人防"客户端出错"，r0semi 防"客户端怀有恶意"：ULEB 守卫、类型级长度、fuzz 双层、pre-auth 降级——原版一家三口的每个解码 bug 形态都有对应工事。
-6. **演进过程本身是资产**。11 ADR + issues 台账 + 横评/审计文档互相引用，让"为什么这么做"可考古；四家对照项目几乎没有决策记录（gooophira 的锁序注释是散点的例外）。
+6. **演进过程本身是资产**。11 ADR + issues 台账 + 横评/审计文档互相引用，让"为什么这么做"可考古；四家对照项目几乎没有决策记录（gooophira 的锁序注释是散点的例外）。08-27 审计后的两天里管理面/反作弊/CPU 优化三线并进，全程 commit + 文档轨迹可考古——演进纪律自证。
 
-与之对应的**代价**：功能交付面小（回放/管理台/持久化都还是空白或最小化）、单人维护、为 encode-once 放弃了广播级多语言内容、性能优化尚未针对已确认的 CPU 小包瓶颈展开。
+与之对应的**代价**：回放录制/Redis/联邦/Web 面板仍是空白（管理 API 先行）、单人维护、为 encode-once 放弃了广播级多语言内容、CPU 剩余项为架构级约束（tokio 单 IO driver）。
 
 ---
 
@@ -238,15 +250,16 @@ r0semi 是唯一公开可复核运行时数据的：RSS 稳态 4.3–5.2MB（ARC
 | gooophira-mp | 生产怪癖补偿 + 回放/统计/webhook/管理台的即用全家桶 | 要**今天就把服开起来运营**，能接受单体复杂度和作者免责声明 |
 | phira-mp-nodejsver | 溯源最认真的 TS 移植 + 最低上手门槛 + 插件 SDK | 团队是 **Node 栈**、要做二次开发/插件生态 |
 | jphira-mp | netty 分阶段 pipeline 教科书 + 5 分钟挂起恢复 + JitPack 嵌入 | 生活在 **JVM 生态**，想把房间服嵌进更大系统 |
-| r0semi-mp | 内存可量化、恶意输入可证明、替换性可机器验证的三重 CI 资产 | 目标机器**挤满服务**、长期演化、对鲁棒性有执念 |
+| r0semi-mp | 三重 CI 资产（内存可量化/恶意输入可证明/替换性可机器验证）+ 开箱即用的管理面与反作弊（API-first，无 Web GUI） | 目标机器**挤满服务**、长期演化、对鲁棒性有执念、接受 API-first 运营 |
 
-结论与 `competitor-review.md` 相同但现在有全景证据支撑：**Go 版赢在"现在"，r0semi 赢在"以后"**——而两者互学的通道已经打开（强开倒计时、错误 i18n、观战聚合缓冲均已分别对标 gooophira/原版落地；学习清单剩 deadline 阶梯等少数项）。
+结论与 `competitor-review.md` 相同但现在有全景证据支撑：**Go 版赢在"现在"，r0semi 赢在"以后"——且"以后"正在到账**（互学通道已兑现：强开倒计时、错误 i18n、观战聚合缓冲、谱面匹配、版本握手、runtime-config 回滚、bench 工具链均已对标落地；学习清单剩 deadline 阶梯、心跳恢复日志/ECONNRESET 遥测、对局中重连窗口延长等少数项）。
 
 ---
 
 ## 7. 审计边界与方法声明（诚实条款）
 
-- 本文档基于 2026-08-27 本地副本快照；上游仓库随后演进可能导致个别结论过期。
+- 本文档基于 2026-08-27 本地副本快照，**2026-08-29 复核更新**：四家对照副本未漂移（本地 HEAD 2026-05-31 ~ 2026-08-01），r0semi 一列数据全量重测；上游仓库随后演进可能导致个别结论过期。
+- r0semi 复测口径：行数 = 物理行含空行（PowerShell Get-Content 计数）；测试数 = `rg "#\[(tokio::)?test\]"` 计 242；依赖 = Cargo.lock `name =` 条目计 203（其中 85 包为 017be37 引入的真 SDK dev 树，118 为运行时口径）；行号引用（server.rs:761/764/1709、stream.rs:80/83、config.rs:58）为 08-29 实查。
 - **jphira 的协议编解码在外部库 `jphira-mp-protocol`（本地未克隆）**，其帧上限/ULEB 守卫情况标注"外部库不可见"，不算其缺点也不算优点。
 - **nodejsver 的 README 能力矩阵显著大于仓库交付物**（内置插件/admin API/密码房通路），文中已逐一标注"未接线/不在仓库"。
 - nodejsver 性能数据为其 README 自报，未经本审计复现；r0semi 数据出自自家压测 harness 与 ARCHITECTURE §10.1.1 实测记录，方法学为回环灌流。

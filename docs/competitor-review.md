@@ -13,7 +13,7 @@
 | `gooophira-mp` | Go | ~44k 行 + 15.4k 行测试（90 文件） | 功能最全 "全家桶" |
 | `phira-mp-nodejsver` | TypeScript/Node | ~10k 行（46 文件） | 插件生态型 |
 | `jphira-mp` | Java/netty | ~10.6k 行（128 文件） | MC 式插件生态 |
-| `r0semi-mp` | Rust | ~16k 行（含测试） | 架构与内存极简派 |
+| `r0semi-mp` | Rust | ~21.6k 行（含测试，2026-08-29 复测） | 架构与内存极简派 |
 
 ## 维度 1：代码质量与测试
 
@@ -74,20 +74,20 @@ r0semi:Touches入有界通道(DropIfFull)→actor串行→解析targets只投mon
 - **gooophira**：tagged union 状态最丰富（含 ReconnectNotified 防刷屏、StartedAt 记局时长）；DangleToken 指针身份校验 + 宽限期 + 房内播报倒计时；谱面匹配反作弊 + Played 重试静默幂等 + ready 强制倒计时（60s 到期 Aborted 未准备者，配 18 个测试）。
 - **nodejsver**：房间元数据最全（密码/黑白名单/消息历史）；中途断线标记弃赛无恢复窗。
 - **jphira**：**5 分钟挂起可恢复**（全场最长窗口）；标准状态模式类。
-- **r0semi**：路由 miss 重放（3×20ms）防幽灵座位；session epoch 校验拒陈旧连接；`reconnect_window` 可配（默认 10s）；ISSUE-0010 CreateRoom 非幂等已留档。
+- **r0semi**：路由 miss 重放（3×20ms）防幽灵座位；session epoch 校验拒陈旧连接；`reconnect_window` 可配（默认 10s）；ISSUE-0010 CreateRoom 非幂等已处置（deployment.md §9 客户端指引）；WaitForReady 60s 强开倒计时已对照 gooophira 落地（B1）。
 
-## 维度 8：玩家可见文案 i18n（r0semi 最短板）
+## 维度 8：玩家可见文案 i18n（原 r0semi 最短板，2026-08 已补）
 
 - **原版**：Mozilla **Fluent** 三语（en-US/zh-CN/zh-TW），per-user LANGUAGE 作用域，报错键位齐全（`create-id-occupied`/`join-game-ongoing`/`join-cant-monitor`...）——与真客户端同源方案。
 - **gooophira**：l10n 包（en-US.json/zh-CN.json），房间日志也走本地化键（`log-room-cycle`）。
 - **jphira**：I18nService + lang 资源目录（zh-CN/en-US）。
 - **nodejsver**：中文硬编码日志为主。
-- **r0semi**：**业务错误英文硬编码**（`"already uploaded"`/`"game is ongoing"`）；只有 welcome_message/maintenance_notice 可配置。
+- **r0semi**：~~业务错误英文硬编码~~ **B2 已落地（2026-08）**——业务错误按用户 language 三语本地化（`l10n.rs`，对照原版 Fluent 键位，契约零变更）；welcome/maintenance 可配置保留；zh-TW 繁简校正对齐原版 Fluent。遗留 ISSUE-0013（EN Title Case）为产品决策点。
 
 ## 维度 9：HTTP 管理面
 
 - **gooophira**：完整运营平台——ban user/room、broadcast、console 命令+日志流、contest 每房间配置、**OTP 双步管理员认证**、replay 配置、**runtime-config 带 rollback**、用户 move/disconnect、metrics。
-- **r0semi**：`/rooms` + `/healthz`（含版本/uptime/连接数/房间数）——极简主义。
+- **r0semi**：~~`/rooms` + `/healthz` 极简主义~~ **管理 API 阶段 0–3.6.1 已落地（2026-08-28）**——只读观测（/admin/rooms?state=、单房详情、users、metrics）+ 写面系统命令（kick/ban/disconnect/broadcast，通道防竞态不用锁）+ Bearer 认证 + 审计环（持久化 audit.jsonl）+ runtime-config 一步回滚（跨重启可用）+ observer 热插拔（ban/anticheat）+ bans/config 快照持久化；刻意不做 OTP/Web GUI/WS console（取舍见 `admin-api.md`）。
 - **nodejsver**：Web dashboard（默认关闭，`ADMIN_PHIRA_ID` 圈权限）。
 - **jphira / 原版**：无。
 
@@ -96,12 +96,12 @@ r0semi:Touches入有界通道(DropIfFull)→actor串行→解析targets只投mon
 | 项目 | 依赖规模 |
 |---|---|
 | 原版 | **Cargo.lock 325 crates**（reqwest 拖动 hyper/tower/rustls 全家桶） |
-| r0semi | **118 crates**（原版的 36%） |
+| r0semi | **运行时 118 crates**（原版的 36%）+ 真 SDK conformance dev 树 85 包 = lock 203（无 reqwest） |
 | gooophira | go.mod 直依 10 个（redis/sqlite/飞书 SDK/websocket） |
 | nodejsver | 运行时直依仅 6 个（express/ws/js-yaml）出乎意料地瘦 |
 | jphira | netty×4 + log4j2×5 + guava + caffeine + zstd-jni + 外部协议库 |
 
-118 vs 325 不只是体积：**供应链审计面缩小到三分之一**；且 r0semi 是五家中唯一把许可证/漏洞纳入 CI 闸门（cargo-deny）的。
+运行时 118 vs 325 不只是体积：**供应链审计面缩小到三分之一**（conformance 测试引入的 85 包 dev 树不进生产二进制）；且 r0semi 是五家中唯一把许可证/漏洞纳入 CI 闸门（cargo-deny）的。
 
 ## 维度 11：读侧洪水防御与半开连接治理
 
@@ -113,9 +113,11 @@ r0semi:Touches入有界通道(DropIfFull)→actor串行→解析targets只投mon
 
 ## 维度 12：真客户端兼容性（独有维度，见 client-conformance.md）
 
-**gooophira / jphira 特有的 `protocol_hack.go`** 沉淀了生产环境换来的**真客户端怪癖补偿**——但那些怪癖的"必要性"应经开源客户端源码验证，而非直接信任。r0semi 的独特机会：interop 测试用的 `phira-mp-client` 正是真客户端集成的同一 crate，可把"怪癖传闻"升级为"可执行一致性断言"。详见 `client-conformance.md`。
+**gooophira / jphira 特有的 `protocol_hack.go`** 沉淀了生产环境换来的**真客户端怪癖补偿**——但那些怪癖的"必要性"应经开源客户端源码验证，而非直接信任。r0semi 已把该机会兑现（2026-08）：`phira-server/tests/conformance.rs` 以游戏客户端 Cargo.toml 锁定的同一 rev（cc822df）真 SDK（`phira-mp-client`）为对端，跑 client-behavior-review §5 的 A1–A6 崩溃猎手剧本——"怪癖传闻"升级为可执行一致性断言。详见 `client-conformance.md`。
 
 ## 经验吸收矩阵（该学什么 / 不该学什么）
+
+> **状态回写（2026-08-29）**：下表多数"该学"项已吸收落地——B1（ready 60s 强开倒计时）、B2（错误 i18n 三语）、B6（观战聚合缓冲）、D2（版本握手校验）、谱面匹配反作弊（P1）、game_time 尾追加（ISSUE-0007）、runtime-config 一步回滚（管理 API 阶段 3）、bench 工具链进 CI（flamegraph workflow）、C1 拆分第一步（admin.rs/storage.rs 抽出）。两项被**明确拒绝**：OTP 双步（自建服过重，通道防竞态 + Bearer 替代——见 `admin-api.md` §0）、广播级消息按玩家语言本地化（encode-once 前提冲突）。另新增 gooophira/原版都没有的反作弊两翼：跨房 record 重放检测（P2）与成绩频率观测（R2）。剩余未做：deadline 阶梯、心跳恢复日志/ECONNRESET 遥测、对局中重连窗口延长、Played 幂等口径拍板。
 
 ### 🟢 该学（与 r0semi 架构正交，搬来不动骨架）
 

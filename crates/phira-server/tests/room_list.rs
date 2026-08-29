@@ -61,8 +61,8 @@ async fn snapshot_tracks_room_lifecycle() {
     assert_eq!(rooms.len(), 1, "一个房间");
     let r = &rooms[0];
     assert_eq!(r.id, "abc");
-    assert_eq!(r.users, 2, "房主 + 加入者");
-    assert_eq!(r.state, "WaitingForReady");
+    assert_eq!(r.players, vec![1, 2], "房主（建房即入列）+ 加入者");
+    assert_eq!(r.state, "wait_for_ready");
     assert!(r.locked);
     assert_eq!(r.host, 1);
 
@@ -126,7 +126,7 @@ async fn chart_select_and_game_end_states() {
     )
     .await;
 
-    // 选图 → SelectChart(7)
+    // 选图 → select_chart + 谱面记录（name+id）
     sink.deliver(
         1,
         &RoomEvent::SelectChart {
@@ -137,14 +137,18 @@ async fn chart_select_and_game_end_states() {
         },
     )
     .await;
-    assert_eq!(sink.snapshot().await[0].state, "SelectChart(7)");
+    let r = &sink.snapshot().await[0];
+    assert_eq!(r.state, "select_chart");
+    assert_eq!(r.chart, Some(("chart".to_owned(), 7)));
 
-    // 开局 → Playing
+    // 开局 → playing（谱面保留）
     sink.deliver(1, &RoomEvent::StartPlaying { room_id: rid("g1") })
         .await;
-    assert_eq!(sink.snapshot().await[0].state, "Playing");
+    let r = &sink.snapshot().await[0];
+    assert_eq!(r.state, "playing");
+    assert_eq!(r.chart, Some(("chart".to_owned(), 7)));
 
-    // 结算 → 回 SelectChart（保留谱面）
+    // 结算 → 回 select_chart（保留谱面）
     sink.deliver(
         1,
         &RoomEvent::GameEnd {
@@ -153,7 +157,82 @@ async fn chart_select_and_game_end_states() {
         },
     )
     .await;
-    assert_eq!(sink.snapshot().await[0].state, "SelectChart(7)");
+    let r = &sink.snapshot().await[0];
+    assert_eq!(r.state, "select_chart");
+    assert_eq!(r.chart, Some(("chart".to_owned(), 7)), "结算后谱面保留");
+
+    // 取消开局且无谱面 → 清空 chart
+    sink.deliver(
+        1,
+        &RoomEvent::CancelGame {
+            room_id: rid("g1"),
+            user: 1,
+            chart: None,
+        },
+    )
+    .await;
+    let r = &sink.snapshot().await[0];
+    assert_eq!(r.state, "select_chart");
+    assert_eq!(r.chart, None, "无谱面事件应清空 chart");
+}
+
+/// 2026-08 对齐拍板：monitor（观战者）不进 players 名单；离开只移除真实玩家。
+#[tokio::test]
+async fn monitor_join_never_enters_players() {
+    let sink = Arc::new(RoomListSink::new(Vec::new()));
+    sink.deliver(
+        1,
+        &RoomEvent::RoomCreated {
+            room_id: rid("m1"),
+            host: 1,
+        },
+    )
+    .await;
+    let mut m = ui(2, "watcher");
+    m.monitor = true;
+    sink.deliver(
+        2,
+        &RoomEvent::UserJoined {
+            room_id: rid("m1"),
+            user: m,
+        },
+    )
+    .await;
+    sink.deliver(
+        3,
+        &RoomEvent::UserJoined {
+            room_id: rid("m1"),
+            user: ui(3, "p3"),
+        },
+    )
+    .await;
+    assert_eq!(
+        sink.snapshot().await[0].players,
+        vec![1, 3],
+        "monitor 不入列，普通玩家入列"
+    );
+
+    // monitor 离开对名单无影响；玩家离开移除
+    sink.deliver(
+        2,
+        &RoomEvent::UserLeft {
+            room_id: rid("m1"),
+            user: 2,
+            name: "watcher".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(sink.snapshot().await[0].players, vec![1, 3]);
+    sink.deliver(
+        3,
+        &RoomEvent::UserLeft {
+            room_id: rid("m1"),
+            user: 3,
+            name: "p3".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(sink.snapshot().await[0].players, vec![1], "玩家离开被移除");
 }
 
 /// 集成测试：真实 bus → RoomListSink 链路——最后一人离开后快照必须清空。

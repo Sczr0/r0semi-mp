@@ -5,7 +5,8 @@
 //! （`AdminKick`/`AdminBroadcast`，§4.4 薄缝）——管理 API 不认识 impl、不持有状态。
 //!
 //! 阶段 1（只读）：`/` `/rooms` `/healthz` + `/admin/rooms[?state=]` `/admin/rooms/{id}`
-//! `/admin/users` `/admin/metrics`。
+//! `/admin/users` `/admin/metrics`。`/rooms` 与管理读面的房间 JSON 统一经
+//! `room_json` 渲染为外部标准格式（2026-08 定稿：roomid/lock/host/state/chart/players）。
 //! 阶段 2（写面 + 审计 + 认证，docs/admin-api.md §3 四件套）：`POST /admin/rooms/{id}/kick`、
 //! `POST /admin/rooms/{id}/broadcast`、`POST /admin/users/{id}/ban`、
 //! `POST /admin/users/{id}/disconnect`、`GET /admin/audit`；**全部 `/admin/*` 需要
@@ -20,14 +21,39 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use phira_api::{RoomCommand, RoomConfig, RoomError, RoomErrorCode, RoomResponse};
+use phira_core::lifecycle::SessionRegistry;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
-use crate::server::ConnContext;
+use crate::server::{ConnContext, RoomInfo};
 
 /// 进程启动时刻（/healthz uptime 数据源，§11.1；OnceLock 惰性初始化）。
 static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// 房间快照项 → 标准公开房间 JSON（2026-08 对齐外部格式定稿）：
+/// `roomid`/`lock`/`host{name,id}`/`state`(select_chart|playing|wait_for_ready)/
+/// `chart{name,id}`/`players[{name,id}]`；**id 统一 int**，`players` 不含 monitor
+/// （RoomListSink 已过滤）。名字经 `SessionRegistry` 渲染时解析（未注册 → null；
+/// 存活期成立：`evict_name` 在 `UserLeft` 之后，lifecycle.rs）。
+fn room_json(info: &RoomInfo, registry: &SessionRegistry) -> serde_json::Value {
+    serde_json::json!({
+        "roomid": info.id,
+        "cycle": info.cycle,
+        "lock": info.locked,
+        "host": { "name": registry.name_of(info.host), "id": info.host },
+        "state": info.state,
+        "chart": info
+            .chart
+            .as_ref()
+            .map(|(name, id)| serde_json::json!({ "name": name, "id": id })),
+        "players": info
+            .players
+            .iter()
+            .map(|id| serde_json::json!({ "name": registry.name_of(*id), "id": id }))
+            .collect::<Vec<_>>(),
+    })
+}
 
 /// 进程已运行秒数（§11.1 /healthz）。
 fn uptime_s() -> u64 {
@@ -349,10 +375,13 @@ async fn route_public(
             "application/json; charset=utf-8",
         ),
         ("GET", "/rooms") => {
+            // 标准格式定稿（2026-08）：{rooms:[…], total:服务器在线玩家总数（含未进房）}
             let rooms = ctx.room_list.snapshot().await;
+            let rooms: Vec<_> = rooms.iter().map(|r| room_json(r, &ctx.registry)).collect();
+            let total = ctx.sink.online().await.len();
             (
                 "200 OK",
-                serde_json::to_string(&rooms).unwrap_or_else(|_| "[]".to_owned()),
+                serde_json::json!({ "rooms": rooms, "total": total }).to_string(),
                 "application/json; charset=utf-8",
             )
         }
@@ -400,6 +429,7 @@ async fn route_admin_read(
             } else {
                 rooms
             };
+            let rooms: Vec<_> = rooms.iter().map(|r| room_json(r, &ctx.registry)).collect();
             (
                 "200 OK",
                 serde_json::to_string(&rooms).unwrap_or_else(|_| "[]".to_owned()),
@@ -441,10 +471,10 @@ async fn route_admin_read(
         path if path.starts_with("/admin/rooms/") => {
             let id = &path["/admin/rooms/".len()..];
             let rooms = ctx.room_list.snapshot().await;
-            match rooms.into_iter().find(|r| r.id == id) {
+            match rooms.iter().find(|r| r.id == id) {
                 Some(room) => (
                     "200 OK",
-                    serde_json::to_string(&room).unwrap_or_else(|_| "{}".to_owned()),
+                    room_json(room, &ctx.registry).to_string(),
                     "application/json; charset=utf-8",
                 ),
                 None => ("404 Not Found", "room not found".to_owned(), "text/plain"),
