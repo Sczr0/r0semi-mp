@@ -12,7 +12,8 @@ use phira_api::{ApiClient, RandomSource, RoomConfig, RoomDeps, RoomFactory};
 use phira_core::{Bus, Config, EventSink, lifecycle::LifecycleTask};
 use phira_server::server::{ConnContext, Server, SessionSink};
 
-/// 老板接线（§4.5）。
+/// 老板接线（§4.5）。组合根接线长是角色使然——换实现只动这里（§3.2）。
+#[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -47,12 +48,15 @@ async fn main() -> Result<()> {
     )
     .with_api(Arc::clone(&http) as Arc<dyn ApiClient>);
 
-    // 用户生命周期（§4.9-3）：单一生产者任务 + 注册表（重连窗口 = yml `reconnect_window`，§6.5-21）
+    // 用户生命周期（§4.9-3）：单一生产者任务 + 注册表（重连窗口 = yml `reconnect_window`；
+    // C-03/ADR-0012：对局中断线用 `playing_reconnect_window`，命令化查询 GetClientState 分级）
     let (lifecycle_task, registry, fact_tx) = LifecycleTask::new(
         bus.clone(),
         config.reconnect_window,
         Duration::from_millis(50),
     );
+    let lifecycle_task =
+        lifecycle_task.with_playing_reconnect_window(config.playing_reconnect_window);
     tokio::spawn(lifecycle_task.run());
 
     // 事件投递（§6.6 表 2）：user → 会话写通道 + 房间列表观察者（§7.3 组合）
@@ -113,6 +117,8 @@ async fn main() -> Result<()> {
         admission: Arc::new(phira_server::server::ConnectionAdmission::default()),
         // PROXY protocol（§前置层：反代后真实 IP；yml `proxy_protocol`，默认关）
         proxy_protocol: config.proxy_protocol,
+        // 鉴权阶段超时（C-01，yml `auth_timeout`）：版本字节确认后→鉴权完成之间
+        auth_timeout: config.auth_timeout,
         // 进服欢迎语（yml welcome_message，None = 不发）
         welcome_message: config.welcome_message.clone(),
         // 管理面（阶段 2）：Bearer token（None = 禁用）+ 写操作审计环（持久化归档）

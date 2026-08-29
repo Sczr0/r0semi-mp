@@ -1064,7 +1064,8 @@ async fn disconnect_reconnect<F: RoomFactory>(factory: &F) {
         "房主被驱逐应迁移: {events:?}"
     );
 
-    // —— Playing 中断线：立即 abort，无重连窗口（§6.5-22）——
+    // —— Playing 中断线：标记缺席，窗口由 core 分级（C-03/ADR-0012，原规则 22
+    //    "立即驱逐、无重连窗口"取消——对局掉线不再 10s 弃赛）——
     let mut room = factory.create(rid());
     setup_playing(&mut room).await;
     let (_, events) = room
@@ -1077,12 +1078,22 @@ async fn disconnect_reconnect<F: RoomFactory>(factory: &F) {
         )
         .await;
     assert!(
+        !events.iter().any(
+            |e| matches!(e, RoomEvent::UserLeft { room_id, user: 2, .. } if room_id == &rid())
+        ),
+        "Playing 断线应标记缺席、不立即驱逐: {events:?}"
+    );
+    // 窗口到期（core 已按 Playing 分级为 playing_reconnect_window）→ 驱逐
+    let (_, events) = room
+        .handle(sys_ctx(), RoomCommand::UserDangleExpired { user_id: 2 })
+        .await;
+    assert!(
         events.iter().any(
             |e| matches!(e, RoomEvent::UserLeft { room_id, user: 2, .. } if room_id == &rid())
         ),
-        "Playing 中断线应立即驱逐: {events:?}"
+        "Playing 缺席窗口到期应驱逐: {events:?}"
     );
-    // 无重连窗口：DangleExpired 不应再驱逐（已不在）
+    // 已驱逐后再次 DangleExpired → 忽略
     let (_, events) = room
         .handle(sys_ctx(), RoomCommand::UserDangleExpired { user_id: 2 })
         .await;

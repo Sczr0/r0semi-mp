@@ -76,6 +76,7 @@ fn test_ctx_with_persist(dir: &std::path::Path) -> Arc<ConnContext> {
         welcome_message: None,
         room_list: Arc::new(phira_server::server::RoomListSink::new(Vec::new())),
         proxy_protocol: false,
+        auth_timeout: Duration::from_secs(10),
         admin_token: Some("test-token".to_owned()),
         admin_audit: phira_server::admin::AuditLog::new_with_file(dir),
         admin_config: phira_server::admin::AdminConfigState::new(),

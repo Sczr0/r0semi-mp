@@ -19,6 +19,16 @@ pub struct Config {
     pub rooms: RoomConfig,
     /// 断线重连窗口（§6.5-21，默认 10s）。
     pub reconnect_window: std::time::Duration,
+    /// 对局中断线重连窗口（C-03/ADR-0012：默认 60s，> reconnect_window）。
+    ///
+    /// 窗口决策需要房间状态视野（core 不认识房间态）：Disconnected 时命令化查询
+    /// `GetClientState`，`Playing` 用本窗口、其余用 [`Config::reconnect_window`]。
+    pub playing_reconnect_window: std::time::Duration,
+    /// 鉴权阶段超时（C-01：版本字节确认后→鉴权完成之间；默认 10s，> http_timeout）。
+    ///
+    /// 未鉴权连接若无限挂起会占住准入额度（§10.4），本超时兜底断开；
+    /// 与 PROXY 头 5s / 握手 5s 同为 per-phase deadline（对照 gooophira）。
+    pub auth_timeout: std::time::Duration,
     /// 回源 HTTP 请求超时（§4.4，默认 5s）。
     pub http_timeout: std::time::Duration,
     /// 停机维护宽限窗口（§11，默认 10s）。
@@ -56,6 +66,8 @@ impl Default for Config {
             // 原版默认白名单（server.rs：monitors: vec![2]）
             rooms: RoomConfig { monitors: vec![2] },
             reconnect_window: std::time::Duration::from_secs(10),
+            playing_reconnect_window: std::time::Duration::from_secs(60),
+            auth_timeout: std::time::Duration::from_secs(10),
             http_timeout: std::time::Duration::from_secs(5),
             maintenance_grace: std::time::Duration::from_secs(10),
             config_poll_interval: std::time::Duration::from_secs(2),
@@ -198,6 +210,12 @@ impl Config {
         if let Some(secs) = yaml.reconnect_window {
             self.reconnect_window = std::time::Duration::from_secs(secs);
         }
+        if let Some(secs) = yaml.playing_reconnect_window {
+            self.playing_reconnect_window = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = yaml.auth_timeout {
+            self.auth_timeout = std::time::Duration::from_secs(secs);
+        }
         if let Some(secs) = yaml.http_timeout {
             self.http_timeout = std::time::Duration::from_secs(secs);
         }
@@ -248,6 +266,10 @@ struct YamlConfig {
     monitors: Option<Vec<i32>>,
     /// 断线重连窗口（秒）。
     reconnect_window: Option<u64>,
+    /// 对局中断线重连窗口（秒；缺省 = reconnect_window，区分需要显式配）。
+    playing_reconnect_window: Option<u64>,
+    /// 鉴权阶段超时（秒；版本字节确认后→鉴权完成之间）。
+    auth_timeout: Option<u64>,
     /// 回源 HTTP 请求超时（秒）。
     http_timeout: Option<u64>,
     /// 停机维护宽限窗口（秒）。

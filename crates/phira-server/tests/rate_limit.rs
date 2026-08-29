@@ -116,6 +116,7 @@ fn limiter_ctx() -> Arc<ConnContext> {
         welcome_message: None,
         room_list: Arc::new(phira_server::server::RoomListSink::new(Vec::new())),
         proxy_protocol: false,
+        auth_timeout: Duration::from_secs(10),
         admin_token: None,
         admin_audit: phira_server::admin::AuditLog::new(),
         admin_config: phira_server::admin::AdminConfigState::new(),

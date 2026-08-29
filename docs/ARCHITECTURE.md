@@ -591,7 +591,7 @@ pub async fn room_contract_suite<F: RoomFactory>(factory: &F) {
     // deps 由工厂持有（构造时注入 fake，§4.9-6；评审 §8 五-11：create 不再收第二份）
     let mut room = factory.create(RoomId::new("test"));
     // 建房 → 选图 → 请求开始 → Ready → 开打 → 上报成绩 → 结算，全流程断言
-    // 边界用例（见 §6 状态机规范）：8 人上限、非 host 越权、断线重连（窗口内重连保留座位 / 窗口外踢人 / Playing 中断线即 abort / 重连恢复房间状态）、锁房、观战权限……
+    // 边界用例（见 §6 状态机规范）：8 人上限、非 host 越权、断线重连（窗口内重连保留座位 / 窗口外踢人 / Playing 断线走延长窗口（C-03/ADR-0012）/ 重连恢复房间状态）、锁房、观战权限……
     // 时间用 TimeMs 伪造：Tick{now} 任意构造，10s 窗口可精确推进（评审 §5）
 }
 
@@ -709,7 +709,7 @@ Playing ──全员 Played/Abort──► SelectChart（cycle 则顺延换房�
 9. host `CancelReady` → `CancelGame` + 回 SelectChart；非 host → 仅 `CancelReady`
 10. `Played`：**A2 两段式（2026-08 兑现，§4.9-2 规则 2）**——第 1 段 actor 内**受理**：幂等预检（已入账/已中止/in-flight）＋登记 in-flight，立即回 Ok；第 2 段 core 房外任务回源官方 API（有界重试）→ `RecordFetched` 回注应用：成功 → 广播 `Played` + 全员结算检查（`record.player == 用户 id` 在此校验）；**回注失败（重试耗尽 / player 不匹配）→ 提交者按"无有效成绩"结算为 aborted**（`settle_record_failed`：进 aborted 集 + 广播 Abort + 清残余缓冲 + 全员结算）——GameEnd 必然触发，房间不卡 Playing（客户端已收 Ok 不会再重试，原"只记日志"会导致永久卡死）。**P1 谱面反作弊（2026-08）**：`record.chart` 与本局 `chart.id` 不一致（双方均有值才校验，缺省 fail-open 参照 gooophira 防误伤）→ 同按"无有效成绩"结算；`Record.chart` 为弱演进 Option 字段（上游 `/record` 携带，r0semi DTO 2026-08 补接）。重复上报 → `AlreadyUploaded`
 11. 全员完成/abort → `GameEnd` → 回 SelectChart；`cycle=true` 时房主顺延给下一位
-12. **断线重连总览**：Playing 中断线 → 判定断线后立即 abort；非 Playing 断线 → 10s 重连窗口（dangle），超时踢人（细节见规则 19-23）
+12. **断线重连总览**：断线统一标记缺席 → core 按房间状态分级窗口（Playing → `playing_reconnect_window`，非 Playing → 10s `reconnect_window`），窗口到期踢人（细节见规则 19-23；C-03/ADR-0012）
 
 **鉴权与会话**
 13. 鉴权前收到任何非 `Ping`/`Authenticate` 包 → 忽略
@@ -726,10 +726,10 @@ Playing ──全员 Played/Abort──► SelectChart（cycle 则顺延换房�
 **断线与重连（规则 19-23）**
 19. **身份与重连**：用户身份 = token 解析出的 user id；同 id 再次鉴权 = 重连 → 复用用户对象、**替换会话（epoch+1，关闭旧 TCP、取消旧会话任务）**（core 职责，§4.9-3）
 20. **断线判定**：心跳 10s 无包（§6.1）→ core **用户生命周期任务**派发 `UserDisconnected{user, epoch}`
-21. **重连窗口**：非 Playing 断线 → 10s 内重连则保留座位（`UserReconnected{user, epoch}`）；10s 到期 → **先查权威会话状态再派发** `UserDangleExpired`（防 9.999s 重连排在 10.000s 定时器后，§4.9-3）→ impl 移除座位、广播 `LeaveRoom`、若为房主则迁移房主（规则 5）
-22. **Playing 中断线**：无重连窗口，判定断线后立即 abort（移除 + 广播）
+21. **重连窗口**：断线 → 10s（`reconnect_window`）内重连则保留座位（`UserReconnected{user, epoch}`）；到期 → **先查权威会话状态再派发** `UserDangleExpired`（防 9.999s 重连排在 10.000s 定时器后，§4.9-3）→ impl 移除座位、广播 `LeaveRoom`、若为房主则迁移房主（规则 5）。**C-03/ADR-0012（2026-08）**：窗口分级——core 在 `Disconnected` 时命令化查询 `GetClientState`（§4.6，已有系统命令零契约新增），`Playing` 房间用 `playing_reconnect_window`（默认 60s），其余用 `reconnect_window`（10s）；`impl` 对 Playing 断线也统一标记缺席（原规则 22 的"立即驱逐"取消）
+22. **Playing 中断线**：**取消"立即驱逐"（C-03/ADR-0012）**——与规则 21 统一标记缺席，窗口由 core 分级为 `playing_reconnect_window`（默认 60s，yml `playing_reconnect_window` 可配），到期仍由 `UserDangleExpired` 驱逐
 23. **重连恢复**：重连成功的鉴权响应必须携带当前房间状态（`ClientRoomState`）——core 通过 `RoomCommand::GetClientState` 查询 impl（§4.4）；**旧连接（epoch 不匹配）到达的命令一律拒绝**。**ISSUE-0007（2026-08 兑现）**：快照携带 `last_game_time`（该玩家最近触摸帧的谱面内时间，f32；无记录 = `NEG_INFINITY` 哨兵，对齐原版 reset_game_time）——`ClientRoomState` **尾部追加**字段，旧客户端读端逐字段读、不校验剩余字节、静默忽略（演进约束：结构体尾追加安全、枚举加变体必炸，锚点测试 `trailing_bytes_after_struct_fields_tolerated` / `unknown_enum_tag_still_rejected`）。数据基础就绪；"断点续观战/按进度结算"等消费方未立项（当前死字段，与原版同病）
-24. **两个 10s 的区别**：心跳断线判定（最后包后 ~10s）与重连窗口（断线后 10s）独立计时，最坏约 20s 完成踢人
+24. **两个 10s 的区别**：心跳断线判定（最后包后 ~10s）与重连窗口（断线后 10s，非对局默认）独立计时，最坏约 20s 完成踢人；对局中重连窗口独立为 `playing_reconnect_window`（C-03/ADR-0012）
 25. **可测性**：impl 唯一时钟源是 `Tick { now: TimeMs }`（u64 毫秒，测试可伪造）；HTTP/随机数经 `RoomDeps` 注入（§4.9-6）——没有这三件事，规则 21/22 的 10s 窗口和规则 10 的回源校验根本无法写契约测试断言
 26. **广播范围**：所有 Message 变体均为**房内广播**（用户+monitor；已核实原版 `broadcast` 仅遍历房内 `users()+monitors()`，协议无全服广播，评审 §8 一）——`Targets::All` 的语义即此
 27. **重复入房**：已在房间中再次 `JoinRoom`/`CreateRoom` → 错误（`already in room`，原版 `user.room` 判重；契约测试需要此用例）

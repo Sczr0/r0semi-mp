@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use phira_api::{CmdCtx, Origin, RoomCommand, RoomId};
+use phira_api::{CmdCtx, Origin, RoomCommand, RoomId, RoomResponse, RoomState};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -211,6 +211,12 @@ pub struct LifecycleTask {
     event_tx: mpsc::Sender<LifecycleEvent>,
     /// 断线到驱逐的窗口（默认 10s，§6.1/§6.5-21；测试注入更小值）。
     dangle_window: Duration,
+    /// 对局中断线到驱逐的窗口（C-03/ADR-0012：默认 60s，`Playing` 房间用）。
+    ///
+    /// 窗口决策需要房间状态视野（core 不认识房间态）：`Disconnected` 时命令化查询
+    /// `GetClientState`（系统命令，已有契约），`Playing` 用本窗口、其余用
+    /// [`Self::dangle_window`]。
+    playing_reconnect_window: Duration,
     /// 周期 `Tick` 心跳间隔（B1/B6 通电：倒计时 + 观战聚合 flush 节拍；生产 50ms）。
     tick_interval: Duration,
 }
@@ -222,6 +228,9 @@ impl LifecycleTask {
     ///
     /// `dangle_window` = 重连窗口（生产 10s；测试可注入）；
     /// `tick_interval` = `Tick` 心跳周期（生产 50ms，对齐 gooophira 慢档刷新窗口；测试可调大减少噪声或调小加速观察）。
+    ///
+    /// `playing_reconnect_window` 初始同 `dangle_window`；组合根如需区分（C-03），
+    /// 调 [`Self::with_playing_reconnect_window`]。
     #[must_use]
     pub fn new(
         bus: Bus,
@@ -237,11 +246,19 @@ impl LifecycleTask {
                 rx,
                 event_tx: event_tx.clone(),
                 dangle_window,
+                playing_reconnect_window: dangle_window,
                 tick_interval,
             },
             registry,
             event_tx.clone(),
         )
+    }
+
+    /// 覆盖对局中断线重连窗口（C-03/ADR-0012；组合根从 yml 双配置注入）。
+    #[must_use]
+    pub fn with_playing_reconnect_window(mut self, window: Duration) -> Self {
+        self.playing_reconnect_window = window;
+        self
     }
 
     /// 消费循环（组合根 spawn）。channel 关闭（server 全部断开）时自然退出。
@@ -302,11 +319,15 @@ impl LifecycleTask {
                     debug!("ignoring stale disconnect user={user_id} epoch={epoch}");
                     return;
                 }
-                // 标记缺席（impl），并启动 10s 窗口
+                // C-03/ADR-0012：窗口决策需要房间状态视野——命令化查询（§4.6）。
+                // 在标记缺席（UserDisconnected）**前**查询，拿"断线瞬间"的房间状态：
+                // `Playing` → `playing_reconnect_window`（对局不因短窗口弃赛）；
+                // 其余（SelectChart/WaitForReady）→ `dangle_window`（§6.5-21 10s）。
+                let window = self.reconnect_window_for(user_id).await;
+                // 标记缺席（impl），并启动窗口
                 self.dispatch(user_id, RoomCommand::UserDisconnected { user_id, epoch })
                     .await;
                 let tx = self.event_tx.clone();
-                let window = self.dangle_window;
                 tokio::spawn(async move {
                     tokio::time::sleep(window).await;
                     // 到期：投回单一生产者队列（不直接派发，§4.9-3 窗口边界）
@@ -342,6 +363,34 @@ impl LifecycleTask {
         };
         if let Err(err) = self.bus.dispatch_system(ctx.room_id, cmd).await {
             warn!("lifecycle dispatch failed for user={user_id}: {err:?}");
+        }
+    }
+
+    /// C-03/ADR-0012：断线重连窗口决策——命令化查询房间状态（§4.6，core 不认识
+    /// 房间态，用已有系统命令 `GetClientState` 拿权威状态，零契约新增）。
+    ///
+    /// 用户在房且房间处于 `Playing` → `playing_reconnect_window`（对局掉线不
+    /// 10s 弃赛）；其余情况（不在房/查询失败/非对局状态）→ `dangle_window`
+    /// （§6.5-21 原语义不变）。查询在 `UserDisconnected` 派发前调用，语义 =
+    /// "断线瞬间房间是否在对局"。
+    async fn reconnect_window_for(&self, user_id: i32) -> Duration {
+        let Some(room_id) = self.lookup_room_with_replay(user_id).await else {
+            return self.dangle_window;
+        };
+        let ctx = CmdCtx {
+            origin: Origin::System,
+            room_id,
+        };
+        match self
+            .bus
+            .dispatch_system(ctx.room_id, RoomCommand::GetClientState { user_id })
+            .await
+        {
+            Ok(RoomResponse::ClientState(Some(cs))) if cs.state == RoomState::Playing => {
+                self.playing_reconnect_window
+            }
+            // 不在房（None）/查询失败/非对局状态 → 原窗口
+            _ => self.dangle_window,
         }
     }
 

@@ -3,7 +3,8 @@
 //! 房间实现，照原版 phira-mp room.rs 语义（§6.5 规则清单逐条兑现）。
 //! 只认识 phira-api，连 core 都不许认识（§4.3-3）——时间与连接事实全部经薄缝命令进入（§4.6）：
 //! - `Tick` 推进玩法计时（v1 无玩法倒计时，占位）
-//! - `UserDisconnected` 标记缺席 / Playing 中断线立即驱逐（规则 22）
+//! - `UserDisconnected` 统一标记缺席（C-03/ADR-0012：原规则 22 的"Playing 立即
+//!   驱逐"取消——窗口分级移到 core，Playing 用 `playing_reconnect_window`）
 //! - `UserReconnected` 恢复座位（规则 21）
 //! - `UserDangleExpired` 执行驱逐（规则 21）
 //!
@@ -388,13 +389,7 @@ impl RoomV1 {
         }
     }
 
-    /// Playing 中断线：立即驱逐（规则 22，无重连窗口）。
-    fn on_playing_disconnect(&mut self, user_id: i32) -> Vec<RoomEvent> {
-        self.evict(user_id)
-    }
-
     // —— 命令处理 ——
-
     fn handle_create(
         &mut self,
         ctx: CmdCtx,
@@ -936,14 +931,12 @@ impl RoomV1 {
         if !self.in_room(user_id) {
             return (None, Vec::new());
         }
-        if matches!(self.state, InternalState::Playing { .. }) {
-            // Playing 中断线：立即 abort（规则 22，无重连窗口）
-            (None, self.on_playing_disconnect(user_id))
-        } else {
-            // 非 Playing：标记缺席，等重连或窗口到期（§4.6）
-            self.absent.insert(user_id);
-            (None, Vec::new())
-        }
+        // 统一标记缺席（规则 21 语义扩展到 Playing，C-03/ADR-0012）：
+        // 原规则 22 对 Playing 断线"立即驱逐、无重连窗口"，现改为标记缺席——
+        // 窗口由 core 按房间状态分级（Playing → playing_reconnect_window）决定，
+        // 到期仍由 `UserDangleExpired` 驱逐。对局中掉线不再 10s 即弃赛。
+        self.absent.insert(user_id);
+        (None, Vec::new())
     }
 
     fn handle_user_reconnected(&mut self, user_id: i32) -> (Option<RoomResponse>, Vec<RoomEvent>) {

@@ -98,6 +98,30 @@ fn setup_ctx_custom(
     moderators: Vec<Arc<dyn phira_api::Moderator>>,
     admin_token: Option<&str>,
 ) -> Arc<ConnContext> {
+    setup_ctx_windows(
+        mock_addr,
+        monitors,
+        welcome,
+        hidden_prefixes,
+        moderators,
+        admin_token,
+        Duration::from_secs(10),
+        Duration::from_secs(60),
+    )
+}
+
+/// C-03：可注入重连窗口的测试上下文（对局中/非对局分开，ADR-0012）。
+#[allow(clippy::too_many_arguments)] // 测试上下文参数化是验收场景需求
+fn setup_ctx_windows(
+    mock_addr: std::net::SocketAddr,
+    monitors: Vec<i32>,
+    welcome: Option<&str>,
+    hidden_prefixes: Vec<&str>,
+    moderators: Vec<Arc<dyn phira_api::Moderator>>,
+    admin_token: Option<&str>,
+    reconnect_window: Duration,
+    playing_reconnect_window: Duration,
+) -> Arc<ConnContext> {
     let base = format!("http://{mock_addr}");
     let http = Arc::new(HttpApiClient::new(base.clone()));
     let deps = RoomDeps {
@@ -118,11 +142,9 @@ fn setup_ctx_custom(
     .with_api(Arc::clone(&http) as Arc<dyn phira_api::ApiClient>)
     .with_moderators(moderators);
 
-    let (task, registry, fact_tx) = LifecycleTask::new(
-        bus.clone(),
-        Duration::from_secs(10),
-        Duration::from_millis(50),
-    );
+    let (task, registry, fact_tx) =
+        LifecycleTask::new(bus.clone(), reconnect_window, Duration::from_millis(50));
+    let task = task.with_playing_reconnect_window(playing_reconnect_window);
     tokio::spawn(task.run());
 
     let sink = Arc::new(SessionSink::new());
@@ -146,6 +168,7 @@ fn setup_ctx_custom(
         welcome_message: welcome.map(str::to_owned),
         room_list,
         proxy_protocol: false,
+        auth_timeout: Duration::from_secs(10),
         admin_token: admin_token.map(str::to_owned),
         admin_audit: phira_server::admin::AuditLog::new(),
         admin_config: phira_server::admin::AdminConfigState::new(),
@@ -1162,6 +1185,185 @@ async fn disconnect_evicts_from_room() {
         "20s 内 user2 应收到 user1 断线的 LeaveRoom 广播"
     );
     drop(c2);
+}
+
+/// C-03 e2e（ADR-0012）：对局中掉线按延长窗口处置——注入短窗口加速观察
+/// （`reconnect_window`=400ms 非对局、`playing_reconnect_window`=3s 对局中）。
+///
+/// 场景：两用户建房→选图→开打（Playing）→ user2 掉线（不 LeaveRoom）。
+/// 阶段 1：超过非对局窗口（400ms）但未到对局窗口（3s）→ **不应**驱逐
+/// （对局中掉线不再 10s 即弃赛）；阶段 2：到对局窗口到期 → 驱逐（LeaveRoom）。
+#[allow(clippy::too_many_lines)] // e2e 全流程脚本长是验收场景需求
+#[tokio::test]
+async fn playing_disconnect_uses_extended_reconnect_window() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    drop(listener);
+    tokio::spawn(mock_api(mock_addr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let ctx = setup_ctx_windows(
+        mock_addr,
+        vec![],
+        None,
+        vec![],
+        vec![],
+        None,
+        Duration::from_millis(400),
+        Duration::from_secs(3),
+    );
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, ctx).await;
+            });
+        }
+    });
+
+    // 用户 1 鉴权 + 建房 + 选图；用户 2 鉴权 + 加入
+    let mut c1 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c1,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok1".into()).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::Authenticate(Ok(_))
+    ));
+    send_cmd(
+        &mut c1,
+        &ClientCommand::CreateRoom {
+            id: phira_api::RoomId::new("p1".into()).unwrap(),
+        },
+    )
+    .await;
+    let _ = recv_cmd(&mut c1).await; // CreateRoom 广播
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::CreateRoom(Ok(()))
+    ));
+    send_cmd(&mut c1, &ClientCommand::SelectChart { id: 1 }).await;
+    let _ = recv_cmd(&mut c1).await; // Message(SelectChart) 广播
+    let _ = recv_cmd(&mut c1).await; // ChangeState(SelectChart(Some(1)))
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::SelectChart(Ok(()))
+    ));
+
+    let mut c2 = client_connect(server_addr).await;
+    send_cmd(
+        &mut c2,
+        &ClientCommand::Authenticate {
+            token: Varchar::new("tok2".into()).unwrap(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_cmd(&mut c2).await,
+        ServerCommand::Authenticate(Ok(_))
+    ));
+    send_cmd(
+        &mut c2,
+        &ClientCommand::JoinRoom {
+            id: phira_api::RoomId::new("p1".into()).unwrap(),
+            monitor: false,
+        },
+    )
+    .await;
+    for _ in 0..2 {
+        let _ = recv_cmd(&mut c1).await; // c1: OnJoinRoom + Message(JoinRoom)
+    }
+    for _ in 0..3 {
+        let _ = recv_cmd(&mut c2).await; // c2: OnJoinRoom + Message(JoinRoom) + JoinRoom 响应
+    }
+
+    // user1 RequestStart（进入 WaitForReady，host 默认 ready）
+    send_cmd(&mut c1, &ClientCommand::RequestStart).await;
+    let _ = recv_cmd(&mut c1).await; // GameStart 广播
+    let _ = recv_cmd(&mut c1).await; // ChangeState(WaitingForReady)
+    assert!(matches!(
+        recv_cmd(&mut c1).await,
+        ServerCommand::RequestStart(Ok(()))
+    ));
+    let _ = recv_cmd(&mut c2).await; // GameStart
+    let _ = recv_cmd(&mut c2).await; // ChangeState(WaitingForReady)
+
+    // user2 Ready → 全员 ready → StartPlaying + ChangeState(Playing)
+    send_cmd(&mut c2, &ClientCommand::Ready).await;
+    let _ = recv_cmd(&mut c2).await; // Ready 广播（自己）
+    let _ = recv_cmd(&mut c1).await; // Ready 广播（user2）
+    let _ = recv_cmd(&mut c1).await; // StartPlaying
+    let _ = recv_cmd(&mut c2).await; // StartPlaying
+    let c1_playing = recv_cmd(&mut c1).await;
+    assert!(
+        matches!(
+            &c1_playing,
+            ServerCommand::ChangeState(phira_api::RoomState::Playing)
+        ),
+        "应 ChangeState(Playing): {c1_playing:?}"
+    );
+    let _ = recv_cmd(&mut c2).await; // ChangeState(Playing)
+
+    // user2 掉线（不 LeaveRoom，模拟断网）
+    drop(c2);
+
+    // 阶段 1：1.2s 内（>400ms 非对局窗口，<3s 对局窗口）不应出现 LeaveRoom{user:2}
+    // 对局中掉线按延长窗口处置——非对局窗口到期不驱逐。
+    let mut saw_leave = false;
+    let phase1 = std::time::Instant::now() + Duration::from_millis(1200);
+    while std::time::Instant::now() < phase1 {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(150)) => {
+                send_cmd(&mut c1, &ClientCommand::Ping).await;
+            }
+            f = read_frame_raw(&mut c1) => {
+                let cmd: ServerCommand = phira_api::decode_packet(&f).unwrap();
+                if matches!(
+                    &cmd,
+                    ServerCommand::Message(phira_api::Message::LeaveRoom { user: 2, .. })
+                ) {
+                    saw_leave = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        !saw_leave,
+        "对局中掉线未到 playing_reconnect_window(3s) 不应驱逐"
+    );
+
+    // 阶段 2：等到对局窗口到期 → 应收到 LeaveRoom{user:2}
+    let deadline = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    send_cmd(&mut c1, &ClientCommand::Ping).await;
+                }
+                f = read_frame_raw(&mut c1) => {
+                    let cmd: ServerCommand = phira_api::decode_packet(&f).unwrap();
+                    if matches!(
+                        &cmd,
+                        ServerCommand::Message(phira_api::Message::LeaveRoom { user: 2, .. })
+                    ) {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        deadline.is_ok(),
+        "对局中掉线应在 playing_reconnect_window 到期后驱逐（8s 内）"
+    );
+    drop(c1);
 }
 
 /// 无超时读一帧（raw 载荷）。

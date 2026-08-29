@@ -130,6 +130,7 @@ async fn spawn_server() -> std::net::SocketAddr {
         welcome_message: None,
         room_list,
         proxy_protocol: false,
+        auth_timeout: Duration::from_secs(10),
         admin_token: None,
         admin_audit: phira_server::admin::AuditLog::new(),
         admin_config: phira_server::admin::AdminConfigState::new(),

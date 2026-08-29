@@ -64,6 +64,11 @@ impl RandomSource for ZeroRng {
 }
 
 fn test_ctx() -> Arc<ConnContext> {
+    test_ctx_with_auth_timeout(Duration::from_secs(10))
+}
+
+/// 可注入鉴权阶段超时（C-01 回归测试用短值加速）。
+fn test_ctx_with_auth_timeout(auth_timeout: Duration) -> Arc<ConnContext> {
     let deps = RoomDeps {
         api: Arc::new(NeverApi),
         rng: Arc::new(ZeroRng),
@@ -91,6 +96,7 @@ fn test_ctx() -> Arc<ConnContext> {
         welcome_message: None,
         room_list: Arc::new(phira_server::server::RoomListSink::new(Vec::new())),
         proxy_protocol: false,
+        auth_timeout,
         admin_token: None,
         admin_audit: phira_server::admin::AuditLog::new(),
         admin_config: phira_server::admin::AdminConfigState::new(),
@@ -233,5 +239,47 @@ async fn stale_connection_commands_rejected_after_reconnect() {
     assert!(
         closed.is_ok(),
         "旧连接应在 4s 内被 kicker 拆线（force_close）"
+    );
+}
+
+/// C-01 回归测试：未鉴权挂起连接到期断开。
+///
+/// 场景：客户端发版本字节后**不鉴权**，只持续发 Ping。心跳只看收包（§6.1）——
+/// 持续 Ping 保持 last_recv 新鲜，若无 `auth_timeout`，未鉴权连接可无限挂占
+/// 准入额度（§10.4）。本测试钉死：版本确认后到鉴权完成之间的硬上限
+/// （`auth_deadline`，yml `auth_timeout`）到期必须断开。
+#[tokio::test]
+async fn unauthenticated_hung_connection_expires_at_auth_timeout() {
+    let ctx = test_ctx_with_auth_timeout(Duration::from_millis(400));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        handle_connection(stream, addr, ctx).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&[PROTOCOL_VERSION]).await.unwrap();
+    // 不鉴权，仅持续 Ping 保持 last_recv 新鲜
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut buf = [0u8; 64];
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(30)) => {
+                    send_cmd(&mut client, &ClientCommand::Ping).await;
+                }
+                r = client.read(&mut buf) => {
+                    match r {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "未鉴权挂起连接应在 auth_timeout(400ms) 到期被断开（持续 Ping 保鲜不应阻止）"
     );
 }

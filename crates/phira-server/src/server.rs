@@ -677,6 +677,10 @@ pub struct ConnContext {
     pub room_list: Arc<RoomListSink>,
     /// PROXY protocol 开关（§前置层：反代后真实 IP；yml `proxy_protocol`）。
     pub proxy_protocol: bool,
+    /// 鉴权阶段超时（C-01，yml `auth_timeout`）：版本字节确认后→鉴权完成之间的
+    /// deadline——未鉴权连接无法靠持续发包（Ping 保持 last_recv 新鲜）无限挂占
+    /// 准入额度（§10.4）；与 PROXY 头 5s / 握手 5s 同为 per-phase（对照 gooophira）。
+    pub auth_timeout: Duration,
     /// 管理 API Bearer token（阶段 2；None = 管理面禁用，见 admin.rs）。
     pub admin_token: Option<String>,
     /// 管理写操作审计（docs/admin-api.md §3 四件套之一；组合根注入）。
@@ -1401,26 +1405,46 @@ pub async fn handle_connection(
 
     // 心跳监控（§6.1）：10s 无任何包 → 判断线 → 生命周期 Disconnected + 通知主流程断开。
     // 主流程用 `select!` 同时等待客户端断开与超时信号（避免共享 Stream 的 take 竞争）。
+    //
+    // C-01：心跳只看收包（持续 Ping 能保持 last_recv 新鲜）——未鉴权连接靠发包可无限
+    // 挂占准入额度（§10.4）。本监控引入鉴权阶段硬上限 `auth_deadline`（版本字节确认后
+    // 起算，yml `auth_timeout`）：未鉴权连接取"心跳"与"鉴权 deadline"较早者——
+    // 无包 10s 判死（心跳语义不变），或 auth_timeout 到点强制断（即使持续发包）。
+    // 已鉴权后只走心跳（auth_deadline 不再参与）。对齐 gooophira per-phase deadline。
+    let auth_deadline = Instant::now() + ctx.auth_timeout;
     let monitor_state = Arc::clone(&state);
     let monitor_ctx = Arc::clone(&ctx);
     let (abort_tx, mut abort_rx) = mpsc::channel::<()>(1);
     let monitor = tokio::spawn(async move {
         loop {
+            let authed = monitor_state.authed.load(Ordering::SeqCst);
             let recv = *monitor_state
                 .last_recv
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tokio::time::sleep_until(recv + HEARTBEAT_DISCONNECT_TIMEOUT).await;
-            if *monitor_state
+            let heartbeat = recv + HEARTBEAT_DISCONNECT_TIMEOUT;
+            let target = if authed {
+                heartbeat
+            } else {
+                std::cmp::min(auth_deadline, heartbeat)
+            };
+            tokio::time::sleep_until(target).await;
+            // 醒来重评估（sleep 期间 last_recv 可能刷新 / 鉴权可能已完成）
+            let authed = monitor_state.authed.load(Ordering::SeqCst);
+            let recv = *monitor_state
                 .last_recv
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                + HEARTBEAT_DISCONNECT_TIMEOUT
-                > Instant::now()
-            {
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let expired = if authed {
+                recv + HEARTBEAT_DISCONNECT_TIMEOUT <= Instant::now()
+            } else {
+                auth_deadline <= Instant::now()
+                    || recv + HEARTBEAT_DISCONNECT_TIMEOUT <= Instant::now()
+            };
+            if !expired {
                 continue;
             }
-            // 超时：标记收尾（CAS 防重复）+ 通知生命周期 + 通知主流程断开
+            // 超时：标记收尾（CAS 防重复）+ 通知生命周期（已鉴权才有 user）+ 通知主流程断开
             if monitor_state.closed.swap(true, Ordering::SeqCst) {
                 return; // 已收尾（客户端已断）
             }
@@ -1432,6 +1456,11 @@ pub async fn handle_connection(
                     .fact_tx
                     .send(LifecycleEvent::Disconnected { user_id, epoch })
                     .await;
+            } else {
+                warn!(
+                    "auth timeout: connection not authenticated within {:?}",
+                    monitor_ctx.auth_timeout
+                );
             }
             let _ = abort_tx.send(()).await;
             return;
