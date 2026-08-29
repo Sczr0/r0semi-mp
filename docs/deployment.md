@@ -129,3 +129,31 @@ journalctl -u r0semi-mp | tail
 - **"房间 ID 已被占用"但明明没人用**：CreateRoom 无幂等键（协议级限制，ISSUE-0010）——建房请求
   响应丢失后客户端同 id 重试必得此错。**指引：建房 id 建议带唯一后缀**（如 `xxx-8f3k`），
   撞 id 时直接换一个新 id 而不是原样重试；孤儿房风险见 `docs/issues/0010`。
+
+## 10. Docker 部署（D-01）
+
+仓库根 `Dockerfile`（multi-stage，clux/muslrust:1.98.0 产 musl 静态二进制，与 CI release 同工具链）
++ `docker-compose.yml`（一条命令起服）：
+
+```bash
+docker compose up -d --build        # 一条命令起服
+```
+
+**验收**（游戏端口 12346 + 管理 HTTP 8080）：
+
+```bash
+curl -s http://127.0.0.1:8080/healthz    # 期望 HTTP 200（healthz JSON）
+# 游戏端口握手（发版本字节 0x01 + Ping 帧 `01 00` → 收 Pong `01 00`）：
+python -c "import socket,time;s=socket.create_connection(('127.0.0.1',12346));s.sendall(b'\x01');time.sleep(.2);s.sendall(b'\x01\x00');print(s.recv(64).hex())"
+```
+
+覆盖配置：`cp server_config.example.yml server_config.yml` 修改后，取消 compose 中
+`./server_config.yml:/app/server_config.yml:ro` 挂载注释；管理面数据持久化在 named volume
+`r0semi-mp-data`（bans/audit/config 快照）。STOPSIGNAL SIGTERM → §11 优雅停机。
+
+> **静态验证（无 Docker 环境时）**：Dockerfile 构建命令与 CI release job 完全一致
+> （`cargo build --profile release-dist --target x86_64-unknown-linux-musl --bin r0semi-mp-server`，
+> 产物路径 `target/x86_64-unknown-linux-musl/release-dist/r0semi-mp-server`，见 `.github/workflows/ci.yml`）；
+> 镜像内默认 `server_config.yml`（12346 + http_port 8080 + persist /app/data）与 §2 字段集合一致
+> （`crates/phira-core/tests/example_yml.rs` 钉死解析）。`/healthz` 由 HTTP 端口提供
+> （`crates/phira-server/tests/healthz.rs` 覆盖），无需回源 API。
