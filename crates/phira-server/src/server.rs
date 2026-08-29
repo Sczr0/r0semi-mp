@@ -822,7 +822,7 @@ fn heartbeat_recovered(idle: Duration) -> bool {
 }
 
 /// 异常断连遥测窗口（参照 nodejsver：真实 IP 5min 窗口 ≥10 次判定攻击）。
-const RESET_WINDOW: Duration = Duration::from_secs(5 * 60);
+const RESET_WINDOW: Duration = Duration::from_mins(5);
 
 /// 遥测表跟踪的 IP 数上限（ISSUE-0012 教训：表只进不出 → 内存膨胀；本表有界）。
 const RESET_MAX_IPS: usize = 4096;
@@ -2062,8 +2062,8 @@ mod tests {
         // victim != ip 保护不误伤）；若全用同一时刻，HashMap 迭代序任意、min 可能选中
         // 当前 IP 而跳过淘汰，表会涨破上限。
         for i in 0..(RESET_MAX_IPS * 2) {
-            let hi = (i >> 16) as u16;
-            let lo = (i & 0xffff) as u16;
+            let hi = u16::try_from(i >> 16).unwrap();
+            let lo = u16::try_from(i & 0xffff).unwrap();
             let ip: std::net::IpAddr = format!("2001:db8:0:0:{hi:x}:{lo:x}:0:0").parse().unwrap();
             telemetry.record(
                 ip,
