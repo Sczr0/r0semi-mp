@@ -808,6 +808,119 @@ pub(crate) fn release_memory(bytes: usize) {
 pub fn in_flight_bytes() -> usize {
     IN_FLIGHT_BYTES.load(Ordering::SeqCst)
 }
+
+// —— C-02 心跳恢复 + 异常断连（ECONNRESET/ECONNABORTED）遥测 ——
+
+/// 心跳"濒危"阈值：距上次收包 ≥ 此值即视为接近心跳超时（[`HEARTBEAT_DISCONNECT_TIMEOUT`]
+/// 10s）——此后重新收到包 = "恢复正常"（打 info 恢复日志，排障价值）。
+const HEARTBEAT_STALE_MARK: Duration = Duration::from_secs(8);
+
+/// C-02：心跳恢复判定——上次收包距今 ≥ [`HEARTBEAT_STALE_MARK`]（濒危窗口）即算"恢复"。
+/// 纯函数便于单测；`handle_frame` 收包时调用打 info 恢复日志。
+fn heartbeat_recovered(idle: Duration) -> bool {
+    idle >= HEARTBEAT_STALE_MARK
+}
+
+/// 异常断连遥测窗口（参照 nodejsver：真实 IP 5min 窗口 ≥10 次判定攻击）。
+const RESET_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// 遥测表跟踪的 IP 数上限（ISSUE-0012 教训：表只进不出 → 内存膨胀；本表有界）。
+const RESET_MAX_IPS: usize = 4096;
+
+/// 每 IP 保留的窗口时间戳上限（单 IP 洪水也不撑爆队列）。
+const RESET_MAX_PER_IP: usize = 128;
+
+/// 告警阈值：窗口内 ≥ 10 次异常断连 → 告警进 audit（本期只告警、不自动封禁）。
+const RESET_ALERT_THRESHOLD: usize = 10;
+
+/// C-02：异常断连遥测表（进程单例；有界，见 [`ResetTelemetry`] 文档）。
+static RESET_TELEMETRY: std::sync::OnceLock<ResetTelemetry> = std::sync::OnceLock::new();
+
+/// C-02：异常断连（ECONNRESET/ECONNABORTED）按真实 IP 聚合的**有界**遥测表。
+///
+/// 内存纪律（§10.4 + ISSUE-0012 教训）：
+/// - IP 数上限 [`RESET_MAX_IPS`]——超限淘汰"最久未更新"的 IP（近似 LRU）；
+/// - 每 IP 时间戳上限 [`RESET_MAX_PER_IP`]——单 IP 洪水只留窗口内最近 N 次；
+/// - 时间戳按窗口 [`RESET_WINDOW`] 滑动裁剪，窗口外计数自动过期。
+///
+/// 本期只做可观测：`record` 返回窗口计数，达阈值由调用方告警进 audit，
+/// **不自动封禁**（保守、可观测优先；回环 IP 同计数但同样只告警）。
+pub struct ResetTelemetry {
+    inner: Mutex<std::collections::HashMap<std::net::IpAddr, Vec<Instant>>>,
+}
+
+impl Default for ResetTelemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResetTelemetry {
+    /// 新遥测表（空表，有界由常量保证）。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 记录一次异常断连（按真实 IP），返回该 IP 窗口内累计次数。
+    ///
+    /// 淘汰纪律：窗口裁剪 → 每 IP 上限 → IP 数上限（最久未更新淘汰）。
+    pub fn record(&self, ip: std::net::IpAddr, now: Instant) -> usize {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let times = map.entry(ip).or_default();
+        times.retain(|t| now.duration_since(*t) <= RESET_WINDOW);
+        times.push(now);
+        while times.len() > RESET_MAX_PER_IP {
+            times.remove(0);
+        }
+        let count = times.len();
+        if map.len() > RESET_MAX_IPS {
+            // 最久未更新淘汰：找窗口最早时间戳最小的 IP（近似 LRU）；先克隆避免借用冲突。
+            let victim = map
+                .iter()
+                .min_by_key(|(_, ts)| ts.first().copied().unwrap_or(now))
+                .map(|(ip, _)| *ip);
+            if let Some(victim) = victim
+                && victim != ip
+            {
+                map.remove(&victim);
+            }
+        }
+        count
+    }
+
+    /// 该 IP 当前窗口计数（只读观测；测试断言用）。
+    #[must_use]
+    pub fn count(&self, ip: std::net::IpAddr) -> usize {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(&ip).map_or(0, Vec::len)
+    }
+
+    /// 当前跟踪的 IP 总数（只读观测；有界断言用）。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.len()
+    }
+
+    /// 空表？
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// 每连接命令限速器（ISSUE-0006 修复：滥用控制"快端"防线）。
 ///
 /// 令牌桶简化版：每个受限命令类别记录"上次允许时刻"，距上次 ≥ interval 才放行。
@@ -1521,13 +1634,37 @@ pub async fn handle_connection(
     });
 
     // 等待连接关闭（客户端断开 / 心跳超时 / 慢消费者踢出）。
-    // select：客户端断开 → await_closed 返回；超时/踢出 → abort/kick 分支触发，
-    // await_closed future 被 drop（stream drop → abort 收发任务 → 连接断开）。
-    tokio::select! {
-        // await_closed move stream：客户端断开 → 正常返回；超时 → future drop → stream drop
-        () = stream.await_closed() => {}
-        () = async { abort_rx.recv().await; } => {}
-        () = async { kick_rx.recv().await; } => {}
+    // select：客户端断开 → await_closed 返回（含 C-02 关闭原因遥测）；
+    // 超时/踢出 → abort/kick 分支触发，await_closed future 被 drop
+    // （stream drop → abort 收发任务 → 连接断开）。
+    let close_cause: Option<std::io::ErrorKind> = tokio::select! {
+        // await_closed move stream：客户端断开 → 返回关闭原因；超时 → future drop → stream drop
+        cause = stream.await_closed() => cause,
+        () = async { abort_rx.recv().await; } => None,
+        () = async { kick_rx.recv().await; } => None,
+    };
+
+    // C-02：异常断连遥测（ECONNRESET/ECONNABORTED 按真实 IP 聚合；只告警不自动封禁）。
+    // 有界计数表（RESET_MAX_IPS / RESET_MAX_PER_IP / 窗口裁剪），ISSUE-0012 教训：表不膨胀。
+    if matches!(
+        close_cause,
+        Some(std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted)
+    ) {
+        let count = RESET_TELEMETRY
+            .get_or_init(ResetTelemetry::new)
+            .record(state.peer_ip, Instant::now());
+        if count >= RESET_ALERT_THRESHOLD {
+            warn!(
+                "connection reset flood from {ip}: {count} ECONNRESET/ECONNABORTED in \
+                 {RESET_WINDOW:?} window (alert only, no auto-ban)",
+                ip = state.peer_ip,
+            );
+            ctx.admin_audit.record(
+                "reset_flood",
+                &state.peer_ip.to_string(),
+                &format!("{count} resets in {RESET_WINDOW:?}"),
+            );
+        }
     }
 
     // 收尾（幂等：监控超时可能已发 Disconnected）
@@ -1573,6 +1710,19 @@ async fn handle_frame(
     send_tx: &Arc<mpsc::Sender<Outbound>>,
     cmd: ClientCommand,
 ) {
+    // C-02：心跳恢复日志（排障价值）——上次收包距今 ≥ HEARTBEAT_STALE_MARK（濒危，接近
+    // 10s 超时）后重新收到包 = "恢复正常"（info 一次；持续发包 idle 很小不触发）。
+    {
+        let idle = Instant::now()
+            - *state
+                .last_recv
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if heartbeat_recovered(idle) {
+            let user_id = state.user_id.load(Ordering::SeqCst);
+            info!("heartbeat recovered, user={user_id} (was idle {idle:?})");
+        }
+    }
     *state
         .last_recv
         .lock()
@@ -1881,5 +2031,67 @@ mod tests {
         // 现有受限命令仍覆盖
         assert!(rate_limit(&ClientCommand::Ping).is_none(), "Ping 不限速");
         assert!(rate_limit(&ClientCommand::Ready).is_none(), "Ready 不限速");
+    }
+
+    /// C-02：ECONNRESET/ECONNABORTED 遥测——单 IP 累计计数且窗口裁剪。
+    #[test]
+    fn reset_telemetry_counts_per_ip_and_prunes_window() {
+        let telemetry = ResetTelemetry::new();
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let base = Instant::now();
+        // 10 次窗口内 → 计数 10（达到告警阈值 RESET_ALERT_THRESHOLD）
+        for i in 0usize..10 {
+            assert_eq!(
+                telemetry.record(ip, base + Duration::from_millis((i * 100) as u64)),
+                i + 1
+            );
+        }
+        assert_eq!(telemetry.count(ip), 10);
+        // 窗口裁剪：旧时间戳（> RESET_WINDOW）不再计数
+        let late = base + RESET_WINDOW + Duration::from_secs(1);
+        assert_eq!(telemetry.record(ip, late), 1, "窗口外旧计数应被裁剪");
+    }
+
+    /// C-02：遥测表 IP 数有界（ISSUE-0012 教训）——超上限淘汰最久未更新。
+    #[test]
+    fn reset_telemetry_bounded_by_max_ips() {
+        let telemetry = ResetTelemetry::new();
+        let base = Instant::now();
+        // 灌入 RESET_MAX_IPS * 2 个不同 IP（IPv6 有足够地址空间）：表必须仍 ≤ RESET_MAX_IPS。
+        // 时间戳递增（每 IP 不同）——淘汰"最久未更新"有确定解（最早者必非当前 IP，
+        // victim != ip 保护不误伤）；若全用同一时刻，HashMap 迭代序任意、min 可能选中
+        // 当前 IP 而跳过淘汰，表会涨破上限。
+        for i in 0..(RESET_MAX_IPS * 2) {
+            let hi = (i >> 16) as u16;
+            let lo = (i & 0xffff) as u16;
+            let ip: std::net::IpAddr = format!("2001:db8:0:0:{hi:x}:{lo:x}:0:0").parse().unwrap();
+            telemetry.record(ip, base + Duration::from_secs(1) + Duration::from_secs(i as u64));
+        }
+        assert!(telemetry.len() <= RESET_MAX_IPS, "IP 数必须受 RESET_MAX_IPS 约束");
+        // 每 IP 计数也有上限（单 IP 洪水不撑爆）
+        let flood: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+        for i in 0..(RESET_MAX_PER_IP * 4) {
+            telemetry.record(flood, base + Duration::from_secs(1) + Duration::from_secs(i as u64));
+        }
+        assert!(telemetry.count(flood) <= RESET_MAX_PER_IP, "单 IP 计数必须受 RESET_MAX_PER_IP 约束");
+    }
+
+    /// C-02：心跳恢复判定（纯函数）——濒危窗口（≥ HEARTBEAT_STALE_MARK）触发恢复日志；
+    /// 正常节奏（HEARTBEAT_INTERVAL=3s 附近）不触发。
+    #[test]
+    fn heartbeat_recovery_mark_threshold() {
+        assert!(
+            heartbeat_recovered(Duration::from_secs(9)),
+            "9s 濒危应触发恢复判定"
+        );
+        assert!(
+            heartbeat_recovered(HEARTBEAT_STALE_MARK),
+            "恰好 8s（边界）应触发"
+        );
+        assert!(
+            !heartbeat_recovered(Duration::from_secs(3)),
+            "3s 正常心跳节奏不应触发"
+        );
+        assert!(!heartbeat_recovered(Duration::ZERO), "0s 不应触发");
     }
 }

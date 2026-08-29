@@ -235,7 +235,7 @@ async fn server_initiated_push() {
         )
         .await
         .unwrap();
-        stream.await_closed().await;
+        let _ = stream.await_closed().await;
     });
 
     let mut client = TcpStream::connect(addr).await.unwrap();

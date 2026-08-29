@@ -216,6 +216,10 @@ pub struct Stream<R> {
     send_task_handle: Option<JoinHandle<()>>,
     recv_task_handle: Option<JoinHandle<Result<()>>>,
 
+    /// 关闭原因（C-02 遥测）：收发任务记录 socket 层 io 错误 kind（ECONNRESET /
+    /// ECONNABORTED 等）；`await_closed` 取出供连接收尾按真实 IP 聚合。
+    close_cause: Arc<std::sync::Mutex<Option<std::io::ErrorKind>>>,
+
     _marker: PhantomData<R>,
 }
 
@@ -263,7 +267,10 @@ where
 
         let (send_tx, mut send_rx) = mpsc::channel(1024);
         let send_tx = Arc::new(send_tx);
+        // C-02：关闭原因共享槽（收发任务记录，await_closed 取出）
+        let close_cause = Arc::new(std::sync::Mutex::new(None));
         let send_task_handle = tokio::spawn({
+            let close_cause = Arc::clone(&close_cause);
             async move {
                 // 安全锁 A：Drop guard——任务结束（含 abort）释放剩余记账（无泄漏）
                 let _releaser = MemoryReleaser(Arc::clone(&queue_bytes));
@@ -319,6 +326,10 @@ where
 
                     if let Err(err) = write.write_all(&out).await {
                         error!("failed to send: {err:?}");
+                        // C-02：发送方向 socket 错误（ECONNRESET/ECONNABORTED）也记录关闭原因
+                        *close_cause
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(err.kind());
                     }
                 }
                 // 安全锁 A：写任务结束（send_rx 关闭 = 连接收尾）——释放剩余记账，
@@ -332,20 +343,29 @@ where
 
         let recv_task_handle = tokio::spawn({
             let send_tx = Arc::clone(&send_tx);
+            let close_cause = Arc::clone(&close_cause);
             async move {
                 // A/B 对拍开关（2026-08，flamegraph workflow 对拍协议，docs/performance-cpu.md §6）：
                 // R0SEMI_DISABLE_READ_COALESCE=1 → 旧逐字节读（对照基线）；未设 → 合读。
                 // 合读为默认与长期形态；legacy 仅作基准/回归安全网——同代码同 workflow 只差
                 // 一个 env，帧率归一对拍无混差（每帧 CPU 成本为裁决依据）。
-                if std::env::var("R0SEMI_DISABLE_READ_COALESCE").is_ok_and(|v| v == "1") {
-                    let _ =
-                        recv_packets_legacy(&mut read, &send_tx, &packet_limit, &mut handler).await;
+                // C-02：读错误（连接被 RST / 中断 / 半帧挂断）不再吞掉——下钻 io kind
+                // 记录到 close_cause（ECONNRESET/ECONNABORTED 遥测的接收侧来源）。
+                let result = if std::env::var("R0SEMI_DISABLE_READ_COALESCE")
+                    .is_ok_and(|v| v == "1")
+                {
+                    recv_packets_legacy(&mut read, &send_tx, &packet_limit, &mut handler).await
                 } else {
-                    let _ =
-                        recv_packets_coalesced(&mut read, &send_tx, &packet_limit, &mut handler)
-                            .await;
+                    recv_packets_coalesced(&mut read, &send_tx, &packet_limit, &mut handler).await
+                };
+                if let Err(err) = &result
+                    && let Some(io_err) = err.downcast_ref::<std::io::Error>()
+                {
+                    *close_cause
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(io_err.kind());
                 }
-                Ok(())
+                result
             }
         });
 
@@ -354,6 +374,7 @@ where
             send_tx,
             send_task_handle: Some(send_task_handle),
             recv_task_handle: Some(recv_task_handle),
+            close_cause,
             _marker: PhantomData,
         })
     }
@@ -388,11 +409,18 @@ where
 
     /// 等待接收任务结束（连接断开 / 解码失败 / 对端关闭）；期间保持发送任务存活。
     ///
+    /// 返回关闭原因（C-02 遥测）：收发任务记录的 socket io kind（ECONNRESET /
+    /// ECONNABORTED 等）；优雅关闭/解码失败/半帧挂断等非 io 错误 → `None`。
+    ///
     /// 会话层（阶段 2）在此之后收尾：归还用户、拆房间任务等。
-    pub async fn await_closed(mut self) {
+    pub async fn await_closed(mut self) -> Option<std::io::ErrorKind> {
         if let Some(handle) = self.recv_task_handle.take() {
             let _ = handle.await;
         }
+        *self
+            .close_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
