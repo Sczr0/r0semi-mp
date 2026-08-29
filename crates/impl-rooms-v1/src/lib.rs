@@ -718,21 +718,19 @@ impl RoomV1 {
         let Origin::Client { user_id } = ctx.origin else {
             return (None, Vec::new());
         };
-        // 幂等预检：已入账 / 已中止 / 已在途（回源未归）——任一即按"成绩以首条为准"
-        // 拒绝。in-flight 是关键：回注前的窗口内重复上报无法从 results 察觉。
+        // 幂等预检（ADR-0013）：已入账 / 已中止 / 已在途（回源未归）——任一即按
+        // "成绩以首条为准"静默幂等成功（对齐 gooophira + ISSUE-0010 哲学：能服务端
+        // 幂等的服务端做——Played 有 user_id 房内唯一锚点，可安全幂等）。in-flight
+        // 是关键：回注前的窗口内重复上报无法从 results 察觉。重复上报不改变状态、
+        // 不产生事件、不重复回源；debug 留痕供运维辨重试与攻击。
         match &self.state {
             InternalState::Playing { results, aborted } => {
                 if results.contains_key(&user_id)
                     || aborted.contains(&user_id)
                     || self.inflight.iter().any(|(u, _)| *u == user_id)
                 {
-                    return (
-                        Some(RoomResponse::Failure(RoomError::Business {
-                            code: RoomErrorCode::AlreadyUploaded,
-                            msg: "already uploaded".to_owned(),
-                        })),
-                        Vec::new(),
-                    );
+                    tracing::debug!(user_id, "duplicate played — idempotent success");
+                    return (Some(RoomResponse::Ok), Vec::new());
                 }
             }
             // 非 Playing：与原版一致静默成功（不登记 in-flight、不发起回源无效功）

@@ -533,9 +533,11 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
     let (resp, events) = room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
     assert!(matches!(resp, Some(RoomResponse::Ok)));
     assert!(events.is_empty(), "受理段不应产出事件: {events:?}");
-    // 重复上报（受理段即拒，与旧 AlreadyUploaded 语义一致）
-    let (resp, _) = room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
-    assert_business(resp.as_ref().unwrap(), RoomErrorCode::AlreadyUploaded);
+    // 重复上报（ADR-0013 幂等：已入账/已在途命中 → 静默 Ok，无事件、不重复回源；
+    // 对齐 gooophira + ISSUE-0010 哲学。此断言钉死"成绩以首条为准"幂等口径）
+    let (resp, events) = room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)), "重复上报应静默成功");
+    assert!(events.is_empty(), "幂等重放不应产出事件: {events:?}");
 
     // 第 2 段（回注）：RecordFetched 系统命令应用回源结果 → Played 广播事件。
     let (resp, events) = room
@@ -584,9 +586,11 @@ async fn game_flow<F: RoomFactory>(factory: &F) {
         }),
         "违规成绩提交者应结算为 aborted（否则房间卡 Playing）: {events:?}"
     );
-    // 被结算后重试上报 → AlreadyUploaded（aborted 幂等锁位，无成绩可再取）
-    let (resp, _) = room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
-    assert_business(resp.as_ref().unwrap(), RoomErrorCode::AlreadyUploaded);
+    // 被结算（aborted）后重试上报 → 幂等静默 Ok（ADR-0013；aborted 幂等锁位——
+    // 成绩以首条为准，重复上报不改变状态、无成绩可再取）
+    let (resp, events) = room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)), "aborted 后重试应静默成功");
+    assert!(events.is_empty(), "幂等重放不应产出事件: {events:?}");
 
     // —— 全员完成 → GameEnd（§6.5-11；user3 受理 + 回注触发结算）——
     let (resp, _) = room.handle(ctx(3), RoomCommand::Played { id: 3 }).await;
