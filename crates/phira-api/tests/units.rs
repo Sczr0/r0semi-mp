@@ -233,3 +233,26 @@ fn user_identity_construct() {
     };
     assert_eq!(id.user_id, 7);
 }
+
+// —— HashMap（§6.3：长度前缀 + K/V 对；入库断言具体错误变体，见 mutants 体检） ——
+
+#[test]
+fn hashmap_declared_len_too_large_rejected() {
+    // len=2 但剩余仅 1 字节：长度校验应**先行**拒收 ArrayTooLarge——
+    // 断言变体而非仅 is_err，确保不是靠后续读取撞出 Eof（两变异方向都要挡住）
+    let data = [0x02, 0x2a];
+    let err = decode_packet::<HashMap<u8, ()>>(&data).unwrap_err();
+    assert!(
+        matches!(err, DecodeError::ArrayTooLarge { .. }),
+        "长度校验应先行拒绝：{err:?}"
+    );
+}
+
+#[test]
+fn hashmap_exact_remaining_boundary_ok() {
+    // len == remaining（每条目恰好 1 字节）：边界成功——
+    // 抓住 `>` 误变异为 `>=`/`==`（此时会误拒收）
+    let data = [0x01, 0x2a];
+    let map = decode_packet::<HashMap<u8, ()>>(&data).unwrap();
+    assert_eq!(map.get(&42), Some(&()));
+}
