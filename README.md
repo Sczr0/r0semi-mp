@@ -9,7 +9,7 @@
 - **高内聚低耦合**：严格的契约分层与模块化设计，使开发者在替换或扩展各子系统时无需费心处理代码间的复杂耦合。
 - **安全与自动化**：注重安全性防线与高测试覆盖率，并通过 GitHub Actions 实现自动化测试与夜间构建（Nightly）发布。
 
-你可以在 [Releases / Nightly](https://github.com/Sczr0/r0semi-mp/releases/tag/nightly) 下载由 Action 自动编译的最新版本。
+你可以在 [Releases / Nightly](https://github.com/Sczr0/r0semi-mp/releases/tag/nightly) 下载由 Action 自动编译的最新版本，请注意，该版本为 Linux 的 musl 版本，如有需要，请另行编译。
 
 未尽事宜，你可以通过 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Sczr0/r0semi-mp) 获取本项目的更多架构与设计细节。
 

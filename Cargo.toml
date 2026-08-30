@@ -20,11 +20,8 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
-# 全量 pedantic：宁可现在集中修，不让警告越堆越多（2026-08 决策）
 pedantic = { level = "warn", priority = -1 }
-# doc_markdown 是纯格式（缺反引号），对契约文档质量贡献低；missing_docs=deny 已保证存在性
 doc_markdown = "allow"
-# 能 const 的函数就 const（借鉴 Next-Phi-Backend）：编译期求值，利于优化
 missing_const_for_fn = "warn"
 
 # 红线：phira-api 只允许 thiserror/half 等轻量库，零 tokio（§4.3-1 / §4.8）
@@ -37,7 +34,7 @@ anyhow = "1"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal", "fs"] }
 
-# 发布构建（§部署）：CI 用 musl 静态构建 + strip 减小体积
+# 发布构建
 [profile.release-dist]
 inherits = "release"
 strip = "symbols"
