@@ -114,3 +114,5 @@ jobs:
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
+          # 空目录 = 本轮无 crash（正常信号），不上传避免警告噪音
+          if-no-files-found: ignore
