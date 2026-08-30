@@ -65,6 +65,27 @@ fn varchar_length_boundary() {
 }
 
 #[test]
+fn varchar_decode_boundary_exact_len_ok() {
+    // 解码路径 len == N 恰好合法（mutants 体检：read_binary 的 `>` → `>=`
+    // 变异存活——varchar_length_boundary 只测 new() 构造器，未触解码路径）
+    let mut data = vec![32u8]; // uleb len = 32
+    data.extend(vec![b't'; 32]);
+    let v = decode_packet::<Varchar<32>>(&data).unwrap();
+    assert_eq!(v.as_str(), &"t".repeat(32));
+}
+
+#[test]
+fn varchar_decode_boundary_over_len_rejected() {
+    let mut data = vec![33u8]; // uleb len = 33
+    data.extend(vec![b't'; 33]);
+    let err = decode_packet::<Varchar<32>>(&data).unwrap_err();
+    assert!(
+        matches!(err, DecodeError::StringTooLong { max: 32, len: 33 }),
+        "应拒收超限：{err:?}"
+    );
+}
+
+#[test]
 fn varchar_byte_len_not_char_len() {
     // 长度按**字节**计（§6.2）：3 字节中文占 9 字节
     let three_chinese = "哈哈哈";
