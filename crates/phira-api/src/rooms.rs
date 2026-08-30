@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! 房间契约：内部契约层（RoomCommand / RoomEvent / CmdCtx / 薄缝 trait）。
 //!
 //! 依据：ARCHITECTURE.md §4.4（薄缝完整形态）、§4.9（并发模型）、§6.5（规则清单）。
@@ -89,6 +90,7 @@ pub struct CompactPos {
 }
 
 impl CompactPos {
+    // 构造器改写自 phira-mp（Apache-2.0，TeamFlos）command.rs 的同类实现，见 NOTICE。
     /// 从 f32 构造（内部转 f16 半精度）。
     pub fn new(x: f32, y: f32) -> Self {
         Self {

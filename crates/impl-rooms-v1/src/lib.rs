@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! # impl-rooms-v1 —— 第一个货物（§4.1 / §6.5）
 //!
 //! 房间实现，照原版 phira-mp room.rs 语义（§6.5 规则清单逐条兑现）。
@@ -47,6 +48,7 @@ enum InternalState {
 }
 
 impl InternalState {
+    // 状态映射改写自 phira-mp（Apache-2.0，TeamFlos）room.rs 的同类 match，见 NOTICE。
     const fn to_client(&self, chart: Option<i32>) -> RoomState {
         match self {
             Self::SelectChart => RoomState::SelectChart(chart),

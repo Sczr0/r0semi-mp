@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! 服务器（§4.5）：监听 + accept + 连接处理（握手 → 鉴权 → 命令派发 → 事件投递）。
 //!
 //! 阶段 2 接线完成：`handle_connection` 驱动协议全流程（§6.6 表 1/表 2 + §4.9-3 生命周期）。
@@ -1743,6 +1744,7 @@ async fn handle_frame(
         if let ClientCommand::Authenticate { token } = cmd {
             authenticate_flow(ctx, state, send_tx, token.as_str()).await;
         } else {
+            // 文案沿袭 phira-mp（Apache-2.0，TeamFlos）session.rs 的对应 warn，见 NOTICE。
             warn!("packet before authentication, ignoring: {cmd:?}");
         }
         return;

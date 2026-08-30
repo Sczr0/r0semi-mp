@@ -10,7 +10,9 @@ members = [
 
 [workspace.package]
 edition = "2024"
-license = "Apache-2.0"
+# 主许可 AGPL-3.0-only（见 LICENSE）；binary.rs/stream.rs 为 Apache-2.0 移植文件
+# （见 LICENSE.Apache-2.0 + NOTICE），包内以文件级 SPDX 头区分
+license = "AGPL-3.0-only"
 rust-version = "1.98"
 
 [workspace.lints.rust]

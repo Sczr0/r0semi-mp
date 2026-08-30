@@ -1,0 +1,37 @@
+r0semi-mp
+
+Copyright (c) 2026 r-0semi
+
+本项目采用 GNU Affero General Public License v3.0（SPDX: AGPL-3.0-only）许可，
+见 LICENSE。
+
+移植自上游 phira-mp 项目的代码
+--------------------------------
+
+以下文件移植/改写自 phira-mp（https://github.com/TeamFlos/phira-mp，
+Apache License 2.0，版权归 phira-mp 贡献者所有）。它们继续以 Apache
+License 2.0（SPDX: Apache-2.0）授权，全文见 LICENSE.Apache-2.0：
+
+- crates/phira-api/src/binary.rs       —— 二进制编解码（BinaryData/BinaryReader/
+  BinaryWriter），改写自 phira-mp-common/src/bin.rs
+- crates/phira-server/src/stream.rs    —— 帧读写循环 + 发送任务，
+  移植自 phira-mp-common/src/lib.rs
+
+此外，上游实现的少量片段出现在本就原创的文件中（出处均以行内注释标注）：
+
+- crates/phira-api/src/proto.rs        —— Played 结构字段 / Varchar<>
+  BinaryData impl 签名（协议约束的命令字典条目）
+- crates/phira-api/src/rooms.rs        —— TouchPoint::new 的 f16 构造器
+- crates/impl-rooms-v1/src/lib.rs      —— 状态转换 match（房间状态到协议
+  RoomState 的映射）
+- crates/phira-server/src/server.rs    —— 鉴权门日志文案措辞
+- phira-server 集成测试                —— ULEB128 读取循环尾部
+  （`pos += 7; if byte & 0x80 == 0`），出现在读帧测试辅助中
+- docs/client-conformance.md           —— 引用的客户端 SDK 代码片段
+  （标注 file:line，仅作行为对照复现）
+
+phira-mp 网络协议本身（线格式、字段名、tag、时序常量）属事实性协议数据，
+不构成版权保护的表达，其复用不受本声明限制。
+
+注：本文件为项目归属与许可结构说明；LICENSE 与 LICENSE.Apache-2.0 的许可文本
+以英文原文为准。

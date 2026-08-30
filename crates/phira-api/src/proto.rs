@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// 本文件移植自 phira-mp（Apache-2.0，TeamFlos）：phira-mp-common/src/command.rs 的
+// 命令字典投影（含协议约束的字段形状与 tag 序）。Apache-2.0 全文见 LICENSE.Apache-2.0，
+// 归属声明见 NOTICE。
 //! 协议命令层（§6.3）——协议直接投影，无猜测成分。
 //!
 //! 原版 `phira-mp-common` 的 `command.rs` 移植（Apache-2.0，TeamFlos）。

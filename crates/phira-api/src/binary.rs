@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// 本文件移植自 phira-mp（Apache-2.0，TeamFlos）：phira-mp-common/src/bin.rs。
+// Apache-2.0 全文见 LICENSE.Apache-2.0，归属声明见 NOTICE。
 //! 二进制编解码（协议 §6.2）。
 //!
 //! 原版 `phira-mp-common` 的 `bin.rs` 移植（Apache-2.0，TeamFlos），按本架构轻量化：

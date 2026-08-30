@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// 本文件移植自 phira-mp（Apache-2.0，TeamFlos）：phira-mp-common/src/lib.rs 的
+// Stream 帧读写 + 发送任务。Apache-2.0 全文见 LICENSE.Apache-2.0，归属声明见 NOTICE。
 //! 协议帧层（§6.1）——原版 `phira-mp-common` 的 `Stream` 移植（Apache-2.0，TeamFlos）。
 //!
 //! 职责（不含心跳判定——那是 core 会话层的生命周期逻辑，阶段 2 接线）：
