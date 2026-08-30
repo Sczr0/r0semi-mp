@@ -1,0 +1,110 @@
+# 深度验证（手动触发，非发布闸门）：CI 七步之外的慢速质量审计。
+#
+# 拓扑：主 CI（ci.yml）通过后，本 workflow 手动触发——三个 job 并行，
+# 各自产 artifact。与 flamegraph.yml 同理：慢（mutants 全量 ~30-60min），
+# 不塞进 push/PR 主闸门；公共仓库不限时长，全量跑不心疼。
+#
+# 分工（各自回答一个问题）：
+#   mutants  —— 测试的测试：契约/解码测试真能抓住行为变化吗？（survived>0 → 红）
+#   coverage —— 哪些分支连测试都没写过？（只报不卡，跑几轮看波动再决定是否设阈值）
+#   fuzz     —— libFuzzer 覆盖率引导喂解码器（超越 proptest 固定种子；crash → 红 + 输入留存）
+#
+# 工具链：不变更 rust-toolchain.toml 的 1.98.0 复现——fuzz 的 nightly 仅经
+# RUSTUP_TOOLCHAIN env 覆盖本 job（env 优先级高于 rust-toolchain.toml）。
+name: deep-verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      fuzz_runs:
+        description: libFuzzer 迭代次数（解码器小而快，默认 50 万 ≈ 分钟级）
+        default: "500000"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@cargo-mutants
+
+      - name: Mutation test phira-api
+        # PROPTEST_CASES=100：fuzz.rs 的 proptest 默认 1 万 case/类型，每个变异点
+        # 都重跑全套——不压到百级，全量变异会慢到不可用（环境变量是 proptest 官方覆盖口）。
+        # 首次跑大概率有 survived（错误文案/Debug 等无害变异），那是覆盖盲区清单而非故障。
+        # 有 survived 时 cargo-mutants 退出码 1 → job 红。
+        env:
+          PROPTEST_CASES: "100"
+        run: cargo mutants --package phira-api --timeout 60
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-report
+          path: mutants.out/
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned) + llvm-tools
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Coverage report (workspace, report-only)
+        # 只产报告不卡阈值：异步/宏展开噪音大，先积累几轮数据再决定是否门槛化
+        run: |
+          cargo llvm-cov --workspace --all-targets --lcov --output-path lcov.info --html
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: |
+            lcov.info
+            target/llvm-cov/html/
+
+  fuzz:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly  # 仅本 job 覆盖；fuzz crate 亦不在 workspace，双保险
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain (fuzz 专用，不影响主工具链钉死)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Fuzz decode (coverage-guided)
+        working-directory: fuzz
+        # max_len 与 proptest 同口径（0-1024）；timeout 防单输入挂死
+        run: |
+          cargo fuzz run decode -- -runs=${{ inputs.fuzz_runs }} -max_len=1024 -timeout=5
+
+      - name: Upload crash inputs (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/

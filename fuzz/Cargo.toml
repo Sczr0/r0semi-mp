@@ -1,0 +1,31 @@
+# cargo-fuzz 增量模糊（§9 模糊层 + CI 深度验证）：libFuzzer 覆盖率引导——
+# 与 tests/fuzz.rs（proptest 固定种子，常驻 CI）互补：自动钻新路径，
+# 手动/CI workflow 触发，不进主闸门。
+#
+# 本 crate 刻意**不加入根 workspace members**（cargo-fuzz 标准布局，自带
+# `[workspace]` 空表脱离）：check-deps.py 只查 member，无需登记 ALLOW；
+# nightly 工具链只在 fuzz job 内覆盖，不影响 rust-toolchain.toml 的 1.98.0 复现。
+[package]
+name = "phira-api-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+phira-api = { path = "../crates/phira-api" }
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+
+[profile.release]
+# 符号信息：崩溃栈可读（libFuzzer 栈轨迹）
+debug = 1
+
+[workspace]

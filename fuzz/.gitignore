@@ -1,0 +1,4 @@
+# 独立 workspace（非根成员）：产物与根 /target 规则分离，各自忽略
+/target
+# libFuzzer 崩溃输入（CI 深度验证时由 workflow artifact 捕获，不入库）
+/artifacts
