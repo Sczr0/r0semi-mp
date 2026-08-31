@@ -39,6 +39,24 @@ use tokio::net::{TcpListener, TcpStream};
 
 // —— mock API（按 token 返回身份；/chart/1 返回谱面） ——
 
+/// 全文件串行锁（ISSUE-0014 复现加固，2026-08-31）：
+///
+/// 本文件每个测试都起"完整服务器 + 真 SDK"（多 tokio 运行时 + 多任务），**并行跑**
+/// 会放大未定位的 tokio 调度问题——CI Linux 4-worker 并发 5 测试实测复现（SDK
+/// 424 行重复响应 panic + JoinRoom 超时）。串行化后回到 ISSUE-0014 验证过的稳定形态，
+/// 测试价值不变（仍各自全链路）。用 tokio Mutex：guard 跨 await 合法，clippy 不报。
+static CONFORMANCE_SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// 取串行锁（tokio Mutex guard 跨 await 持有是合法设计）。
+macro_rules! serial_conformance {
+    () => {
+        let _serial = CONFORMANCE_SERIAL
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+    };
+}
+
 /// 绑定好的 mock HTTP 服务器（listener 由调用方预绑定，避免"drop 后重绑端口"竞态）。
 async fn mock_api(listener: TcpListener) {
     loop {
@@ -182,6 +200,7 @@ async fn sdk_blocking_state(client: &Arc<Client>) -> Option<phira_mp_common::Cli
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a2_a3_real_sdk_connect_auth_ping() {
+    serial_conformance!();
     let addr = spawn_server().await;
 
     let client = sdk_connect(addr).await;
@@ -205,6 +224,7 @@ async fn a2_a3_real_sdk_connect_auth_ping() {
 /// 建房 → 第二人入房 → 断线重连（全新 TCP + 重新鉴权）→ 快照带原房间。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a1_a5_room_lifecycle_and_reconnect_snapshot() {
+    serial_conformance!();
     let addr = spawn_server().await;
 
     // 房主 A：建房（响应唯一——重复响应会 panic SDK）
@@ -253,6 +273,7 @@ async fn a1_a5_room_lifecycle_and_reconnect_snapshot() {
 /// LockRoom 推送被真客户端应用（locked=true 可见）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a6_broadcasts_decode_by_real_sdk() {
+    serial_conformance!();
     let addr = spawn_server().await;
 
     let host = sdk_connect(addr).await;
@@ -339,6 +360,7 @@ async fn assert_no_room_push_to_unjoined(
 /// （client-behavior-review §5 A2）。这是"服务端多说话就出事"的第一条可执行断言。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a2_no_room_push_to_unjoined_user() {
+    serial_conformance!();
     let addr = spawn_server().await;
     let guest = sdk_connect(addr).await;
     guest.authenticate("tokB").await.unwrap();
@@ -350,6 +372,7 @@ async fn a2_no_room_push_to_unjoined_user() {
 /// 证明上面的负向断言不是"服务端从不推任何东西"，而是精确地"只对未入房者禁推"。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a2_in_room_user_gets_pushes() {
+    serial_conformance!();
     let addr = spawn_server().await;
     let host = sdk_connect(addr).await;
     host.authenticate("tokA").await.unwrap();

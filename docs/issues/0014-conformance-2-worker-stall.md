@@ -54,3 +54,17 @@ conformance 测试在 `#[tokio::test(flavor = "multi_thread", worker_threads = 2
   `worker_threads = 4`**——本 issue 的绕过策略延续，未改 2 线程复测；
 - 本轮 6 个 conformance 测试全绿（本地连续跑）；
 - 待办不变：升级 tokio 依赖时顺手复测 2 线程（验收标准第二条），复测结果回写本 issue。
+
+## 复现记录（2026-08-31，CI Linux）——并发放大实锤
+
+- **现象**：`worker_threads = 4` 下并发跑 5 个 conformance 测试（P4 从 3 个加到 5 个），
+  CI Linux 实测 `a1_a5` 挂——SDK `lib.rs:424` 收到**同一命令第二次响应** panic
+  （`cb().take().unwrap()` on None）+ 对应 JoinRoom 超时（10s）；
+- **对照**：本地 Windows 串行/并行/单独跑全部稳定（3 连跑全绿）——与 issue 正文
+  "Windows 上 4-worker 5 连跑稳定"一致，证实是**并发任务形状 + 平台调度**触发，
+  非协议 bug（e2e 同构稳定）；
+- **处置（方案 C）**：conformance.rs 加**全文件串行锁**（tokio Mutex + OnceLock，
+  `serial_conformance!` 宏）——每个测试独占运行，消除并发放大；5 测试全绿 +
+  clippy 干净；测试价值不变（各自仍全链路）；
+- **教训回写**：issue 正文"若未来有人……加更多并发测试，可能复现"**已被实测证实**；
+  串行锁应视为本文件的长期约束（新增测试必须带 `serial_conformance!()`）。
