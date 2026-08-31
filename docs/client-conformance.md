@@ -107,13 +107,20 @@ r0semi 的 interop 测试用的 `phira-mp-client` **就是真客户端集成的�
 ### 一致性验证体系设计（"永续方案"）
 
 ```text
-1. 锁版本   → interop 测试钉住具体 commit："client@51b05cb 全绿"
+1. 锁版本   → interop 测试钉住具体 commit："client@cc822df 全绿"
 2. 建断言库 → 对抗性序列 × phira_mp_client::Client
              "建房瞬间并发 LockRoom → 断言不 panic 且状态一致"
 3. 审计UI层 → phira/src/mp/panel.rs（825行）+ song.rs 假设清单化，并入服务器行为规格
 4. 装漂移哨兵 → CI 定期 diff 上游 mp 相关文件，变更即重跑全部兼容性测试并更新怪癖文档
 5. 保三足鼎立 → Oracle(字节) + Conformance(行为) + Contract(自身)，缺一不可
 ```
+
+> **状态注记（2026-08-31）**：步骤 1 已落地（Cargo.toml rev=cc822df 钉死）；
+> 步骤 2 已动工（conformance.rs 断言库雏形——`assert_no_room_push_to_unjoined` A2 负向注入，
+> 三面覆盖 Message/状态/心跳，正向基线对照）；
+> 步骤 4 已动工（`tools/check-client-drift.py` 漂移哨兵 + drift-sentinel workflow 手动/每周，
+> 漂移即红并提示重跑兼容测试 + 更新本清单）；
+> 步骤 3（UI 层审计）与"并发 LockRoom 竞态"对抗场景待续。
 
 ### 明确边界（不能"彻底根治"的部分）
 

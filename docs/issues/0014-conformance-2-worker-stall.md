@@ -47,3 +47,10 @@ conformance 测试在 `#[tokio::test(flavor = "multi_thread", worker_threads = 2
 
 - conformance.rs（崩溃猎手，client-behavior-review §5 A1–A6）
 - client-conformance.md §已落地（坑位注记的文档锚点）
+
+## 复核注记（2026-08-31）
+
+- 断言库雏形（P4）新增 2 个 conformance 测试（A2 负向注入 + 正向基线），**同样取
+  `worker_threads = 4`**——本 issue 的绕过策略延续，未改 2 线程复测；
+- 本轮 6 个 conformance 测试全绿（本地连续跑）；
+- 待办不变：升级 tokio 依赖时顺手复测 2 线程（验收标准第二条），复测结果回写本 issue。

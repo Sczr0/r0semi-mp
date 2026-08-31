@@ -149,6 +149,14 @@ DTO 未接）一并落地。
 Moderator 观察者面落地 + R2 高频观测（3.6.1，纯 flag 不自动拦）——即 C4 的"拦截类"规则已走
 观察者通道出账；`RecordPolicy` 回注点裁决插座仍未建，触发点 = P3 难度校验（mod/level，
 DTO 未接）或多解规则真实出现。
+
+> **P2 落地阻力实证（2026-08-31）**：本段"上游有 mod/level"为**未实证断言语**——实地核查
+> 原版 `phira-mp-server/src/server.rs:27` `Record` 结构体**无** mod/level 字段；本地所有源码
+> 均无该字段证据；线上官方 API（`/record/{id}`）需鉴权，无法直接取证。**当前添加
+> `Record.mod`/`level` 会因字段名猜错（如官方叫 `charm`/`difficulty` 而非 `mod`/`level`）
+> 而成为永死字段。** 故 P2 降级为勘误：**不添加**，留待拿到官方 `/record` 真实响应结构
+> 或 P3 规则需求出现时再定字段名。加入后还需 `#[serde(default)]` + Option 缺省（与现有
+> `chart: Option<i32>` 同款风格），并需验证字段名与实际 API 响应一致。
 ---
 
 ## D 级：防御缺口（有意取舍但仍属缺口）
@@ -157,7 +165,7 @@ DTO 未接）或多解规则真实出现。
 |---|---|---|---|
 | D1 | Chat 不限速（✅ 已解决 2026-08）——`rate_limit()` 白名单加入 `ClientCommand::Chat`（2/s，500ms 间隔），超限回 `TooManyRequests`；`rate_limit` 单元测试 + 移植 memory_guard 测试改用 Touches | `rate_limit()` 白名单只有 CreateRoom/JoinRoom/SelectChart/Played；注释"低频命令(Chat/Ready…)不限"是显式决定 | gooophira 聊天 2/s 令牌桶 |
 | D2 | 版本握手不校验（✅ 已解决 2026-08）——`handle_connection` 握手后校验 `stream.version() != PROTOCOL_VERSION` 即释放准入并断开，回归测试 `handshake_rejects_wrong_version_then_accepts_v1` | stream.rs 读取版本但只记录展示（healthz），不拒绝不匹配 | gooophira `ver != protocolVersion` 即断 |
-| D3 | protocol_hack 层缺失 | 无真客户端怪癖补偿机制（✅ 部分推进 2026-08：conformance.rs 真 SDK 崩溃猎手 A1–A6 已落地且全绿；一致性断言库 + 漂移哨兵未建，见 client-conformance.md 五步规划） | gooophira/jphira 的 forceSyncInfo/fixClientRoomState（源码已验证怪癖机制，见 client-conformance.md） |
+| D3 | protocol_hack 层缺失 | 无真客户端怪癖补偿机制（✅ **部分推进 2026-08-31**：conformance.rs 真 SDK 崩溃猎手 A1–A6 全绿 + **断言库雏形**（A2 负向注入：未入房用户绝收房间推送，三面覆盖）+ **漂移哨兵**（tools/check-client-drift.py + drift-sentinel workflow 手动/每周）——client-conformance.md 五步规划步骤 2/4 已动工） | gooophira/jphira 的 forceSyncInfo/fixClientRoomState（源码已验证怪癖机制，见 client-conformance.md） |
 
 D2 在协议 v2 到来时会被动暴露；D3 的正确解法不是抄传闻，而是走 client-conformance.md 的一致性验证体系。
 
