@@ -35,6 +35,22 @@ docker compose up -d
 > **Docker 部署提示**  
 > Docker 部署方式目前未经充分测试，在完成整体开发之前，不保证该部署方式的绝对可用性。建议优先使用源码编译或 Nightly 二进制运行。
 
+## 国内 Docker 镜像（CNB 云原生构建）
+
+由仓库根目录的 [.cnb.yml](.cnb.yml) 驱动，在 cnb.cool 云原生构建里自动构建本项目的
+Docker 镜像并推送到 cnb.cool 的 Docker 制品库，适合国内直接拉取（无需翻墙）。
+
+- **触发**：推送到 `master` → 推送 `:latest` 与 `:nightly`（与 Nightly 发布习惯一致）；
+  打 `tag`（如 `v1.0.0`）→ 推送 `:v1.0.0`。
+- **构建产物仅 amd64**（对应 Dockerfile 的 musl 静态二进制），镜像运行端口/配置见
+  [Dockerfile](Dockerfile) 与 [docker-compose.yml](docker-compose.yml)。
+- **国内拉取**：
+  ```bash
+  docker pull <产物地址>
+  ```
+  产物地址 = `<CNB_DOCKER_REGISTRY>/<CNB_REPO_SLUG_LOWERCASE>`，在 cnb.cool 项目页面的
+  **构建记录 → 环境变量**里可查到展开值，或用项目构建输出的实际路径替换上面的占位符。
+
 ## 验证
 
 ```bash

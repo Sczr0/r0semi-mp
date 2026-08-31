@@ -1,0 +1,59 @@
+# .cnb.yml —— cnb.cool 云原生构建：构建本项目 Docker 镜像并推送到 CNB Docker 制品库
+#
+# 产物地址（= 国内拉取路径）：
+#   ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
+#   例如 docker pull <该地址>:latest
+#
+# 语法对照官方文档 zh/build/grammar.md，核心机制：
+#   - `services: [docker]`  开启 dind + docker cli，并自动向 CNB 制品库注入临时凭据，
+#     后续任务即可用 `${CNB_DOCKER_REGISTRY}` / `${CNB_REPO_SLUG_LOWERCASE}` 拼出镜像全名；
+#   - `docker buildx build --platform linux/amd64 --push` 直接构建并推送 amd64 镜像
+#     （本仓库 Dockerfile 产出的是 x86_64-unknown-linux-musl 静态二进制，故钉死 amd64；
+#      即便构建节点是 arm64，buildx 也会产出正确的 amd64 镜像）；
+#   - 内置变量（见 zh/build/build-in-env.md）：CNB_DOCKER_REGISTRY、CNB_REPO_SLUG_LOWERCASE、
+#     CNB_TOKEN_USER_NAME、CNB_TOKEN、CNB_TAG。
+#
+# 启用前提（在 cnb.cool 项目页面操作，一次性）：
+#   1. 项目开启「云原生构建」；
+#   2. 项目开启「Docker 制品库」，并给当前用户/令牌授予该仓库的写权限。
+# 之后任何推送到 master 或打 tag 都会自动构建并推送，无需手动跑。
+
+# —— 默认分支 master 上 push 时：构建并推送 :latest 与 :nightly（对应项目 nightly 发布习惯）——
+master:
+  push:
+    - name: build-and-push-latest
+      services:
+        - docker
+      env:
+        IMAGE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
+      stages:
+        - name: docker login
+          script: docker login -u ${CNB_TOKEN_USER_NAME} -p "${CNB_TOKEN}" ${CNB_DOCKER_REGISTRY}
+        - name: build and push amd64
+          script: |
+            docker buildx build \
+              --platform linux/amd64 \
+              -t ${IMAGE}:latest \
+              -t ${IMAGE}:nightly \
+              --push .
+
+# —— 打 tag（如 v1.0.0）时：按 tag 名推送版本化镜像 :v1.0.0 ——
+# 注意：CNB_TAG 为本次推送的标签名；若你的平台未提供该变量，脚本会回退到 :latest，
+# 可把下方 ${CNB_TAG:-latest} 改成一个固定值后重新触发相应 tag。
+$:
+  tag_push:
+    - name: build-and-push-tag
+      services:
+        - docker
+      env:
+        IMAGE: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}
+      stages:
+        - name: docker login
+          script: docker login -u ${CNB_TOKEN_USER_NAME} -p "${CNB_TOKEN}" ${CNB_DOCKER_REGISTRY}
+        - name: build and push amd64
+          script: |
+            TAG="${CNB_TAG:-latest}"
+            docker buildx build \
+              --platform linux/amd64 \
+              -t ${IMAGE}:${TAG} \
+              --push .
