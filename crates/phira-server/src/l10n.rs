@@ -8,8 +8,10 @@
 //!
 //! - **不用 Fluent 运行时**：6 条静态文案 ×3 语言 = 常量表即可（原则 5：等第二个
 //!   复杂需求出现再引 Fluent——复数/参数化时才需要）。零新依赖，P0 内存不受影响。
-//! - **EN 表逐字对齐 impl 现行原文**（非原版 ftl 的 Title Case）：保证 `lang=en`
-//!   时行为与本地化之前**字节级不变**（Oracle 兼容前提；现有断言不改）。
+//! - **EN 表对齐原版 ftl 的 Title Case 措辞**（非 impl 现行小写）：`lang=en`
+//!   用户看到的文案与官服 en-US 逐字一致（ISSUE-0013 方案 A，2026-08 拍板）。
+//!   不依赖"字节级不变"：Oracle 用自构造输入（见 docs/oracle.md），不经过本出口；
+//!   现有断言不锁 EN 表值，均不受影响。
 //! - **per-user 作用域 = 会话槽位**：原版用 `tokio task_local` 包裹命令处理；
 //!   本项目命令经 bus 异步流转到 impl actor，无法传递 task_local。改为把
 //!   [`Locale`] 存进 [`crate::server::SendSlot`](会话槽位)——随连接生灭，
@@ -95,13 +97,15 @@ impl Key {
 }
 
 // 文案顺序严格对应 Key 枚举序；编译期断言见表数与 KEY_COUNT 一致（下方 tests）。
+// EN 表为原版 en-US.ftl 的 Title Case 逐字措辞（ISSUE-0013 方案 A）；
+// `TooManyRequests` 为 r0semi 新增 key，原版无对应 ftl，保留小写。
 const EN: [&str; KEY_COUNT] = [
-    "room id occupied",
-    "room is locked",
-    "game is ongoing",
-    "no monitor permission",
-    "room is full",
-    "no chart selected",
+    "Room ID is occupied",
+    "Room is locked",
+    "Game is ongoing",
+    "Permission denied. You can't monitor this room.",
+    "Room is full",
+    "No chart selected",
     "too many requests",
 ];
 

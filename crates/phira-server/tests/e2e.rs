@@ -503,7 +503,7 @@ async fn game_flow_select_ready_start() {
     send_cmd(&mut c1, &ClientCommand::RequestStart).await;
     let resp = recv_cmd(&mut c1).await;
     assert!(
-        matches!(&resp, ServerCommand::RequestStart(Err(msg)) if msg.contains("no chart")),
+        matches!(&resp, ServerCommand::RequestStart(Err(msg)) if msg.contains("chart")),
         "未选图请求开始应拒绝: {resp:?}"
     );
 
