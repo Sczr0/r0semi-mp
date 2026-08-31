@@ -157,3 +157,8 @@ python -c "import socket,time;s=socket.create_connection(('127.0.0.1',12346));s.
 > 镜像内默认 `server_config.yml`（12346 + http_port 8080 + persist /app/data）与 §2 字段集合一致
 > （`crates/phira-core/tests/example_yml.rs` 钉死解析）。`/healthz` 由 HTTP 端口提供
 > （`crates/phira-server/tests/healthz.rs` 覆盖），无需回源 API。
+>
+> **CI 真实构建（2026-08-31 起）**：`.github/workflows/docker-build.yml` 在 push 到 master
+> （改动到 Dockerfile / crates / Cargo.lock / 示例配置时）+ 手动触发时**真实构建镜像 + 起容器冒烟**
+> （/healthz 200 + 游戏端口握手回 Pong，即本节的验收命令）；只构建不推送镜像（无 registry 凭据，
+> 推送留待发布流程）。

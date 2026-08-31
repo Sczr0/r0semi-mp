@@ -1,0 +1,87 @@
+# Docker 镜像构建 + 冒烟验证（D-01 防烂闸门，非发布推送）。
+#
+# 背景：README 曾声明"Docker 部署未经充分测试"，deployment.md §10 只有静态验证
+# （手工比对构建命令）。本 workflow 把 Docker 路径升级为**真实构建 + 起容器冒烟**：
+#   1. 构建镜像（与本地 `docker compose up -d --build` 同一条 Dockerfile 路径）；
+#   2. 起容器，验证 /healthz 200（HTTP 管理面）+ 游戏端口握手（0x01 版本字节 +
+#      Ping `01 00` → 收 Pong，即 deployment.md §10 的验收命令）。
+# 只构建不推送镜像（无 registry 凭据；推送留待发布流程，可后续加 GHCR 步骤）。
+#
+# 触发：push 到 master 且改动到构建面（Dockerfile/crates/Cargo.lock/示例配置/workflow）
+# 时跑；也可手动补跑。不进 PR 闸门（与 release job 同定位：发布面验证）。
+name: docker-build
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "Dockerfile"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "server_config.example.yml"
+      - ".github/workflows/docker-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (gha layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: r0semi-mp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test (healthz + game-port handshake, deployment.md §10 验收)
+        run: |
+          set -euo pipefail
+          # 容器端口映射到高位 host 端口，避免与 runner 冲突
+          cid=$(docker run -d -p 18080:8080 -p 112346:12346 r0semi-mp:ci)
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+
+          # 1) 管理 HTTP：轮询 /healthz 直到 200（启动上限 60s）
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -sf -o /dev/null "http://127.0.0.1:18080/healthz"; then
+              ok=1; break
+            fi
+            sleep 1
+          done
+          test "$ok" = 1 || { echo "[FAIL] /healthz 60s 内未 200"; exit 1; }
+          echo "[OK] /healthz 200"
+
+          # 2) 游戏端口：发版本字节 0x01 + Ping 帧 01 00 → 收 Pong（deployment.md §10）
+          pong=$(python3 - <<'EOF'
+          import socket, time
+          s = socket.create_connection(("127.0.0.1", 112346), timeout=5)
+          s.sendall(b"\x01")
+          time.sleep(0.2)
+          s.sendall(b"\x01\x00")
+          data = s.recv(64)
+          print(data.hex())
+          EOF
+          )
+          test -n "$pong" || { echo "[FAIL] 游戏端口握手无响应"; exit 1; }
+          echo "[OK] 游戏端口握手回包: $pong"
+
+      - name: Save image to artifact (供手动部署取用)
+        if: always() && github.event_name == 'workflow_dispatch'
+        run: docker save r0semi-mp:ci | gzip > r0semi-mp-ci.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: always() && github.event_name == 'workflow_dispatch'
+        with:
+          name: r0semi-mp-docker-image
+          path: r0semi-mp-ci.tar.gz
+          retention-days: 7
