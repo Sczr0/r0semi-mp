@@ -227,6 +227,7 @@ pub async fn room_contract_suite<F: RoomFactory>(factory: &F) {
     ready_countdown_tick(factory).await;
     relay_aggregation_buffer(factory).await;
     game_time_tracking(factory).await;
+    race_and_edge_settlements(factory).await;
 }
 
 /// game_time 进度记录（ISSUE-0007，§6.5-16/23）：Touches 记录最后帧时间，
@@ -1997,4 +1998,187 @@ async fn relay_aggregation_buffer<F: RoomFactory>(factory: &F) {
             .any(|e| matches!(e, RoomEvent::RelayTouches { player: 3, .. })),
         "monitor 回归后应恢复转播: {events:?}"
     );
+}
+
+/// A2 竞态与边角（覆盖率补全）：RequestStart 非法状态/未选图、in-flight 中 Abort
+/// （AlreadyUploaded）、RecordFetched 非系统来源/无在途条目/迟到回注（对局已结束）、
+/// WaitForReady 到期驱逐未 ready 者后强制开局、无观战者时 relay 缓冲直接丢弃。
+#[allow(clippy::too_many_lines)] // 场景脚本六段断言一体
+async fn race_and_edge_settlements<F: RoomFactory>(factory: &F) {
+    // —— RequestStart：非 SelectChart 态 → InvalidState ——
+    let mut room = factory.create(rid());
+    setup_playing(&mut room).await;
+    let (resp, _) = room.handle(ctx(1), RoomCommand::RequestStart).await;
+    assert_business(resp.as_ref().unwrap(), RoomErrorCode::InvalidState);
+
+    // —— RequestStart：未选图 → NoChartSelected ——
+    let mut room = factory.create(rid());
+    create_room(&mut room).await;
+    room.handle(
+        ctx(2),
+        RoomCommand::JoinRoom {
+            id: rid(),
+            monitor: false,
+            name: "user2".to_owned(),
+        },
+    )
+    .await;
+    let (resp, _) = room.handle(ctx(1), RoomCommand::RequestStart).await;
+    assert_business(resp.as_ref().unwrap(), RoomErrorCode::NoChartSelected);
+
+    // —— in-flight 期间 Abort → AlreadyUploaded（§4.9-2 受理后不可撤销）——
+    let mut room = factory.create(rid());
+    setup_playing(&mut room).await;
+    let (resp, _) = room.handle(ctx(1), RoomCommand::Played { id: 1 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    let (resp, _) = room.handle(ctx(1), RoomCommand::Abort).await;
+    assert_business(resp.as_ref().unwrap(), RoomErrorCode::AlreadyUploaded);
+
+    // —— RecordFetched 非系统来源（客户端伪造）→ 忽略 ——
+    let (resp, events) = room
+        .handle(
+            ctx(1),
+            RoomCommand::RecordFetched {
+                user_id: 1,
+                record_id: 1,
+                record: record_ok_fn(1),
+            },
+        )
+        .await;
+    assert!(resp.is_none() && events.is_empty(), "非系统回注应被忽略");
+
+    // —— 无在途条目的回注（伪造 id）→ 忽略 ——
+    let (resp, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 9,
+                record_id: 9,
+                record: record_ok_fn(9),
+            },
+        )
+        .await;
+    assert!(
+        resp.is_none() && events.is_empty(),
+        "无在途条目的回注应被忽略"
+    );
+
+    // —— 提交者离房后回注 → in-flight 随离房清除 → 迟到回注按"无在途条目"忽略 ——
+    room.handle(
+        sys_ctx(),
+        RoomCommand::RecordFetched {
+            user_id: 1,
+            record_id: 1,
+            record: record_ok_fn(9),
+        },
+    )
+    .await;
+    let (resp, _) = room.handle(ctx(2), RoomCommand::Played { id: 2 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    let (resp, _) = room.handle(ctx(3), RoomCommand::Played { id: 3 }).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    // user1（成绩在途）离房 → evict 清其 in-flight（成绩作废）
+    let (resp, _) = room.handle(ctx(1), RoomCommand::LeaveRoom).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    // 剩余 2/3 结算 → 全员完成 → GameEnd
+    room.handle(
+        sys_ctx(),
+        RoomCommand::RecordFetched {
+            user_id: 2,
+            record_id: 2,
+            record: record_ok_fn(2),
+        },
+    )
+    .await;
+    let (_, events) = room
+        .handle(
+            sys_ctx(),
+            RoomCommand::RecordFetched {
+                user_id: 3,
+                record_id: 3,
+                record: record_ok_fn(3),
+            },
+        )
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::GameEnd { room_id, .. } if room_id == &rid())),
+        "离房者成绩作废后剩余全员应结算: {events:?}"
+    );
+    // 迟到 Ok / Err 回注（in-flight 已被离房清除）→ 一律忽略，不 panic
+    for record in [
+        record_ok_fn(1),
+        Err(ApiError::Internal {
+            msg: "late failure".into(),
+        }),
+    ] {
+        let (resp, events) = room
+            .handle(
+                sys_ctx(),
+                RoomCommand::RecordFetched {
+                    user_id: 1,
+                    record_id: 1,
+                    record,
+                },
+            )
+            .await;
+        assert!(
+            resp.is_none() && events.is_empty(),
+            "离房后迟到回注应忽略: {events:?}"
+        );
+    }
+
+    // —— WaitForReady 到期：驱逐未 ready 者 → 剩余全员已 ready → 强制开局 ——
+    let mut room = factory.create(rid());
+    create_room(&mut room).await;
+    room.handle(
+        ctx(2),
+        RoomCommand::JoinRoom {
+            id: rid(),
+            monitor: false,
+            name: "user2".to_owned(),
+        },
+    )
+    .await;
+    room.handle(ctx(1), RoomCommand::SelectChart { id: 1 })
+        .await;
+    let (resp, _) = room.handle(ctx(1), RoomCommand::RequestStart).await;
+    assert!(matches!(resp, Some(RoomResponse::Ok)));
+    // 首拍锚定 deadline；第二拍越过超时 → 驱逐 user2 → 剩余 host 已 ready → 开局
+    room.handle(sys_ctx(), RoomCommand::Tick { now: 1_000 })
+        .await;
+    let (_, events) = room
+        .handle(sys_ctx(), RoomCommand::Tick { now: 1_000_000 })
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::StartPlaying { room_id, .. } if room_id == &rid())),
+        "驱逐未 ready 者后剩余全员应强制开局: {events:?}"
+    );
+
+    // —— 无观战者时 relay 缓冲直接丢弃（不延迟投递、不产出事件）——
+    let mut room = factory.create(rid());
+    create_room(&mut room).await;
+    room.handle(
+        ctx(1),
+        RoomCommand::Touches {
+            frames: Arc::new(vec![TouchFrame {
+                time: 1.0,
+                points: Vec::new(),
+            }]),
+        },
+    )
+    .await;
+    let (_, events) = room.handle(sys_ctx(), RoomCommand::Tick { now: 500 }).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::RelayTouches { .. })),
+        "无 monitor 时缓冲应直接丢弃: {events:?}"
+    );
+    // 第二拍：缓冲已清空 → 无事件（幂等）
+    let (_, events) = room.handle(sys_ctx(), RoomCommand::Tick { now: 600 }).await;
+    assert!(events.is_empty(), "清空后 Tick 应无事件: {events:?}");
 }

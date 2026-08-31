@@ -39,7 +39,7 @@ Phira 联机房间服务器 `phira-mp`（Rust）的重写：**内存最小（目
 > 下表为历史陷阱，各条均已解决：修复细节见 `docs/issues/` 各文末修复记录（ADR-0007/0008/0009）。
 > **当前未决**：ISSUE-0013（l10n EN Title Case 产品决策，owner 定夺）、ISSUE-0014（conformance 2-worker 僵死备查）——均低危待决，见各 issue。
 > **已解决（2026-08）**：ISSUE-0009（旧 TCP 命令无 epoch 校验——命令侧 epoch 校验 + stale_connection 回归测试）、ISSUE-0011（EncodeCache 指针键 ABA——方案 A 条目钉住源 Arc + 4 回归测试）、ISSUE-0012（SessionRegistry 只进不出——方案 A 拆 epochs/names 两表 + evict_name + 回归测试），各见文末修复记录。
-> **其余 0001~0008/0010 亦已全部解决/处置**（0007 game_time 尾追加 2026-08-27 落地；0010 已处置——deployment.md §9 客户端指引）。
+> **其余 0001~0008/0010 亦已全部解决/处置**（0007 game_time 尾追加 2026-08-27 落地；0010 已处置——deployment.md §9 客户端指引）。ISSUE-0015（读侧内存守卫失败路径记账泄漏）已修复+测试实证（2026-08-30）。
 
 | # | 陷阱 | 现状 |
 |---|---|---|

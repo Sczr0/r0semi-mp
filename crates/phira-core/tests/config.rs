@@ -220,3 +220,38 @@ fn yaml_proxy_protocol_parsed() {
     let cfg = Config::load_from_yaml(fake_env(&[]), Some("proxy_protocol: false\n"), None).unwrap();
     assert!(!cfg.proxy_protocol);
 }
+
+// ———— phira-core 补充覆盖：env 覆盖 / apply_yaml 字段 ————
+// （`Config::load` 的文件读取读真实环境变量——bin-only 路径，见 cov 报告）
+
+/// env 覆盖分支：`R0SEMI_MP_ADMIN_TOKEN` / `R0SEMI_MP_PERSIST_DIR`（L179/182）。
+#[test]
+fn env_overrides_admin_token_and_persist_dir() {
+    let cfg = phira_core::Config::load_from_yaml(
+        |name| match name {
+            "R0SEMI_MP_ADMIN_TOKEN" => Ok("env-tok".to_owned()),
+            "R0SEMI_MP_PERSIST_DIR" => Ok("/env/data".to_owned()),
+            _ => Err(std::env::VarError::NotPresent),
+        },
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.admin_token.as_deref(), Some("env-tok"));
+    assert_eq!(cfg.persist_dir, "/env/data");
+}
+
+/// `apply_yaml` 的 admin_token / persist_dir 字段逐项合并（组合根热更语义）。
+#[test]
+fn apply_yaml_admin_token_and_persist_dir_fields() {
+    let mut cfg = phira_core::Config::default();
+    cfg.apply_yaml(
+        "admin_token: \"yaml-tok\"
+persist_dir: \"/yaml/data\"
+",
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.admin_token.as_deref(), Some("yaml-tok"));
+    assert_eq!(cfg.persist_dir, "/yaml/data");
+}

@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use phira_api::{
-    ClientCommand, JoinRoomResponse, Message, RoomCommand, RoomError, RoomErrorCode, RoomEvent,
-    RoomId, RoomResponse, RoomState, ServerCommand, Targets, TouchFrame, UserInfo, Varchar,
+    ClientCommand, JoinRoomResponse, JudgeEvent, Judgement, Message, RoomCommand, RoomError,
+    RoomErrorCode, RoomEvent, RoomId, RoomResponse, RoomState, ServerCommand, Targets, TouchFrame,
+    UserInfo, Varchar,
 };
 use phira_core::convert::{client_to_room, error_message, event_to_server, response_to_server};
 
@@ -335,6 +336,33 @@ fn table2_relay_targets_passthrough() {
             ServerCommand::Touches {
                 player: 2,
                 frames: Arc::clone(&frames)
+            }
+        )]
+    );
+}
+
+#[test]
+fn table2_relay_judges_passthrough() {
+    // 热路径：RelayJudges → Judges，targets 原样透传（与 RelayTouches 同构，§6.5-17）
+    let judges = Arc::new(vec![JudgeEvent {
+        time: 1.0,
+        line_id: 1,
+        note_id: 2,
+        judgement: Judgement::Perfect,
+    }]);
+    let out = event_to_server(RoomEvent::RelayJudges {
+        room_id: rid(),
+        targets: Targets::Specific(vec![99]),
+        player: 2,
+        judges: Arc::clone(&judges),
+    });
+    assert_eq!(
+        out,
+        vec![(
+            Targets::Specific(vec![99]),
+            ServerCommand::Judges {
+                player: 2,
+                judges: Arc::clone(&judges)
             }
         )]
     );

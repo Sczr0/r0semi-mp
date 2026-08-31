@@ -493,3 +493,64 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phira_api::ClientCommand;
+
+    /// 安全锁 A 读侧 fail-closed（ISSUE-0015）：全局在途账超限 → 读循环 bail 断连，
+    /// 且记账**完整回滚**（charge_memory 先加后验、超限回减——失败路径账目平衡实证）。
+    /// 测试用覆盖开关把水位压到 64B（生产 64MiB 不可达），发 200B 声明帧触发。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试串行锁覆盖整个用例是预期行为
+    #[allow(clippy::type_complexity)] // 测试 handler 直书完整类型，避免为测试引入别名
+    async fn recv_loop_bails_when_global_guard_exceeded() {
+        let _serial = crate::server::TEST_MEMORY_GUARD_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::server::set_memory_guard_limit_for_test(64);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read, _write) = stream.into_split();
+            let limit = Arc::new(AtomicU32::new(MAX_PACKET_SIZE));
+            let (tx, _rx) = mpsc::channel::<Outbound>(16);
+            let handler: Box<
+                dyn FnMut(
+                        Arc<mpsc::Sender<Outbound>>,
+                        ClientCommand,
+                    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+                    + Send
+                    + Sync,
+            > = Box::new(|_tx, _cmd| Box::pin(async {}));
+            recv_packets_coalesced::<ClientCommand, _, _>(
+                &mut read,
+                &Arc::new(tx),
+                &limit,
+                &mut Box::new(handler),
+            )
+            .await
+        });
+        // 200B 声明帧（> 覆盖水位 64B）→ 读侧记账失败 → bail
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut frame = vec![0xC8, 0x01]; // ULEB128(200)
+        frame.extend(std::iter::repeat_n(0u8, 200));
+        client.write_all(&frame).await.unwrap();
+
+        let err = server.await.unwrap().unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("read-side memory guard exceeded"),
+            "应 fail-closed 断连: {msg}"
+        );
+        assert_eq!(
+            crate::server::in_flight_bytes(),
+            0,
+            "失败路径必须回滚记账（无残留虚增水位）"
+        );
+        crate::server::set_memory_guard_limit_for_test(0);
+    }
+}

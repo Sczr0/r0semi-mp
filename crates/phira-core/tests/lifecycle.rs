@@ -562,3 +562,24 @@ async fn replay_gives_up_when_user_never_in_room() {
         "用户从未入房：重放后应放弃，不得误派发"
     );
 }
+
+// ———— phira-core 补充覆盖：Tick 心跳到达活跃房间 ————
+// （R0SEMI_EPOCHS_PROBE 探针读真实环境变量 + forbid(unsafe_code) → 不可注入，
+// 观测面 bin-only 缺口，见 cov 报告）
+
+/// B1/B6 通电：生命周期任务的 `Tick` 心跳必须到达活跃房间
+/// （impl 内唯一时钟源的单一生产者，§4.9-6）。
+#[tokio::test]
+async fn tick_heartbeat_reaches_active_rooms() {
+    let (bus, _registry, _fact_tx, received) = setup(Duration::from_secs(10)).await;
+    // 心跳周期 50ms：等 3+ 拍（首个 Tick = now + 50ms）
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let ticks = received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| matches!(c, RoomCommand::Tick { .. }))
+        .count();
+    assert!(ticks >= 1, "活跃房间应收 Tick 心跳: {received:?}");
+    drop(bus);
+}

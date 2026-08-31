@@ -99,11 +99,23 @@ impl Server {
     ///
     /// 获取本地地址失败 / 停机信号 handler 安装失败。
     pub async fn run(self) -> Result<()> {
+        self.run_with_shutdown(shutdown_signal()).await
+    }
+
+    /// 运行主循环，停机条件注入（生产经 [`Server::run`] 接系统信号；测试注入
+    /// 自定义 future 驱动优雅停机分支：维护通知广播 → 宽限 → 停 accept）。
+    ///
+    /// # Errors
+    ///
+    /// 获取本地地址失败。
+    pub async fn run_with_shutdown<F>(self, shutdown: F) -> Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let local = self.listener.local_addr()?;
         info!("r0semi-mp-server listening on {local}");
 
         // 优雅停机（§11）：SIGTERM/SIGINT → 停止 accept
-        let shutdown = shutdown_signal();
         let ctx = Arc::clone(&self.ctx);
         let notice = self.maintenance_notice.clone();
         let grace = self.maintenance_grace;
@@ -780,6 +792,35 @@ const SLOW_CONSUMER_KICK_AFTER: Duration = Duration::from_secs(5);
 /// 内存**硬上限**（攻击下绝不膨胀）。
 const MEMORY_GUARD_LIMIT: usize = 64 * 1024 * 1024;
 
+/// 测试专用：真实触发 fail-closed 路径（读侧/投递侧全局超限）的覆盖开关；
+/// 0 = 使用常量默认值。仅 lib 单元测试（`cfg(test)`）可见，生产不受影响。
+#[cfg(test)]
+static TEST_MEMORY_GUARD_LIMIT: AtomicUsize = AtomicUsize::new(0);
+
+/// 测试专用：设置守卫上限覆盖（配 [`TEST_MEMORY_GUARD_MUTEX`] 串行化，
+/// 防止同进程两个守卫测试互相干扰）。
+#[cfg(test)]
+pub(crate) fn set_memory_guard_limit_for_test(v: usize) {
+    TEST_MEMORY_GUARD_LIMIT.store(v, Ordering::SeqCst);
+}
+
+/// 测试专用：守卫相关测试的串行锁（读侧 stream.rs 与投递侧 server.rs 共用）。
+#[cfg(test)]
+pub(crate) static TEST_MEMORY_GUARD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 当前生效的全局在途上限（测试可覆盖，生产恒为 [`MEMORY_GUARD_LIMIT`]）。
+#[cfg(not(test))]
+const fn memory_guard_limit() -> usize {
+    MEMORY_GUARD_LIMIT
+}
+
+/// 测试专用实现：覆盖开关非 0 时以覆盖值为水位。
+#[cfg(test)]
+fn memory_guard_limit() -> usize {
+    let v = TEST_MEMORY_GUARD_LIMIT.load(Ordering::SeqCst);
+    if v > 0 { v } else { MEMORY_GUARD_LIMIT }
+}
+
 /// 每连接 send 队列字节上限（超限 → 该连接被踢）。
 const PER_CONN_MEM_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -795,8 +836,16 @@ static IN_FLIGHT_BYTES: AtomicUsize = AtomicUsize::new(0);
 static AUTHED_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// 全局记账：返回 false = 超限（调用方丢新）。
+///
+/// 失败时**原子回滚本次累计**（先加后验，超限回减）——保证 fail-closed 路径
+/// （读侧 bail、投递侧丢新）不残留虚增账：ISSUE-0015（读侧超限曾永久抬高水位）。
 pub(crate) fn charge_memory(bytes: usize) -> bool {
-    IN_FLIGHT_BYTES.fetch_add(bytes, Ordering::SeqCst) + bytes <= MEMORY_GUARD_LIMIT
+    IN_FLIGHT_BYTES.fetch_add(bytes, Ordering::SeqCst);
+    let ok = IN_FLIGHT_BYTES.load(Ordering::SeqCst) <= memory_guard_limit();
+    if !ok {
+        IN_FLIGHT_BYTES.fetch_sub(bytes, Ordering::SeqCst);
+    }
+    ok
 }
 
 /// 全局记账：写任务消费后释放。
@@ -1273,9 +1322,9 @@ impl EventSink for SessionSink {
                         slot.backpressure.force_close();
                     }
                     if !charge_memory(len) {
-                        // 全局超限：丢新（不投递）+ 断最重连接（回收内存）
+                        // 全局超限：丢新（不投递）+ 断最重连接（回收内存）。
+                        // 注：全局账已在 charge_memory 内回滚（ISSUE-0015），此处只还 per-conn 账。
                         slot.queue_bytes.fetch_sub(len, Ordering::SeqCst);
-                        release_memory(len);
                         if let Some((_, bp)) = self.heaviest() {
                             bp.force_close();
                         }
@@ -2107,5 +2156,186 @@ mod tests {
             "3s 正常心跳节奏不应触发"
         );
         assert!(!heartbeat_recovered(Duration::ZERO), "0s 不应触发");
+    }
+
+    /// 安全锁 A 投递侧**全局**超限（§10.4 承诺"丢新 + 断最重连接"）——用测试覆盖
+    /// 真实触发 fail-closed（生产默认 64MiB 不可达，覆盖开关模拟极限水位）：
+    /// 新帧记账失败 → 回滚 → 断 queue_bytes 最重的连接，轻连接不受影响。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试串行锁覆盖整个用例是预期行为
+    async fn deliver_global_limit_refunds_and_kicks_heaviest() {
+        let _serial = TEST_MEMORY_GUARD_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_memory_guard_limit_for_test(1);
+        let sink = SessionSink::new();
+        let (tx1, mut rx1) = tokio::sync::mpsc::channel::<Outbound>(2);
+        let bp1 = Arc::new(Backpressure::new());
+        sink.register(
+            1,
+            Arc::new(tx1),
+            Arc::clone(&bp1),
+            Arc::new(AtomicUsize::new(0)),
+            crate::l10n::Locale::default(),
+        )
+        .await;
+        // 更重的连接：queue_bytes 500 > 0 —— 全局超限时应断它
+        let (tx2, _rx2) = tokio::sync::mpsc::channel::<Outbound>(2);
+        let bp2 = Arc::new(Backpressure::new());
+        sink.register(
+            2,
+            Arc::new(tx2),
+            Arc::clone(&bp2),
+            Arc::new(AtomicUsize::new(500)),
+            crate::l10n::Locale::default(),
+        )
+        .await;
+
+        let baseline = IN_FLIGHT_BYTES.load(Ordering::SeqCst);
+        let rid = phira_api::RoomId::new("r".to_owned()).unwrap();
+        let ev = RoomEvent::RelayTouches {
+            room_id: rid,
+            targets: phira_api::Targets::All,
+            player: 1,
+            frames: Arc::new(vec![TouchFrame {
+                time: 1.0,
+                points: vec![],
+            }]),
+        };
+        sink.deliver(1, &ev).await;
+
+        assert!(bp2.is_forced(), "全局超限应断最重连接（user 2）");
+        assert!(!bp1.is_forced(), "轻连接用户 1 不应被断");
+        assert_eq!(
+            IN_FLIGHT_BYTES.load(Ordering::SeqCst),
+            baseline,
+            "投递被拒应完整回滚记账（账目平衡）"
+        );
+        assert!(
+            rx1.try_recv().is_err(),
+            "被拒帧不得入队（丢新，§10.4 绝不阻塞房间）"
+        );
+        set_memory_guard_limit_for_test(0);
+    }
+
+    /// 安全锁 B：已鉴权连接上限（§11）拒绝分支——预置计数到顶后真实走
+    /// `authenticate_flow`，断言第 1001 个被拒并收到 `server full`（生产分支，
+    /// 不建 1000 个真实连接）。
+    /// 上限测试串行锁（两个用例共享进程级 `AUTHED_CONNECTIONS` 计数）。
+    static CAP_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试串行锁覆盖整个用例是预期行为
+    async fn authed_cap_rejects_when_full() {
+        let _serial = CAP_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        AUTHED_CONNECTIONS.store(MAX_AUTHED_CONNECTIONS, Ordering::SeqCst);
+        let ctx = test_cap_ctx();
+        let state = Arc::new(ConnState::new("127.0.0.1".parse().unwrap()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(16);
+        authenticate_flow(&ctx, &state, &Arc::new(tx), "tok").await;
+
+        let got = rx.recv().await.expect("应收到拒绝响应");
+        match got {
+            Outbound::Command(ServerCommand::Authenticate(Err(msg))) => {
+                assert_eq!(msg, "server full", "拒绝文案");
+            }
+            other => panic!("应被拒绝: {other:?}"),
+        }
+        assert!(state.panicked.load(Ordering::SeqCst), "拒后连接应标记收尾");
+        AUTHED_CONNECTIONS.store(0, Ordering::SeqCst);
+    }
+
+    /// 安全锁 B 边界：计数 = 上限 - 1 时鉴权成功（+1 = 上限，不超）。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试串行锁覆盖整个用例是预期行为
+    async fn authed_cap_allows_at_limit_minus_one() {
+        let _serial = CAP_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        AUTHED_CONNECTIONS.store(MAX_AUTHED_CONNECTIONS - 1, Ordering::SeqCst);
+        let ctx = test_cap_ctx();
+        let state = Arc::new(ConnState::new("127.0.0.1".parse().unwrap()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outbound>(16);
+        authenticate_flow(&ctx, &state, &Arc::new(tx), "tok").await;
+
+        match rx.recv().await.expect("应收到鉴权响应") {
+            Outbound::Command(ServerCommand::Authenticate(Ok(_))) => {}
+            other => panic!("应成功: {other:?}"),
+        }
+        assert!(!state.panicked.load(Ordering::SeqCst), "成功路径不标记收尾");
+        assert_eq!(
+            AUTHED_CONNECTIONS.load(Ordering::SeqCst),
+            MAX_AUTHED_CONNECTIONS,
+            "计数应 +1"
+        );
+        AUTHED_CONNECTIONS.store(0, Ordering::SeqCst);
+    }
+
+    /// 上限测试用最小上下文（AuthOk + 空 actor + 空 bus）。
+    fn test_cap_ctx() -> Arc<ConnContext> {
+        struct CapAuth;
+        #[async_trait::async_trait]
+        impl phira_api::AuthHandler for CapAuth {
+            async fn authenticate(
+                &self,
+                _token: &str,
+            ) -> Result<phira_api::UserIdentity, phira_api::AuthError> {
+                Ok(phira_api::UserIdentity {
+                    user_id: 1,
+                    name: "cap".to_owned(),
+                    lang: "zh".to_owned(),
+                })
+            }
+        }
+        struct CapActor;
+        #[async_trait::async_trait]
+        impl phira_api::RoomActor for CapActor {
+            async fn handle(
+                &mut self,
+                _ctx: phira_api::CmdCtx,
+                _cmd: phira_api::RoomCommand,
+            ) -> (Option<phira_api::RoomResponse>, Vec<RoomEvent>) {
+                (None, Vec::new())
+            }
+        }
+        struct CapFactory;
+        impl phira_api::RoomFactory for CapFactory {
+            fn create(&self, _room_id: phira_api::RoomId) -> Box<dyn phira_api::RoomActor> {
+                Box::new(CapActor)
+            }
+        }
+        let factory = Arc::new(CapFactory);
+        let bus = phira_core::Bus::new(
+            factory as Arc<dyn phira_api::RoomFactory>,
+            Arc::new(phira_api::RoomConfig::default()),
+        );
+        let (task, registry, fact_tx) = phira_core::lifecycle::LifecycleTask::new(
+            bus.clone(),
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+        );
+        tokio::spawn(task.run());
+        let sink = Arc::new(SessionSink::new());
+        bus.attach_sink(Arc::clone(&sink) as Arc<dyn phira_core::EventSink>);
+        Arc::new(ConnContext {
+            bus,
+            auth: Arc::new(CapAuth),
+            registry,
+            fact_tx,
+            sink,
+            admission: Arc::new(ConnectionAdmission::default()),
+            welcome_message: None,
+            room_list: Arc::new(RoomListSink::new(Vec::new())),
+            proxy_protocol: false,
+            auth_timeout: Duration::from_secs(30),
+            admin_token: None,
+            admin_audit: crate::admin::AuditLog::new(),
+            admin_config: crate::admin::AdminConfigState::new(),
+            admin_ban_observer: BanObserver::new(),
+            admin_anticheat: AntiCheatObserver::new(),
+            config_store: Arc::new(crate::storage::ConfigStore::disabled()),
+        })
     }
 }

@@ -1,5 +1,7 @@
 //! HTTP 回源客户端测试（§10.1 手写 HTTP/1.1 + 本地 mock API，§9 Oracle 环境）。
 
+use std::time::Duration;
+
 use phira_api::{ApiClient, AuthHandler};
 use phira_server::http::{HttpApiClient, HttpAuth};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -467,4 +469,317 @@ async fn trailing_bytes_beyond_content_length_discarded() {
     let chart = client.fetch_chart(7).await.unwrap();
     assert_eq!(chart.id, 7);
     mock.await.unwrap();
+}
+
+// —— 错误分支补齐（覆盖率第 6 项）——
+
+/// base URL 协议不支持 → 内部错误（不发起连接）。
+#[tokio::test]
+async fn base_url_bad_scheme_rejected() {
+    let client = HttpApiClient::new("ftp://upstream".into());
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("unsupported base url scheme")),
+        "非法 scheme 应拒绝: {err:?}"
+    );
+}
+
+/// base URL 端口越界 → 内部错误。
+#[tokio::test]
+async fn base_url_bad_port_rejected() {
+    let client = HttpApiClient::new("http://upstream:99999".into());
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("invalid port")),
+        "越界端口应拒绝: {err:?}"
+    );
+}
+
+/// 302 跳转到同主机但**非信任端口** → 拒绝（防端口走私）。
+#[tokio::test]
+async fn redirect_cross_port_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let target = format!("http://127.0.0.1:{}/chart/1", addr.port() + 1);
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        let resp = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("redirect to untrusted port")),
+        "跨端口跳转应拒绝: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 响应头超 64KiB → 拒绝（防上游头洪水）。
+#[tokio::test]
+async fn oversized_response_headers_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        let mut resp = String::from("HTTP/1.1 200 OK\r\n");
+        resp.push_str(&"X-Pad: yyyyyyyyyy\r\n".repeat(7000)); // ~91KB 头
+        resp.push_str("\r\n");
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("response headers too large")),
+        "超大响应头应拒绝: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 声明 16MiB（恰好合法）但实发超限 → 读中拒绝（防御"声明小实发多"）。
+#[tokio::test]
+async fn body_exceeds_limit_while_streaming_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            16 * 1024 * 1024
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+        // 实发 16MiB + 余量（读中超过上限触发防御分支）
+        // 用不整除 16MiB 的块长（10000B）——末次读必然越过上限触发防御分支
+        let chunk = [0x41u8; 10_000];
+        for _ in 0..(16 * 1024 * 1024 / 10_000 + 16) {
+            if sock.write_all(&chunk).await.is_err() {
+                break; // 客户端已断——测试目标达成
+            }
+        }
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("exceeded limit while reading")),
+        "流式超限应拒绝: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 畸形状态行（无状态码）→ 内部错误。
+#[tokio::test]
+async fn malformed_status_line_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        sock.write_all(b"BANANA\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("malformed status line")),
+        "畸形状态行应拒绝: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 状态码非 UTF-8 字节 → 内部错误。
+#[tokio::test]
+async fn malformed_status_code_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        sock.write_all(b"HTTP/1.1 2\xFF0 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("malformed status code")),
+        "非法字节状态码应拒绝: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 状态码非数字 → 内部错误。
+#[tokio::test]
+async fn invalid_status_code_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        sock.write_all(b"HTTP/1.1 ABC Nope\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("invalid status code")),
+        "非数字状态码应拒绝: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// Content-Length 非法 → 内部错误。
+#[tokio::test]
+async fn invalid_content_length_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: oops\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("invalid content-length")),
+        "非法 Content-Length 应拒绝: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 无 Content-Length + 无体 → 空体 → get_json 解析失败（invalid JSON 分支 + CL 缺失 = 0）。
+#[tokio::test]
+async fn missing_content_length_empty_body_invalid_json() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("invalid JSON")),
+        "空体应报 invalid JSON: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 200 + 非 JSON 体 → get_json 的 invalid JSON 分支（L69-70）。
+#[tokio::test]
+async fn invalid_json_body_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = "<html>not json</html>";
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("invalid JSON")),
+        "非 JSON 体应报 invalid JSON: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// /me 返回非 JSON → HttpAuth 的 invalid JSON 分支（L168-169）。
+#[tokio::test]
+async fn auth_invalid_json_body_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nnope!!")
+            .await
+            .unwrap();
+    });
+
+    let auth = HttpAuth::new(format!("http://{addr}"));
+    let err = auth.authenticate("tok").await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::AuthError::Internal { msg } if msg.contains("invalid JSON")),
+        "/me 非 JSON 应报 invalid JSON: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// 声明有体但连接中断 → body truncated（L491-493）。
+#[tokio::test]
+async fn truncated_body_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await.unwrap();
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789",
+        )
+        .await
+        .unwrap();
+        // 关闭（不再发剩余 90 字节）
+    });
+
+    let client = HttpApiClient::new(format!("http://{addr}"));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg } if msg.contains("body truncated")),
+        "截断体应报 truncated: {err:?}"
+    );
+    mock.await.unwrap();
+}
+
+/// https base + 端口不可达 → 连接错误。
+/// 注：rustls 0.23 起 IP 字面量可作为 SNI（IpAddress 变体），"invalid hostname"
+/// 分支仅剩防御性（非法输入被 URL 解析提前拦下）。
+/// 失败发生在哪个阶段依网络环境而定：直连 → TCP connect 失败（文案含 connect）；
+/// 代理/防火墙 accept 后丢弃 → TLS 握手 EOF（文案含 handshake）。两者都必须映射 Internal。
+#[tokio::test]
+async fn tls_connect_failure_reported() {
+    let client =
+        HttpApiClient::new_with_timeout("https://192.0.2.1:1".into(), Duration::from_secs(2));
+    let err = client.fetch_chart(1).await.unwrap_err();
+    assert!(
+        matches!(&err, phira_api::ApiError::Internal { msg }
+            if msg.contains("connect") || msg.contains("handshake")),
+        "连接失败应报 Internal: {err:?}"
+    );
 }
