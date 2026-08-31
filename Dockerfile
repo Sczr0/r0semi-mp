@@ -1,11 +1,14 @@
 # syntax=docker/dockerfile:1
 # r0semi-mp-server 运行时镜像（D-01）
 #
-# 策略：multi-stage——builder 用 clux/muslrust（与 CI release 同工具链，tag 钉死
-# 1.98.0，ring 无系统依赖问题）产 musl **静态**二进制；运行时镜像只带二进制 + 配置。
+# 策略：multi-stage——builder 用 clux/muslrust（自带 musl 工具链，ring 无系统依赖问题；
+# tag 钉死 `1.98.0-stable`——裸 `1.98.0` 在 Docker Hub 不存在，2026-08 CI 实测修正）
+# 产 musl **静态**二进制；运行时镜像只带二进制 + 配置。
+# 注：CI release job 是 runner 直接构建（dtolnay 装 target + apt musl-tools，ci.yml），
+# 本容器独立但同 rust 1.98.0 + release-dist profile + musl target（产物等价）。
 # TLS 回源用 webpki-roots 内嵌根证书（§10.3），无需系统 CA；alpine 提供 busybox
 # wget 供 /healthz 容器探针。
-FROM clux/muslrust:1.98.0 AS builder
+FROM clux/muslrust:1.98.0-stable AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates

@@ -52,7 +52,8 @@ jobs:
 
   # 部署产物（§部署）：musl 静态二进制 + nightly release——服务器匿名 curl 下载即跑，
   # 机子上不装 Rust 工具链（docs/deployment.md 迁移清单的构建源）。
-  # 构建用 clux/muslrust 容器（自带 musl 工具链，ring 无系统依赖问题；tag 钉死 1.98.0）。
+  # runner 直接构建：dtolnay 显式装 musl target（rust-std 完整）+ apt musl-tools 提供
+  # musl-gcc 供 ring——钉死 1.98.0（2026-08 CI 实测；Dockerfile 的 muslrust 容器独立同版本）。
   release:
     runs-on: ubuntu-latest
     needs: check

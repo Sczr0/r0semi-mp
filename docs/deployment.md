@@ -151,9 +151,12 @@ python -c "import socket,time;s=socket.create_connection(('127.0.0.1',12346));s.
 `./server_config.yml:/app/server_config.yml:ro` 挂载注释；管理面数据持久化在 named volume
 `r0semi-mp-data`（bans/audit/config 快照）。STOPSIGNAL SIGTERM → §11 优雅停机。
 
-> **静态验证（无 Docker 环境时）**：Dockerfile 构建命令与 CI release job 完全一致
-> （`cargo build --profile release-dist --target x86_64-unknown-linux-musl --bin r0semi-mp-server`，
-> 产物路径 `target/x86_64-unknown-linux-musl/release-dist/r0semi-mp-server`，见 `.github/workflows/ci.yml`）；
+> **静态验证（无 Docker 环境时）**：Dockerfile 构建产物与 CI release job 等价
+> （release-dist profile + musl 静态：`cargo build --profile release-dist
+> --target x86_64-unknown-linux-musl --bin r0semi-mp-server`，产物路径
+> `target/x86_64-unknown-linux-musl/release-dist/r0semi-mp-server`，见 `.github/workflows/ci.yml`；
+> CI 是 runner 直接构建（dtolnay + apt musl-tools），Dockerfile 用 clux/muslrust 容器，
+> 同 rust 1.98.0 + 同 profile/target，产物等价）；
 > 镜像内默认 `server_config.yml`（12346 + http_port 8080 + persist /app/data）与 §2 字段集合一致
 > （`crates/phira-core/tests/example_yml.rs` 钉死解析）。`/healthz` 由 HTTP 端口提供
 > （`crates/phira-server/tests/healthz.rs` 覆盖），无需回源 API。
