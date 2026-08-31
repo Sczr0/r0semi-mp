@@ -255,3 +255,51 @@ persist_dir: \"/yaml/data\"
     assert_eq!(cfg.admin_token.as_deref(), Some("yaml-tok"));
     assert_eq!(cfg.persist_dir, "/yaml/data");
 }
+
+// —— P1 安全锁阈值参数化（2026-08-31：memory_guard / per_conn / max_authed 进 config）——
+
+#[test]
+fn yaml_guard_limits_default_zero_keeps_const() {
+    // 缺省 = 0（不覆盖）→ server.rs 使用 const 默认（64MiB / 8MiB / 1000），行为不变
+    let cfg = Config::load_from_yaml(fake_env(&[]), Some("monitors: [2]\n"), None).unwrap();
+    assert_eq!(cfg.memory_guard_bytes, 0);
+    assert_eq!(cfg.per_conn_mem_bytes, 0);
+    assert_eq!(cfg.max_authed_connections, 0);
+}
+
+#[test]
+fn yaml_guard_limits_parsed_mb_to_bytes() {
+    // 显式配置 MiB → 内部转字节
+    let cfg = Config::load_from_yaml(
+        fake_env(&[]),
+        Some("memory_guard_mb: 128\nper_conn_mem_mb: 16\nmax_authed_connections: 500\n"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.memory_guard_bytes, 128 * 1024 * 1024);
+    assert_eq!(cfg.per_conn_mem_bytes, 16 * 1024 * 1024);
+    assert_eq!(cfg.max_authed_connections, 500);
+}
+
+#[test]
+fn yaml_guard_limits_partial_keeps_default() {
+    // 只配一个：其余保持 0（const 默认）
+    let cfg = Config::load_from_yaml(fake_env(&[]), Some("memory_guard_mb: 32\n"), None).unwrap();
+    assert_eq!(cfg.memory_guard_bytes, 32 * 1024 * 1024);
+    assert_eq!(cfg.per_conn_mem_bytes, 0);
+    assert_eq!(cfg.max_authed_connections, 0);
+}
+
+#[test]
+fn yaml_guard_limits_zero_explicit_accepted() {
+    // 显式 0 = 等于缺省（不覆盖，回 const 默认）——合法不自报错
+    let cfg = Config::load_from_yaml(
+        fake_env(&[]),
+        Some("memory_guard_mb: 0\nper_conn_mem_mb: 0\nmax_authed_connections: 0\n"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.memory_guard_bytes, 0);
+    assert_eq!(cfg.per_conn_mem_bytes, 0);
+    assert_eq!(cfg.max_authed_connections, 0);
+}

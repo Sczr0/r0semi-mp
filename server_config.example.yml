@@ -55,6 +55,20 @@ maintenance_notice: "服务器维护中，房间即将关闭，请稍后再来"
 # 管理面持久化目录（bans.json / audit.jsonl / config 快照，自动创建；默认 "./data"）。
 persist_dir: "./data"
 
+# —— 安全锁阈值（P1 参数化；缺省 0 = 使用 server.rs const 默认 = 现值，行为不变）——
+
+# 全局在途字节上限（MiB；默认 64）。
+# 超限丢新 + 断最重连接（安全锁 A，§10.4）。0 或不配 = 64MiB。
+# memory_guard_mb: 64
+
+# 每连接 send 队列字节上限（MiB；默认 8）。
+# 单连接超限 → 该连接被踢（慢消费者）。0 或不配 = 8MiB。
+# per_conn_mem_mb: 8
+
+# 已鉴权连接总数上限（安全锁 B，§11；默认 1000）。
+# 0 或不配 = 1000。
+# max_authed_connections: 1000
+
 # —— 环境变量覆盖（优先级高于文件）——
 # R0SEMI_MP_PORT         监听端口
 # R0SEMI_MP_API_BASE     官方 API 基地址

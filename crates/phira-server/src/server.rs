@@ -34,8 +34,8 @@ use tokio::time::Instant;
 use anyhow::Result;
 use phira_api::{
     AuthError, AuthHandler, ClientCommand, CmdCtx, HEARTBEAT_DISCONNECT_TIMEOUT, Origin,
-    RoomCommand, RoomError, RoomErrorCode, RoomEvent, RoomId, RoomResponse, ServerCommand,
-    UserInfo, encode_packet,
+    RoomCommand, RoomError, RoomErrorCode, RoomEvent, RoomResponse, ServerCommand, UserInfo,
+    encode_packet,
 };
 use phira_core::{
     Bus, EventSink,
@@ -175,150 +175,8 @@ async fn accept_loop(listener: TcpListener, ctx: Arc<ConnContext>) {
 
 /// 房间列表快照项（§运营：公开房间列表，`/rooms` HTTP 端点返回；管理读面共用）。
 ///
-/// 2026-08 对齐公开房间列表标准格式（用户拍板：id 统一 int、monitor 不进名单）：
-/// `roomid`/`lock`/`host{name,id}`/`state`(select_chart|playing|wait_for_ready)/
-/// `chart{name,id}`/`players[{name,id}]`。本结构只存事实（id 集合 + 谱面 + 三态）；
-/// 名字在渲染时经 `SessionRegistry` 解析（admin.rs `room_json`）——存活期成立：
-/// `evict_name` 发生在 `UserLeft` 之后（lifecycle.rs，ISSUE-0012）。
-#[derive(Debug, Clone)]
-pub struct RoomInfo {
-    /// 房间 id。
-    pub id: String,
-    /// 房主用户 id。
-    pub host: i32,
-    /// 房间状态（三态 snake_case：`select_chart` / `playing` / `wait_for_ready`）。
-    pub state: &'static str,
-    /// 是否锁定。
-    pub locked: bool,
-    /// 循环对局（admin 详情用，阶段 1：RoomListSink 维护 CycleRoom 事件）。
-    pub cycle: bool,
-    /// 玩家 id 名单（加入序；**不含 monitor**——观察者不是玩家，2026-08 拍板）。
-    pub players: Vec<i32>,
-    /// 当前谱面（`SelectChart` 事件记录 name+id；`GameEnd`/`CancelGame(None)` 清空）。
-    pub chart: Option<(String, i32)>,
-}
-
-/// 房间列表观察者（§7.3 观察者模式）：订阅事件维护活动房间快照。
-///
-/// 纯观察者——不碰核心（bus/actor），数据源 = EventSink 事件流。
-/// 隐私过滤：房间 id 匹配 `hidden_prefixes` 任一前缀 → 不进入公开列表。
-pub struct RoomListSink {
-    rooms: tokio::sync::RwLock<std::collections::HashMap<RoomId, RoomInfo>>,
-    /// 私密房间 id 前缀（yml `hidden_room_prefixes`，如 `["solo"]`）。
-    hidden_prefixes: Vec<String>,
-}
-
-impl RoomListSink {
-    /// 构造。`hidden_prefixes` = 私密房间 id 前缀（命中则不公开展示）。
-    #[must_use]
-    pub fn new(hidden_prefixes: Vec<String>) -> Self {
-        Self {
-            rooms: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            hidden_prefixes,
-        }
-    }
-
-    fn hidden(&self, id: &RoomId) -> bool {
-        self.hidden_prefixes
-            .iter()
-            .any(|p| id.as_str().starts_with(p))
-    }
-
-    /// 公开房间列表快照（已过滤私密房间）。
-    pub async fn snapshot(&self) -> Vec<RoomInfo> {
-        let mut list: Vec<_> = self.rooms.read().await.values().cloned().collect();
-        list.sort_by(|a, b| a.id.cmp(&b.id));
-        list
-    }
-}
-
-#[async_trait::async_trait]
-impl EventSink for RoomListSink {
-    async fn deliver(&self, _user_id: i32, event: &RoomEvent) {
-        use phira_api::RoomEvent as E;
-        match event {
-            E::RoomCreated { room_id, host } => {
-                if !self.hidden(room_id) {
-                    self.rooms.write().await.insert(
-                        room_id.clone(),
-                        RoomInfo {
-                            id: room_id.as_str().to_owned(),
-                            host: *host,
-                            state: "select_chart",
-                            locked: false,
-                            cycle: false,
-                            players: vec![*host],
-                            chart: None,
-                        },
-                    );
-                }
-            }
-            E::RoomClosed { room_id } => {
-                self.rooms.write().await.remove(room_id);
-            }
-            E::UserJoined { room_id, user } => {
-                // monitor 不进 players（观察者不是玩家，2026-08 拍板）
-                if let Some(r) = self.rooms.write().await.get_mut(room_id)
-                    && !user.monitor
-                {
-                    r.players.push(user.id);
-                }
-            }
-            E::UserLeft { room_id, user, .. } => {
-                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.players.retain(|p| p != user);
-                }
-            }
-            E::NewHost {
-                room_id, new_host, ..
-            } => {
-                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.host = *new_host;
-                }
-            }
-            E::SelectChart {
-                room_id, name, id, ..
-            } => {
-                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.state = "select_chart";
-                    r.chart = Some((name.clone(), *id));
-                }
-            }
-            E::GameStart { room_id, .. } => {
-                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.state = "wait_for_ready";
-                }
-            }
-            E::StartPlaying { room_id } => {
-                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.state = "playing";
-                }
-            }
-            E::GameEnd { room_id, chart } | E::CancelGame { room_id, chart, .. } => {
-                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.state = "select_chart";
-                    // 谱面保留（Some(id) 与存量一致）；None = 图已被取消 → 清空
-                    if chart.is_none() {
-                        r.chart = None;
-                    }
-                }
-            }
-            E::LockRoom { room_id, lock } => {
-                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.locked = *lock;
-                }
-            }
-            E::CycleRoom { room_id, cycle } => {
-                if let Some(r) = self.rooms.write().await.get_mut(room_id) {
-                    r.cycle = *cycle;
-                }
-            }
-            // 热路径（RelayTouches/Judges）与不改变列表展示的（Chat/Ready/Played/Abort）
-            // 不更新快照
-            _ => {}
-        }
-    }
-}
+/// 房间列表快照与组合扇出（C1 拆分第一步：RoomInfo/RoomListSink/CompositeSink → sink.rs）。
+pub use crate::sink::{CompositeSink, RoomInfo, RoomListSink};
 
 /// 反作弊观察者（P2 首个运营规则 Moderator，docs/admin-api.md §4）：跨房 record 重放检测。
 ///
@@ -643,32 +501,6 @@ impl phira_api::Moderator for BanObserver {
     async fn on_event(&self, _ev: &RoomEvent) {}
 }
 
-/// 组合投递目标：多个 EventSink 的扇出（§4.9-5 观察者组合，bus 零改动）。
-#[derive(Default)]
-pub struct CompositeSink {
-    sinks: tokio::sync::RwLock<Vec<Arc<dyn EventSink>>>,
-}
-
-impl CompositeSink {
-    /// 构造时注入观察者列表（同步，避免 async 构造在非 async 上下文不可用）。
-    #[must_use]
-    pub fn new(sinks: Vec<Arc<dyn EventSink>>) -> Self {
-        Self {
-            sinks: tokio::sync::RwLock::new(sinks),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl EventSink for CompositeSink {
-    async fn deliver(&self, user_id: i32, event: &RoomEvent) {
-        let sinks = self.sinks.read().await.clone();
-        for sink in sinks {
-            sink.deliver(user_id, event).await;
-        }
-    }
-}
-
 /// 连接处理上下文（组合根接线；accept 时 Arc 共享）。
 #[derive(Clone)]
 pub struct ConnContext {
@@ -797,6 +629,46 @@ const MEMORY_GUARD_LIMIT: usize = 64 * 1024 * 1024;
 #[cfg(test)]
 static TEST_MEMORY_GUARD_LIMIT: AtomicUsize = AtomicUsize::new(0);
 
+/// 当前生效的全局在途上限（config 可覆盖；未 init 或覆盖 0 → const 默认 = 现值）。
+///
+/// 覆盖优先级：测试覆盖开关（`cfg(test)`，最优先）→ config 初始化值（[`GUARD_LIMITS`]）
+/// → const 默认（[`MEMORY_GUARD_LIMIT`]）。
+fn memory_guard_limit() -> usize {
+    #[cfg(test)]
+    {
+        let t = TEST_MEMORY_GUARD_LIMIT.load(Ordering::SeqCst);
+        if t > 0 {
+            return t;
+        }
+    }
+    let cfg = GUARD_LIMITS.load(Ordering::SeqCst);
+    if cfg > 0 { cfg } else { MEMORY_GUARD_LIMIT }
+}
+
+/// 每连接 send 队列字节上限（config 可覆盖；未 init 或 0 → const 默认 8MiB = 现值）。
+pub(crate) fn per_conn_mem_limit() -> usize {
+    let cfg = GUARD_PER_CONN.load(Ordering::SeqCst);
+    if cfg > 0 { cfg } else { PER_CONN_MEM_LIMIT }
+}
+
+/// 已鉴权连接总数上限（config 可覆盖；未 init 或 0 → const 默认 1000 = 现值）。
+pub(crate) fn max_authed_connections() -> usize {
+    let cfg = GUARD_MAX_AUTHED.load(Ordering::SeqCst);
+    if cfg > 0 { cfg } else { MAX_AUTHED_CONNECTIONS }
+}
+
+/// 进程级安全锁阈值（P1 参数化）；0 表示未覆盖、回落 const 默认。
+static GUARD_LIMITS: AtomicUsize = AtomicUsize::new(0);
+static GUARD_PER_CONN: AtomicUsize = AtomicUsize::new(0);
+static GUARD_MAX_AUTHED: AtomicUsize = AtomicUsize::new(0);
+
+/// 用 config 初始化三个安全锁阈值（组合根 main.rs 调用；0 = 保持 const 默认）。
+pub fn init_guard_limits(memory_guard_bytes: usize, per_conn_mem_bytes: usize, max_authed: usize) {
+    GUARD_LIMITS.store(memory_guard_bytes, Ordering::SeqCst);
+    GUARD_PER_CONN.store(per_conn_mem_bytes, Ordering::SeqCst);
+    GUARD_MAX_AUTHED.store(max_authed, Ordering::SeqCst);
+}
+
 /// 测试专用：设置守卫上限覆盖（配 [`TEST_MEMORY_GUARD_MUTEX`] 串行化，
 /// 防止同进程两个守卫测试互相干扰）。
 #[cfg(test)]
@@ -807,19 +679,6 @@ pub(crate) fn set_memory_guard_limit_for_test(v: usize) {
 /// 测试专用：守卫相关测试的串行锁（读侧 stream.rs 与投递侧 server.rs 共用）。
 #[cfg(test)]
 pub(crate) static TEST_MEMORY_GUARD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// 当前生效的全局在途上限（测试可覆盖，生产恒为 [`MEMORY_GUARD_LIMIT`]）。
-#[cfg(not(test))]
-const fn memory_guard_limit() -> usize {
-    MEMORY_GUARD_LIMIT
-}
-
-/// 测试专用实现：覆盖开关非 0 时以覆盖值为水位。
-#[cfg(test)]
-fn memory_guard_limit() -> usize {
-    let v = TEST_MEMORY_GUARD_LIMIT.load(Ordering::SeqCst);
-    if v > 0 { v } else { MEMORY_GUARD_LIMIT }
-}
 
 /// 每连接 send 队列字节上限（超限 → 该连接被踢）。
 const PER_CONN_MEM_LIMIT: usize = 8 * 1024 * 1024;
@@ -1318,7 +1177,7 @@ impl EventSink for SessionSink {
                 if let Outbound::Encoded(bytes) = &out {
                     let len = bytes.len();
                     let conn = slot.queue_bytes.fetch_add(len, Ordering::SeqCst) + len;
-                    if conn > PER_CONN_MEM_LIMIT {
+                    if conn > per_conn_mem_limit() {
                         slot.backpressure.force_close();
                     }
                     if !charge_memory(len) {
@@ -1880,7 +1739,7 @@ async fn authenticate_flow(
         Ok(identity) => {
             let user_id = identity.user_id;
             // 安全锁 B：已鉴权连接总数上限（§11 兑现）——超限拒绝鉴权 + 等断开
-            if AUTHED_CONNECTIONS.fetch_add(1, Ordering::SeqCst) + 1 > MAX_AUTHED_CONNECTIONS {
+            if AUTHED_CONNECTIONS.fetch_add(1, Ordering::SeqCst) + 1 > max_authed_connections() {
                 AUTHED_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
                 warn!("too many authed connections, rejecting user={user_id}");
                 let _ = send_tx
@@ -2337,5 +2196,29 @@ mod tests {
             admin_anticheat: AntiCheatObserver::new(),
             config_store: Arc::new(crate::storage::ConfigStore::disabled()),
         })
+    }
+
+    /// P1：config 阈值覆盖 const 默认——`init_guard_limits` 写入后，`memory_guard_limit` /
+    /// `per_conn_mem_limit` / `max_authed_connections` 读 config 值；未覆盖（0）= const 默认。
+    /// 串行锁隔离，测后还原为 0（不污染其它守卫测试进程级原子）。
+    #[test]
+    fn guard_limits_init_takes_config_value() {
+        let _serial = TEST_MEMORY_GUARD_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // 未覆盖 → const 默认（现值）
+        assert_eq!(memory_guard_limit(), MEMORY_GUARD_LIMIT);
+        assert_eq!(per_conn_mem_limit(), PER_CONN_MEM_LIMIT);
+        assert_eq!(max_authed_connections(), MAX_AUTHED_CONNECTIONS);
+        // config 覆盖生效
+        init_guard_limits(1024 * 1024, 2 * 1024 * 1024, 42);
+        assert_eq!(memory_guard_limit(), 1024 * 1024);
+        assert_eq!(per_conn_mem_limit(), 2 * 1024 * 1024);
+        assert_eq!(max_authed_connections(), 42);
+        // 还原（0 = 回到 const 默认）
+        init_guard_limits(0, 0, 0);
+        assert_eq!(memory_guard_limit(), MEMORY_GUARD_LIMIT);
+        assert_eq!(per_conn_mem_limit(), PER_CONN_MEM_LIMIT);
+        assert_eq!(max_authed_connections(), MAX_AUTHED_CONNECTIONS);
     }
 }

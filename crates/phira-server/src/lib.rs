@@ -9,6 +9,7 @@ pub mod admin;
 pub mod http;
 pub mod l10n;
 pub mod proxy;
+pub mod sink;
 pub mod storage;
 
 // 测试专用入口（http.rs 内 doc(hidden)，此处仅 re-export 供集成测试）

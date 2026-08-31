@@ -25,6 +25,13 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
     eprintln!("[boot] api_base = {}", config.api_base);
 
+    // 安全锁阈值（P1 参数化）：用 config 初始化三个守卫阈值（0 = 保持 server.rs const 默认）。
+    phira_server::server::init_guard_limits(
+        config.memory_guard_bytes,
+        config.per_conn_mem_bytes,
+        config.max_authed_connections,
+    );
+
     // 老板接线：决定谁上架 + 注入外部依赖（§4.9-6）
     // 单一 HTTP 实例，auth 与 chart/record 共享（评审 §8 五-1）
     let http = Arc::new(phira_server::http::HttpApiClient::new_with_timeout(
@@ -85,8 +92,7 @@ async fn main() -> Result<()> {
         config.config_poll_interval,
     );
 
-    // 管理面持久化（组合根 storage，docs/admin-api.md §持久化）：
-    // - 启动加载生效配置原文（config.current.json）→ 覆盖初始配置；
+    // 管理面持久化（组合根 storage，docs/admin-api.md §持久化）：    // - 启动加载生效配置原文（config.current.json）→ 覆盖初始配置；
     // - 上一份（config.last.json）回填 AdminConfigState->重启后仍可 rollback；
     // - ban/audit 由 BanObserver/AuditLog 带文件构造时自动加载（同目录）。
     let persist_dir = std::path::PathBuf::from(&config.persist_dir);

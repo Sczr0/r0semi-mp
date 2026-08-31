@@ -54,6 +54,18 @@ pub struct Config {
     /// true = 所有连接必须先发 PROXY 头（HAProxy `send-proxy` / nginx `proxy_protocol on`），
     /// 头缺失/非法 → 断开；false = 直连（默认）。
     pub proxy_protocol: bool,
+    /// 安全锁 A：全局在途字节上限（§10.4 承诺兑现；默认 64MiB = 现值，见 server.rs）。
+    ///
+    /// 0/缺省 = 使用 server.rs 的 `MEMORY_GUARD_LIMIT` 常量默认（64MiB）。
+    pub memory_guard_bytes: usize,
+    /// 安全锁 A：每连接 send 队列字节上限（超限 → 该连接被踢；默认 8MiB = 现值）。
+    ///
+    /// 0/缺省 = 使用 server.rs 的 `PER_CONN_MEM_LIMIT` 常量默认（8MiB）。
+    pub per_conn_mem_bytes: usize,
+    /// 安全锁 B：已鉴权连接总数上限（§11 兑现；默认 1000 = 现值）。
+    ///
+    /// 0/缺省 = 使用 server.rs 的 `MAX_AUTHED_CONNECTIONS` 常量默认（1000）。
+    pub max_authed_connections: usize,
 }
 
 impl Default for Config {
@@ -78,6 +90,10 @@ impl Default for Config {
             proxy_protocol: false,
             admin_token: None,
             persist_dir: "./data".to_owned(),
+            // 安全锁阈值（P1 技术债：可参数化；0 = 使用 server.rs 的 const 默认 = 现值）。
+            memory_guard_bytes: 0,
+            per_conn_mem_bytes: 0,
+            max_authed_connections: 0,
         }
     }
 }
@@ -246,6 +262,15 @@ impl Config {
         if let Some(dir) = yaml.persist_dir {
             self.persist_dir = dir;
         }
+        if let Some(v) = yaml.memory_guard_mb {
+            self.memory_guard_bytes = v * 1024 * 1024;
+        }
+        if let Some(v) = yaml.per_conn_mem_mb {
+            self.per_conn_mem_bytes = v * 1024 * 1024;
+        }
+        if let Some(v) = yaml.max_authed_connections {
+            self.max_authed_connections = v;
+        }
         Ok(())
     }
 }
@@ -290,4 +315,10 @@ struct YamlConfig {
     admin_token: Option<String>,
     /// 管理面持久化目录（None = 仅内存）。
     persist_dir: Option<String>,
+    /// 安全锁 A：全局在途字节上限（MiB；缺省 0 = 用 server.rs const 默认 64MiB）。
+    memory_guard_mb: Option<usize>,
+    /// 安全锁 A：每连接 send 队列字节上限（MiB；缺省 0 = 用 server.rs const 默认 8MiB）。
+    per_conn_mem_mb: Option<usize>,
+    /// 安全锁 B：已鉴权连接总数上限（缺省 0 = 用 server.rs const 默认 1000）。
+    max_authed_connections: Option<usize>,
 }
