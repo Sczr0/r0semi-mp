@@ -1,0 +1,39 @@
+# 客户端漂移哨兵（client-conformance.md 五步规划步骤 4，手动触发 + 每周定时）。
+#
+# 目的：conformance 测试钉住上游 `phira-mp`（TeamFlos）的 commit（现 cc822df）；
+# 上游 main 前进后测试与怪癖文档都会失真。本 workflow 定期对比钉住 commit 与上游
+# main HEAD，漂移即显式失败（红），提醒维护者：升 rev → 重跑全部兼容性测试 →
+# 按新客户端行为更新 client-behavior-review.md / client-conformance.md 怪癖清单。
+#
+# 与 deep-verify.yml / flamegraph.yml 同理：手动 + 定时，不进 push/PR 主闸门。
+name: drift-sentinel
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1" # 每周一 03:00 UTC 自动检查
+
+permissions:
+  contents: read
+
+jobs:
+  check-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstream client drift (--strict: 漂移即红)
+        run: python3 tools/check-client-drift.py --strict
+
+      - name: Upload pin snapshot (审计留档)
+        if: always()
+        run: |
+          mkdir -p artifacts
+          grep -A1 'name = "phira-mp-client"' Cargo.lock > artifacts/pin.txt
+          python3 tools/check-client-drift.py > artifacts/report.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: drift-report
+          path: artifacts/
+          if-no-files-found: ignore

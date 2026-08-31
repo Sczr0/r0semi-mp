@@ -285,3 +285,83 @@ async fn a6_broadcasts_decode_by_real_sdk() {
     let st = sdk_blocking_state(&guest).await.expect("guest 应仍在房间");
     assert!(st.locked, "guest 视角的 locked 应为 true");
 }
+
+// —— 断言库雏形（P4，client-conformance.md 五步规划步骤 2 第一笔） ——
+//
+// 对抗性序列 × 真 SDK 的可复用断言。当前一条：A2 负向注入——服务端绝不向
+// 未入房用户推送房间事件（Message::{LockRoom,CycleRoom,LeaveRoom}、ChangeState、
+// ChangeHost，无房 → 真客户端 panic，lib.rs:453-483）。确定性断言（窗口内缺席），
+// 不依赖时序，非 flaky。后续对抗性场景（并发 LockRoom 竞态等）复用同一辅助扩展。
+
+/// A2 负向注入：断言 `client` 在 `window` 内未收到任何房间推送（连接健康、无房态）。
+///
+/// 观察面与 SDK 事实对齐：`take_messages` 只暴露 `Message`（LockRoom/CycleRoom/LeaveRoom）；
+/// `ChangeState`/`ChangeHost` 是 `ServerCommand` 变体（无公共读取面），由其副作用覆盖——
+/// 若服务端向未入房用户推它们，SDK 处理时踩裸 unwrap panic（lib.rs:453-483）→ recv 任务
+/// 退出 → 心跳失败，被 ping 断言捕获。三者合一即 A2 全量。
+async fn assert_no_room_push_to_unjoined(
+    client: &Arc<phira_mp_client::Client>,
+    window: Duration,
+    label: &str,
+) {
+    use phira_mp_common::Message;
+    tokio::time::sleep(window).await;
+    // 1) Message 层：LockRoom/CycleRoom/LeaveRoom 推送必须缺席
+    //    （blocking_* 访问器须经 spawn_blocking——真客户端"UI 线程"姿势，同 sdk_blocking_state）
+    let c = Arc::clone(client);
+    let msgs = tokio::task::spawn_blocking(move || c.blocking_take_messages())
+        .await
+        .expect("take_messages 任务 panicked");
+    for m in &msgs {
+        assert!(
+            !matches!(
+                m,
+                Message::LockRoom { .. } | Message::CycleRoom { .. } | Message::LeaveRoom { .. }
+            ),
+            "{label}: 未入房用户收到房间推送 {m:?}（A2 违例）"
+        );
+    }
+    // 2) 状态层：从未进入房间（ChangeState/ChangeHost 未越过房间边界）
+    let st = sdk_blocking_state(client).await;
+    assert!(
+        st.is_none(),
+        "{label}: 未入房用户状态应保持 None（A2 违例）"
+    );
+    // 3) 心跳层：recv 任务未因坏帧/panic 退出（ChangeState/ChangeHost 越权的副作用面）
+    tokio::time::timeout(Duration::from_secs(2), client.ping())
+        .await
+        .expect("{label}: ping 超时（A2 违例）")
+        .unwrap();
+}
+
+/// A2 负向注入（真 SDK）：鉴权后不入房，静置窗口内绝不能收到房间推送——
+/// 服务端若在用户未入房时推 LockRoom/ChangeState 等，真客户端会踩裸 unwrap panic
+/// （client-behavior-review §5 A2）。这是"服务端多说话就出事"的第一条可执行断言。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a2_no_room_push_to_unjoined_user() {
+    let addr = spawn_server().await;
+    let guest = sdk_connect(addr).await;
+    guest.authenticate("tokB").await.unwrap();
+    // 不入房，静置 2s——服务端若有越界推送必在窗口内到达
+    assert_no_room_push_to_unjoined(&guest, Duration::from_secs(2), "未入房 guest").await;
+}
+
+/// A2 正向基线（对照）：入房用户应正常收到房间事件（锁房推送被应用）——
+/// 证明上面的负向断言不是"服务端从不推任何东西"，而是精确地"只对未入房者禁推"。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a2_in_room_user_gets_pushes() {
+    let addr = spawn_server().await;
+    let host = sdk_connect(addr).await;
+    host.authenticate("tokA").await.unwrap();
+    host.create_room(rid_ok("conf-x")).await.unwrap();
+    let guest = sdk_connect(addr).await;
+    guest.authenticate("tokB").await.unwrap();
+    guest
+        .join_room(rid_ok("conf-x"), true)
+        .await
+        .expect("monitor 加入");
+
+    host.lock_room(true).await.unwrap();
+    let st = sdk_blocking_state(&guest).await.expect("guest 应仍在房间");
+    assert!(st.locked, "入房用户应收到锁房推送（正向基线）");
+}
