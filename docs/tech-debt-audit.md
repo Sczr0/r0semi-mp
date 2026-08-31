@@ -5,6 +5,11 @@
 > 分四级，均含代码定位。两条新的实质性 bug 已按项目纪律落档：
 > [ISSUE-0011](issues/0011-encode-cache-pointer-key-aba.md)（EncodeCache ABA）与
 > [ISSUE-0012](issues/0012-session-registry-unbounded-growth.md)（SessionRegistry 增长）。
+>
+> **2026-08-31 状态同步注记**：审计后部分项已清偿，本次逐项对照代码回写——
+> B4/B5/D1/D2 ✅ 关闭；C3 热重载 ✅（仅剩子域 CDN allowlist）；C1/C4/B6/优先级表
+> 进度与剩余项修正；"丢旧保新"表述统一（实现为丢新 + 慢消费者断连，效果等价）。
+> 同步基线：`cargo test --workspace` 307 全绿（2026-08 实测）。
 
 ## 审计方法
 
@@ -49,18 +54,19 @@ Rust 分配器可复用同尺寸类释放块的地址。地址复用 = 新事件
 | B1 | **Tick 是空壳**（✅ 已解决 2026-08——WaitForReady 60s 倒计时，契约测试 ready_countdown_tick 三场景） | lib.rs:851 "v1 无玩法倒计时…占位（§4.6）"；但 bus.rs 队列策略已分类 `Tick→DropIfFull` | 无倒计时/超时强开，对局或无限挂起 | gooophira ready 倒计时（60s 强制开赛，未准备 Aborted，18 测试） |
 | B2 | **lang 字段躺契约里没用**（✅ 已解决 2026-08——server 出口按 lang 本地化，l10n 静态表零依赖） | `UserIdentity.lang` 存在（auth.rs）；错误 `"already uploaded"`/`"game is ongoing"` 英文硬编码 | 中文玩家看英文报错 | 原版 Fluent 三语（en/zh-CN/zh-TW，per-user 作用域） |
 | B3 | **Metrics 收集了但不暴露**（✅ 已解决 2026-08） | bus.rs `Metrics::snapshot()`（含 calls/ok/business/internal），但 /healthz 仅 conn_count/rooms/version（server.rs 1121） | 可观测性数据进黑洞 | 一小时可暴露 |
-| B4 | ISSUE-0007 game_time 缺失 | 重连恢复"玩家打到哪"无进度维度 | 断线恢复体验缺一维 | 原版 `NEG_INFINITY` 哨兵 + AtomicU32 |
-| B5 | ISSUE-0010 CreateRoom 非幂等 | 响应丢失重试 → RoomIdOccupied + 孤儿房 | 弱网玩家建房失败率上升 | 协议级限制，已留档 |
-| B6 | **观战转播逐命令直发**（✅ 已解决 2026-08——B6 聚合缓冲 + Tick 心跳）| live 下 Touches/Judges 立即产出 Relay*，朴素客户端 60Hz 单帧即 ~480 cmd/s/房小包洪峰 | 网络/syscall/包数放大 | gooophira AggregatingMonitorBuffer（50ms 动态窗合并 + flush 编码一次） |
+| B4 | ISSUE-0007 game_time 缺失（✅ **已解决 2026-08-27**——方案 A：`GetClientState` 尾追加 last_game_time + actor 内双时机记录/重置，回归测试） | 重连恢复"玩家打到哪"无进度维度 | 断线恢复体验缺一维 | 原版 `NEG_INFINITY` 哨兵 + AtomicU32 |
+| B5 | ISSUE-0010 CreateRoom 非幂等（✅ **已处置 2026-08-27**——方案 D→C：deployment.md §9 客户端指引；协议级根因留待协议演进） | 响应丢失重试 → RoomIdOccupied + 孤儿房 | 弱网玩家建房失败率上升 | 协议级限制，已留档 |
+| B6 | **观战转播逐命令直发**（✅ 已解决 2026-08——B6 聚合缓冲 + Tick 心跳；**遗留**："丢旧保新"为策略表述、实际丢新 + kicker 5s 断连；阈值硬编码未进 config）| live 下 Touches/Judges 立即产出 Relay*，朴素客户端 60Hz 单帧即 ~480 cmd/s/房小包洪峰 | 网络/syscall/包数放大 | gooophira AggregatingMonitorBuffer（50ms 动态窗合并 + flush 编码一次） |
 
 B1 的修复与架构最贴合：Tick 插座已预埋，只需生命周期任务周期发 `Tick{now}` + 房间状态机加倒计时字段。B2/B3 是全场最低成本高收益项。
 > **修复注记（2026-08）**：B1 已通电（WaitForReady 倒计时 + 超时驱逐复用 evict）；B2 已落地（对照原版 Fluent 三语语义，但用零依赖静态文案表实现于协议出口，lang 存 SendSlot 随会话生灭）；B3 同日完成（/healthz 暴露 Metrics）。
+> **状态同步注记（2026-08-31）**：B4 已关闭（ISSUE-0007 方案 A——last_game_time 尾追加 2026-08-27 落地，回归测试）；B5 已处置（ISSUE-0010 方案 D→C——deployment.md §9 客户端指引，协议级根因留待演进）；B6 遗留 = 慢消费者实际为**丢新 + kicker 5s 断连**（"丢旧"是策略表述，效果等价），且内存守卫/踢人阈值仍为硬编码 `const` 未进 config（见 AGENTS.md 安全锁）。
 
 ---
 
 ## C 级：结构性技术债
 
-### C1. server.rs 上帝文件（1357 行）
+### C1. server.rs 上帝文件（拆分已触发：admin.rs 790 行已抽出，server.rs 仍 2341 行，2026-08 实测）
 
 SessionSink、EncodeCache、CommandLimiter、ConnectionAdmission、Backpressure、RoomListSink、
 CompositeSink 全挤在一个文件。违背自身"薄缝"哲学。**拆分蓝图**（netty 已示范）：
@@ -72,6 +78,8 @@ server.rs → front-gate/(admission, proxy, limiter)
 ```
 
 **触发时机**：不要为拆而拆，绑定到下一个必然功能（管理 API / 回放 Sink）进场时"顺便"抽出。
+**进度（2026-08-31 同步）**：管理 API 进场已触发第一步——`http_serve`/`http_accept_loop` 抽至 `admin.rs`；
+sink/shutdown 组块与 `front-gate/` 拆分未动（server.rs 期间增长至 2341 行，下一个触发点 = 回放/Store Sink 进场）。
 bus.rs:520 已留升级路径："泛化触发条件 = 第二个大扇出广播场景"——作者自知但未到阈值。
 
 ### C2. SessionRegistry 只进不出 → **ISSUE-0012**（✅ 已解决 2026-08）
@@ -102,6 +110,9 @@ bus.rs:520 已留升级路径："泛化触发条件 = 第二个大扇出广播�
 非 200 终态均显式报错（可诊断，不静默）。**剩余项**：若实际上游 302 到**子域** CDN
 （如 cdn.5wyxi.com），需把白名单从"同 host"扩为"可配置 allowlist"（走 config 项，现状拒绝对
 故障更安全）。
+
+**配置热重载（✅ 已落地）**：`config_poll_interval` 周期轮询 + `update_config` 广播（见
+`server_config.example.yml`），C3 剩余仅上列子域 CDN allowlist 一项。
 
 ### C4. 谱面反作弊规则耦合（已标识的演进点，P2 触发时清偿）
 
@@ -134,6 +145,10 @@ pub trait RecordPolicy: Send + Sync {
 不受影响。
 **触发时机**：P2（mod/level/阈值类运营规则）需求到来时，与 `record.Mod` 数据口（上游有、
 DTO 未接）一并落地。
+**进度（2026-08-31 同步）**：跨房重放规则已由 **AntiCheatObserver（admin-api 阶段 3.6）**以
+Moderator 观察者面落地 + R2 高频观测（3.6.1，纯 flag 不自动拦）——即 C4 的"拦截类"规则已走
+观察者通道出账；`RecordPolicy` 回注点裁决插座仍未建，触发点 = P3 难度校验（mod/level，
+DTO 未接）或多解规则真实出现。
 ---
 
 ## D 级：防御缺口（有意取舍但仍属缺口）
@@ -142,7 +157,7 @@ DTO 未接）一并落地。
 |---|---|---|---|
 | D1 | Chat 不限速（✅ 已解决 2026-08）——`rate_limit()` 白名单加入 `ClientCommand::Chat`（2/s，500ms 间隔），超限回 `TooManyRequests`；`rate_limit` 单元测试 + 移植 memory_guard 测试改用 Touches | `rate_limit()` 白名单只有 CreateRoom/JoinRoom/SelectChart/Played；注释"低频命令(Chat/Ready…)不限"是显式决定 | gooophira 聊天 2/s 令牌桶 |
 | D2 | 版本握手不校验（✅ 已解决 2026-08）——`handle_connection` 握手后校验 `stream.version() != PROTOCOL_VERSION` 即释放准入并断开，回归测试 `handshake_rejects_wrong_version_then_accepts_v1` | stream.rs 读取版本但只记录展示（healthz），不拒绝不匹配 | gooophira `ver != protocolVersion` 即断 |
-| D3 | protocol_hack 层缺失 | 无真客户端怪癖补偿机制 | gooophira/jphira 的 forceSyncInfo/fixClientRoomState（但需源码验证，见 client-conformance.md） |
+| D3 | protocol_hack 层缺失 | 无真客户端怪癖补偿机制（✅ 部分推进 2026-08：conformance.rs 真 SDK 崩溃猎手 A1–A6 已落地且全绿；一致性断言库 + 漂移哨兵未建，见 client-conformance.md 五步规划） | gooophira/jphira 的 forceSyncInfo/fixClientRoomState（源码已验证怪癖机制，见 client-conformance.md） |
 
 D2 在协议 v2 到来时会被动暴露；D3 的正确解法不是抄传闻，而是走 client-conformance.md 的一致性验证体系。
 
@@ -153,9 +168,9 @@ D2 在协议 v2 到来时会被动暴露；D3 的正确解法不是抄传闻，�
 | 阶段 | 内容 | 判据 |
 |---|---|---|
 | **立即**（天级） | ✅ A1 ABA 修复（ISSUE-0011）· ✅ B3 Metrics 暴露 · ✅ D2 版本握手校验 · ✅ client-conformance 崩溃猎手测试（conformance.rs，真 SDK A1–A6） | 消灭全部已知正确性地雷 |
-| **短期**（周级） | ✅ B2 i18n · ✅ 谱面反作弊（P0/P1 落地：`Record.chart` 数据口 + 回注点谱面匹配（fail-open）；P2 观察者规则/P3 难度校验未做；规则耦合已标识 → **C4**）· ✅ 观战聚合缓冲（B6+Tick 心跳）· ✅ D1 Chat 限速 · ✅ C2 Registry 拆表（ISSUE-0012） | 每项带契约测试落地 |
-| **中期**（月级） | ✅ B1 Tick 通电（倒计时，提前完成）· 一致性断言库 + 漂移哨兵 · 管理 API | 玩家可感知 + 护城河成形 |
-| **择机** | ✅ A2 回源出队（已提前完成）· C1 server.rs 拆分 · 回放录制（Store 接口） | 绑定到相关功能进场时顺手做 |
+| **短期**（周级） | ✅ B2 i18n（EN 措辞决策遗留 ISSUE-0013）· ✅ 谱面反作弊（P0/P1 + 跨房重放/频率观测经 AntiCheatObserver 落地 = admin-api 阶段 3.6/3.6.1；P3 难度校验未做、`record.Mod`/level DTO 未接 → **C4**）· ✅ 观战聚合缓冲（B6+Tick 心跳）· ✅ D1 Chat 限速 · ✅ C2 Registry 拆表（ISSUE-0012） | 每项带契约测试落地 |
+| **中期**（月级） | ✅ B1 Tick 通电（倒计时，提前完成）· ⬜ 一致性断言库 + 漂移哨兵（未建，见 client-conformance.md 五步规划；崩溃猎手 A1–A6 已先行）· ✅ 管理 API（阶段 1-3.6.1 全落地；⬜ 阶段 4 面板 = 前端消费方，决策不进仓库） | 玩家可感知 + 护城河成形 |
+| **择机** | ✅ A2 回源出队（已提前完成）· ⬜ C1 server.rs 拆分（admin.rs 第一步已抽出；sink/shutdown 组块待下一触发点）· ⬜ 回放录制（Store 接口） | 绑定到相关功能进场时顺手做 |
 | **远景** | Store 持久化 · 协议 v2 预案 · 多实例（仅当需求出现） | 文档立 flag，不动代码 |
 
 ## 总体判断

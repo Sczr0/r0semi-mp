@@ -43,6 +43,8 @@
    与纠纷回溯的地基；
 2. **干预走既有安全语义**：AdminBan = 更新 Moderator 名单（触发既有 intercept），
    不是旁路拔线；误操作最高到"踢人/禁言"；
+   **实现注记（2026-08-31 同步）**：实际落地为"kick + 断 TCP + BanObserver 名单拦截"
+   （§4 ban 行 / 阶段 3 observer 热插拔）——拦截走 Moderator 通道不旁路状态机，语义等价；
 3. **配置回滚**：runtime-config 每次写入保留上一份全量快照，
    `/admin/config/rollback` 一步回切（gooophira rollback 概念，v1 做"上一份"；
    不搞版本栈）；
@@ -62,7 +64,7 @@
 | `GET /admin/metrics` | 1 | ✅ 本轮 | bus Metrics 快照（与 /healthz.metrics 同构） |
 | `POST /admin/rooms/{id}/kick` | 2 | ✅ 本轮 | 系统命令 `AdminKick`（复用 evict；不断 TCP）+ 审计 |
 | `POST /admin/rooms/{id}/broadcast` | 2 | ✅ 本轮 | 系统命令 `AdminBroadcast`（房内系统 Chat user=0）+ 审计 |
-| `POST /admin/users/{id}/ban` | 2 | ✅ 本轮 | kick（若有房）+ 断 TCP（kicker force_close）+ 审计；**名单拦截依赖 P2** |
+| `POST /admin/users/{id}/ban` | 2 | ✅ 本轮 | kick（若有房）+ 断 TCP（kicker force_close）+ 审计；**名单拦截已由阶段 3 BanObserver 热插拔兑现** |
 | `POST /admin/users/{id}/disconnect` | 2 | ✅ 本轮 | 仅断连（连接收尾发生命周期事实）+ 审计 |
 | `GET /admin/audit` | 2 | ✅ 本轮 | 审计环（有界 256，时间倒序） |
 | `POST /admin/config` | 3 | ✅ 本轮 | runtime-config 热更（先存"上一份"→广播）+ 审计 |
@@ -73,7 +75,7 @@
 - ~~`/admin/rooms/{id}` 详情目前 = RoomInfo（id/host/users/state/locked/cycle）；成员名单……~~
   **已清偿（2026-08）**：成员名单（`players`，不含 monitor）与谱面（`chart` name+id）
   已进标准格式；**谱面难度（level）仍缺**（回源才有，留数据源扩展）；
-- `/admin/users` 暂不含 lang/队列状态（SessionSink 未暴露），阶段 2 补；
+- `/admin/users` 暂不含 lang/队列状态（SessionSink 未暴露），**未补、留面板需求触发**；
 - 状态过滤的匹配对象是三态 snake_case 字符串（`select_chart` 等），
   子串语义已够面板用。
 
@@ -83,7 +85,7 @@
 |---|---|---|---|
 | 0 | 设计定稿（本文档） | — | — |
 | 1 ✅ | 只读管理面（/admin/rooms、rooms/{id}、users、metrics） | 零写风险、原 /rooms /healthz 回归不动 | **C1 拆分触发**（http_serve/http_accept_loop 从 server.rs → admin.rs） |
-| 2 ✅ | 写面系统命令族（AdminKick/AdminBroadcast）+ Bearer 认证 + 审计环 | kick e2e 全链路（含被踢者本人收 LeaveRoom）+ 401/403 + 审计 4 端点 | `/admin/*` 全认证（读面收紧）；AdminBan 名单拦截留 P2 |
+| 2 ✅ | 写面系统命令族（AdminKick/AdminBroadcast）+ Bearer 认证 + 审计环 | kick e2e 全链路（含被踢者本人收 LeaveRoom）+ 401/403 + 审计 4 端点 | `/admin/*` 全认证（读面收紧）；AdminBan 名单拦截当时留 P2，**已由阶段 3 BanObserver 热插拔兑现** |
 | 3 ✅ | runtime-config（存"上一份"+一步回滚）+ observer 热插拔（ban） | config 回滚 409/审计 + 热插拔生效失效/幂等 + 名单拦命令 | **§7.3 定形实锤**：Moderator 加 `kind()`（type_name_of_val 对 &dyn 返回 dyn 名不可作身份键） |
 | 3.5 ✅ | 管理面持久化（ban / audit / config 快照） | 重启后名单拦截生效、审计历史可查、rollback 跨重启仍可用；损坏文件 fail soft | 组合根 storage 模块，契约/core 零改动 |
 | 3.6 ✅ | 反作弊 P2（AntiCheatObserver，第二个真实 Moderator） | 跨房 record 重放被 Moderated 拒绝（端到端）+ /admin/anticheat 读面 + 热插拔 kind=anticheat | §7.3 观察者接口被第二个实例再次定形（intercept 同步判定 + 拒绝环形） |
@@ -123,10 +125,11 @@ data/
    拒绝通用透传 —— 已定；
 3. **面板**：纯 API 消费方，前端不进仓库（gooophira 是前者，代价是 React 进仓库，
    本项目不做）—— 已定；
-4. **阶段 1 动工**：已开启（本轮）。
+4. **阶段 1 动工**：已开启（本轮）——**进度同步（2026-08-31）：阶段 1-3.6.1 均已按本设计落地**。
 
 ## 7. 关联
 
-- C1（server.rs 上帝文件 1594 行）：**本轮已触发**——admin.rs 抽出为第一步；
+- C1（server.rs 上帝文件）：**本轮已触发第一步**——admin.rs 抽出；server.rs 现仍 2341 行
+  （2026-08 实测），sink/shutdown 组块拆分待下一触发点；
 - gooophira 对照：controller/OTP/console/rollback 概念的取舍记录（server-comparison §3.2）；
 - 反作弊 P2：运营观察台 = 阶段 4 面板的天然宿主，不单独做。

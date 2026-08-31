@@ -1,23 +1,23 @@
 # AGENTS.md —— r0semi-mp 项目纪律（给 AI Agent / 协作者）
 
-> 本文件是**工作纪律摘要**，不是架构文档。架构细节见 `docs/ARCHITECTURE.md`（1106 行，权威规范）。
+> 本文件是**工作纪律摘要**，不是架构文档。架构细节见 `docs/ARCHITECTURE.md`（权威规范）。
 > 目标：让"每次会话都是新协作者"的 AI 在 5 分钟内掌握：什么能信、什么不能信、怎么改不出错。
 
 ## 项目一句话
 
-Phira 联机房间服务器 `phira-mp`（Rust）的重写：**内存最小（目标 RSS 7-15MB）+ 子系统可整体替换（契约分层）+ 协议完全兼容**。Rust workspace，5 个 crate，178 测试全绿。
+Phira 联机房间服务器 `phira-mp`（Rust）的重写：**内存最小（目标 RSS 7-15MB）+ 子系统可整体替换（契约分层）+ 协议完全兼容**。Rust workspace，5 个 crate，307 测试全绿（2026-08 实测 `cargo test --workspace`；此数会随提交变动，以实测为准）。
 
 ## 文档可信度分级（两轮检查结论，2026-08）
 
 | 文档 | 可信度 | 说明 |
 |---|---|---|
 | `docs/ARCHITECTURE.md` 的**契约层**（§4.4 类型、§6.6 转换表、依赖方向） | ✅ 与代码一致 | 骨架是诚实的 |
-| `docs/ARCHITECTURE.md` 的**性能/防护承诺**（§6.5-17 编码一次、§10.4 丢旧保新、§4.9-2 每连接限速） | ✅ **已兑现（2026-08）** | 编码一次共享（ADR-0009/EncodeCache）、丢新不阻塞+kicker（ISSUE-0004）、每连接限速（ADR-0008/CommandLimiter）均已落地 |
+| `docs/ARCHITECTURE.md` 的**性能/防护承诺**（§6.5-17 编码一次、§10.4 慢消费者不阻塞房间、§4.9-2 每连接限速） | ✅ **已兑现（2026-08）** | 编码一次共享（ADR-0009/EncodeCache）、丢新+kicker 不阻塞房间（ISSUE-0004——注意："丢旧保新"为策略表述，实现是**丢新 + 慢消费者 5s 断连**，"绝不阻塞房间"的效果等价，见陷阱表 #4）、每连接限速（ADR-0008/CommandLimiter）均已落地 |
 | `docs/ARCHITECTURE.md` 的**选型描述**（§4.8-3 peek） | ✅ 已同步 | §4.8-3/§11.1 已改写为"独立端口 http_port + /rooms + /healthz"（ISSUE-0005 已解决） |
-| `docs/adr/` | ✅ **已有 0001-0009** | 含新增 ADR-0007（重放）/0008（限速）/0009（编码一次）（ISSUE-0002 已解决） |
+| `docs/adr/` | ✅ **已有 0001-0013** | 0007（重放）/0008（限速）/0009（编码一次）/0010（内存守卫·连接上限）/0011（EventsOutlet 首消费者等待）/0012（对局中重连窗口）/0013（Played 幂等静默成功）；`tools/check-adr.py` 盯编号连续（ISSUE-0002 已解决） |
 | 代码注释 | ✅ 可信 | 大量注释自带章节引用，且记录真实决策（如 peek 放弃原因） |
 
-**总纪律：以代码为准。发现"文档说了、代码没有"→ 记入 `docs/issues/`（现有 0001-0014；0001-0012 已全部解决/处置；**0013（EN Title Case 决策点，owner 定夺）/ 0014（conformance 2-worker 僵死备查）待决（低危）**，格式见下）。**
+**总纪律：以代码为准。发现"文档说了、代码没有"→ 记入 `docs/issues/`（现有 0001-0015；0001-0012 与 0015 已全部解决/处置；**0013（EN Title Case 决策点，owner 定夺）/ 0014（conformance 2-worker 僵死备查）待决（低危）**，格式见下）。**
 
 ## 修改纪律（改代码前必读）
 
@@ -32,7 +32,7 @@ Phira 联机房间服务器 `phira-mp`（Rust）的重写：**内存最小（目
 5. **lint 红线**：全 workspace `forbid(unsafe_code)`；`phira-api` 额外 `missing_docs=deny`；`phira-core` 禁 `unwrap/expect`（柜台不 panic）；clippy `pedantic` 全量 + `-D warnings`
 6. **测试**：`cargo test --workspace` 必须全绿；契约测试是"任何 impl 必须通过"的安全网；**模糊测试**（`tests/fuzz.rs` 解码器 + `tests/fuzz_frames.rs` 真实 TCP 垃圾流）保证解码器吃任意字节不 panic；**压力测试**（`tests/pressure.rs`，`#[ignore]` 手动跑：`-- --ignored`——本地回环实测 ~1.5-2.3Gbps 灌流 0 panic 0 内存膨胀）；Oracle 字节级对照在独立工程 `C:/git/r0semi-mp-oracle`（不在 workspace）
 7. **错误走 Err 不走 panic**：业务拒绝用 `RoomError::Business`（客户端可见），内部故障用 `Internal`（通用文案 + 日志）。错误率只统计 `Internal`
-8. **安全锁（§10.4/§11，ADR-0010）**：全局在途字节 64MiB + 每连接 send 队列 8MiB（超限踢）+ 已鉴权连接上限 1000——**改投递/写路径时必须保持记账平衡**（投递 charge ↔ 写任务 fetch_sub ↔ Drop guard 兜底），否则内存守卫失真；上限为常量可参数化
+8. **安全锁（§10.4/§11，ADR-0010）**：全局在途字节 64MiB + 每连接 send 队列 8MiB（超限踢）+ 已鉴权连接上限 1000——**改投递/写路径时必须保持记账平衡**（投递 charge ↔ 写任务 fetch_sub ↔ Drop guard 兜底），否则内存守卫失真；三个阈值现为硬编码 `const`，尚未进 config（"可参数化"为后续待办）
 
 ## 陷阱清单（历史记录：0001-0006 已全部解决并回写文档——现在可以信文档）
 
@@ -44,9 +44,9 @@ Phira 联机房间服务器 `phira-mp`（Rust）的重写：**内存最小（目
 | # | 陷阱 | 现状 |
 |---|---|---|
 | 1 | "表 miss 挂起重放"（§4.9-3 幽灵座位） | ✅ **已修复（2026-08）**——`lookup_room_with_replay`（3×20ms 重放）；ADR-0007（ISSUE-0001 已解决） |
-| 2 | ADR 文件 | ✅ **已修复（2026-08）**——0001-0009 已落 `docs/adr/`（含 0007 重放/0008 限速/0009 编码一次）+ `tools/check-adr.py` CI 第 3b 闸门（编号连续）（ISSUE-0002 已解决） |
+| 2 | ADR 文件 | ✅ **已修复（2026-08）**——0001-0013 已落 `docs/adr/`（0007 重放/0008 限速/0009 编码一次/0010 内存守卫/0011 事件出口/0012 重连窗口/0013 Played 幂等）+ `tools/check-adr.py` CI 第 3b 闸门（编号连续）（ISSUE-0002 已解决） |
 | 3 | "一次编码 Bytes 共享"（§6.5-17） | ✅ **已修复（2026-08）**——`EncodeCache` 热路径编码一次（帧 Arc 指针缓存）+ `Outbound::Encoded` 直写；ADR-0009（ISSUE-0003 已解决） |
-| 4 | "丢旧保新、绝不阻塞房间"（§10.4） | ✅ **已修复（2026-08）**——`try_send` 丢新不阻塞 + `Backpressure` 积压标记 + kicker 5s 踢乌龟；阈值未进 config；"丢旧"仍为文档表述（实际丢新）（ISSUE-0004 已解决） |
+| 4 | "丢旧保新、绝不阻塞房间"（§10.4） | ✅ **已修复（2026-08）**——`try_send` 丢新不阻塞 + `Backpressure` 积压标记 + kicker 5s 踢乌龟；"丢旧"为策略表述（实际**丢新 + 慢消费者断连**，"绝不阻塞房间"的效果等价）；阈值仍为硬编码 `const`（ISSUE-0004 已解决） |
 | 5 | peek 嗅探（§4.8-3/§11.1 方案 B） | ✅ **已修复（2026-08）**——文档 3 处同步（peek 已放弃）；`http_port` 提供 `/rooms` + `/healthz`（ISSUE-0005 已解决） |
 | 6 | 每连接限速（§4.9-2/§4.9-9） | ✅ **已修复（2026-08）**——`CommandLimiter` 只限"贵"命令（CreateRoom 1/s，JoinRoom/SelectChart/Played 5/s），超限回 `TooManyRequests`；ADR-0008（ISSUE-0006 已解决） |
 
@@ -61,7 +61,7 @@ python3 tools/check-deps.py        # 依赖方向（CI 第 3 闸门；Windows �
 cargo fmt --all -- --check         # 格式
 ```
 
-CI 六道闸门：fmt → clippy → check-deps → test → cargo-deny 许可 → cargo-semver-checks（盯 phira-api）。
+CI 六道闸门（`ci.yml`，另含 Nightly 二进制发布 job）：fmt → clippy → check-deps → test → cargo-deny 许可 → cargo-semver-checks（盯 phira-api）。另有手动触发不进主闸门的 workflow：`deep-verify.yml`（mutants/llvm-cov/fuzz 深度验证）、`flamegraph.yml`（CPU 火焰图）。
 
 ## 新增 issue 的格式（docs/issues/）
 
