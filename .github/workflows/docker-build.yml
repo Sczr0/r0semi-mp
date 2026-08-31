@@ -47,8 +47,8 @@ jobs:
       - name: Smoke test (healthz + game-port handshake, deployment.md §10 验收)
         run: |
           set -euo pipefail
-          # 容器端口映射到高位 host 端口，避免与 runner 冲突
-          cid=$(docker run -d -p 18080:8080 -p 112346:12346 r0semi-mp:ci)
+          # 容器端口映射到高位 host 端口（≤65535），避免与 runner 冲突
+          cid=$(docker run -d -p 18080:8080 -p 23456:12346 r0semi-mp:ci)
           trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
           # 1) 管理 HTTP：轮询 /healthz 直到 200（启动上限 60s）
@@ -65,7 +65,7 @@ jobs:
           # 2) 游戏端口：发版本字节 0x01 + Ping 帧 01 00 → 收 Pong（deployment.md §10）
           pong=$(python3 - <<'EOF'
           import socket, time
-          s = socket.create_connection(("127.0.0.1", 112346), timeout=5)
+          s = socket.create_connection(("127.0.0.1", 23456), timeout=5)
           s.sendall(b"\x01")
           time.sleep(0.2)
           s.sendall(b"\x01\x00")
